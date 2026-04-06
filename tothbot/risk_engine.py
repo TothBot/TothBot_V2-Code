@@ -438,6 +438,15 @@ class RiskEngine:
 
         # ── Sizing (RE-SZ-002/003/004) ────────────────────────────────────
         per_trade_usd = self._compute_per_trade_usd()
+
+        # PL-NEW-005 FIX: apply sizing_modifier from Gate 6 (via Signal Pipeline).
+        # sizing_modifier = 1.0 (FULL) for TRENDING regimes,
+        #                 = 0.5 (HALF) for NON_DIR + NORMAL_VOL.
+        # Gate 6 never blocks — modifier scales position size only.
+        sizing_modifier = Decimal(str(pair_spec.get("sizing_modifier", "1")))
+        if sizing_modifier != Decimal("1"):
+            per_trade_usd = per_trade_usd * sizing_modifier
+
         # RE-SZ-001: portfolio_USD = spot_usd_balance (realized only, never MTM)
         raw_qty = per_trade_usd / entry_fill_price
         # BP-DEC-002: ROUND_DOWN for quantities (conservative)
