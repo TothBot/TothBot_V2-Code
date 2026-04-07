@@ -292,7 +292,7 @@ class SignalPipeline:
         """
         # HR-SP-010: pipeline does not fire during WS reconnect.
         # WS Manager sets reconnecting flag — check it.
-        if self._wm.is_reconnecting:
+        if self._wm._is_reconnecting:
             return None
 
         # ── PRE-PIPELINE ─────────────────────────────────────────────────
@@ -431,7 +431,7 @@ class SignalPipeline:
             return None
 
         # ── GATE 8 — POSITION SIZER (never blocks — only sizes) ──────────
-        pair_spec = self._wm.pair_specs.get(symbol, {})
+        pair_spec = self._wm.pair_cache.get(symbol, {})
         sizing_output = self._gate_8(
             symbol, entry_limit_price, atr_14_dec, pair_spec,
             sizing_modifier, params
@@ -442,10 +442,13 @@ class SignalPipeline:
 
         # ── PIPELINE PASS ─────────────────────────────────────────────────
         output = {
-            "symbol":           symbol,
+            "symbol":            symbol,
             "entry_limit_price": entry_limit_price,
-            "sizing_modifier":  sizing_modifier,
-            "signal_params":    signal_params,
+            "sizing_modifier":   sizing_modifier,
+            "signal_params":     signal_params,
+            "asset_regime":      directional,       # from Gate 3 (TRENDING_POSITIVE etc.)
+            "vol_regime":        vol_regime,         # from Gate 3 (NORMAL_VOL / ELEVATED_VOL)
+            "market_regime":     "",                 # BTC/USD proxy — set by LM from rge.regime_cache
             **sizing_output,
         }
 
@@ -542,8 +545,8 @@ class SignalPipeline:
             }))
             return False, "", ""
 
-        directional = regime_data.get("directional", "")
-        vol_regime  = regime_data.get("vol_regime", "")
+        directional = regime_data.directional
+        vol_regime  = regime_data.vol_regime
 
         # FAIL conditions: TRENDING_NEGATIVE, or NON_DIR+ELEVATED_VOL
         if directional == TRENDING_NEGATIVE:
@@ -788,7 +791,7 @@ class SignalPipeline:
 
         # SC-GATE-5: minimum size pre-validation
         entry_limit_price = self._compute_entry_limit(candle_close, params)
-        pair_spec  = self._wm.pair_specs.get(symbol, {})
+        pair_spec  = self._wm.pair_cache.get(symbol, {})
         qty_est    = self._preview_gate8_qty(entry_limit_price, pair_spec, params)
         qty_min    = Decimal(str(pair_spec.get("qty_min",  "0")))
         cost_min   = Decimal(str(pair_spec.get("cost_min", "0")))
