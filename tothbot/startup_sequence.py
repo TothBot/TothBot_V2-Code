@@ -80,8 +80,8 @@ import uvloop
 from tothbot.vps_deployment import check_kraken_status
 from tothbot.logger import (
     LOG_FILE,
+    initialize_logger,
     log_record,
-    setup_logger,
 )
 from tothbot.regime_engine import RegimeEngine
 from tothbot.risk_engine import RiskEngine
@@ -92,7 +92,7 @@ from tothbot.signal_pipeline import SignalPipeline
 from tothbot.long_module import LongModule
 from tothbot.selection_ctrl import SelectionController
 from tothbot.ciats import CIATS
-from tothbot.ws_manager import WSManager
+from tothbot.ws_manager import WSManager, OHLCCandle
 
 
 # =============================================================
@@ -286,9 +286,8 @@ def _build_components(
 
     # ── 6. ExitController ─────────────────────────────────────
     ec = ExitController(
-        ws_manager=wm,
         risk_engine=re,
-        position_mirror=pm,
+        regime_engine=rge,
         logger=logger,
     )
 
@@ -303,9 +302,9 @@ def _build_components(
     # ── 8. LongModule ─────────────────────────────────────────
     lm = LongModule(
         ws_manager=wm,
+        execution_engine=ee,
         risk_engine=re,
         position_mirror=pm,
-        exec_engine=ee,
         logger=logger,
     )
 
@@ -323,15 +322,55 @@ def _build_components(
     )
 
     # ── Wire pipeline callbacks into WSManager ─────────────────
-    # WSManager calls these on candle-close events and execution events.
-    # sp.on_candle(symbol, candle, wm)        — 5m pipeline eval
-    # lm.on_execution_event(event, wm)        — entry state machine
-    # ec.on_ticker_bbo(symbol, bid, wm)       — MAE monitoring
-    # rge.refresh_all(universe)               — daily regime refresh
-    wm._signal_pipeline_fn  = sp.on_candle
-    wm._exec_engine_fn      = lm.on_execution_event
-    wm._exit_ctrl_fn        = ec.on_ticker_bbo
-    wm._regime_engine_fn    = rge.refresh_all
+    #
+    # WSManager._process_ohlc_5m calls:
+    #   signal_pipeline_fn(OHLCCandle, pre_comp_cache, params_snapshot)
+    # Convert OHLCCandle → dict, run sp.on_candle, pass gate-8 output
+    # to lm.on_gate8_output if the pipeline passes.
+    #
+    async def _pipeline_wrapper(
+        candle: OHLCCandle, pre_comp: dict, params: dict
+    ) -> None:
+        candle_dict = {
+            "open":           candle.open,
+            "high":           candle.high,
+            "low":            candle.low,
+            "close":          candle.close,
+            "volume":         candle.volume,
+            "vwap":           candle.vwap,
+            "interval_begin": candle.interval_begin,
+        }
+        result = await sp.on_candle(candle.symbol, candle_dict, params)
+        if result is not None:
+            # Enrich market_regime from BTC/USD proxy if pipeline left it blank.
+            if not result.get("market_regime"):
+                btc_state = rge.get_regime("BTC/USD")
+                result["market_regime"] = (
+                    btc_state.directional if btc_state else ""
+                )
+            await lm.on_gate8_output(result)
+
+    # WSManager._handle_filled calls:
+    #   exec_engine_fn(event_dict, wm_instance)  [2 positional args]
+    # lm.on_execution_event takes (event_dict) only — wrap to drop wm arg.
+    #
+    async def _exec_wrapper(event: dict, wm_inst) -> None:  # noqa: wm_inst unused
+        await lm.on_execution_event(event)
+
+    # WSManager._trigger_daily_regime_refresh calls:
+    #   regime_engine_fn(daily_candles, "BTC/USD")
+    # rge.run_daily_computation() fetches its own OHLC — ignore passed args.
+    #
+    async def _regime_wrapper(candles, symbol: str) -> None:  # noqa: args unused
+        await rge.run_daily_computation()
+
+    # ExitController is callable via __call__(symbol, event, wm).
+    # WSManager calls exit_ctrl_fn(symbol, event, wm) — wire ec directly.
+    #
+    wm._signal_pipeline_fn = _pipeline_wrapper
+    wm._exec_engine_fn     = _exec_wrapper
+    wm._exit_ctrl_fn       = ec                   # ExitController.__call__
+    wm._regime_engine_fn   = _regime_wrapper
 
     return {
         "wm":    wm,
@@ -369,7 +408,7 @@ async def _async_main() -> None:
     universe    = _load_universe(config)
 
     # ── Initialise Logger (must be first — all others depend on it) ─
-    logger = setup_logger()
+    log_queue, log_listener, logger = initialize_logger()
     logger.info(log_record({
         "event":     "TOTHBOT_STARTING",
         "level":     "INFO",
