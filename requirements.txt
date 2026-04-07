@@ -1,0 +1,28 @@
+# TothBot V2 — Python Dependencies
+# Coding spec: 1011001 Engineering_Best_Practices dv1_6 (BP-LIB-001 through -008)
+# Platform: Ubuntu 24.04.4 LTS, Python 3.12.3
+# All versions pinned to exact version. Never use ranges.
+
+# Async event loop replacement (BP-UVL-001)
+uvloop==0.19.0
+
+# JSON library — replaces stdlib json for all serialization (BP-JSON-001)
+orjson==3.9.15
+
+# WebSocket client (Kraken WS v2 Public and Private)
+websockets==12.0
+
+# Async HTTP client (Kraken REST API, Kraken Status API)
+aiohttp==3.9.5
+
+# Statistical computing — Mann-Whitney U, Spearman correlation (CIATS)
+scipy==1.13.0
+
+# Async SMTP for operator alerts (VD-ALT-002)
+aiosmtplib==3.0.1
+
+# systemd watchdog and READY notification (VD-WD-006)
+sdnotify==0.3.2
+
+# Numeric library (scipy dependency — explicit pin)
+numpy==1.26.4

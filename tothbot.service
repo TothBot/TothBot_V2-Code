@@ -1,0 +1,21 @@
+[Unit]
+Description=TothBot V2 Automated Cryptocurrency Trading System
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+ExecStart=/root/tothbot_env/bin/python3 -m tothbot
+WorkingDirectory=/root/TothBot_V2-Code
+EnvironmentFile=/root/.tothbot.env
+Restart=on-failure
+RestartSec=5
+WatchdogSec=120
+LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tothbot
+
+[Install]
+WantedBy=multi-user.target
