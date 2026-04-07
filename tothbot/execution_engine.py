@@ -137,13 +137,13 @@ class ExecutionEngine:
         self,
         ws_manager: Any,
         risk_engine: Any,
-        position_mirror: Any,
         logger: Any,
     ) -> None:
         self._wm = ws_manager
         self._re = risk_engine
-        self._pm = position_mirror
         self._logger = logger
+        # Position Mirror writes go through self._wm.pm_*() methods.
+        # HR-PM-009: WS Manager is SOLE WRITER. No _pm object injected.
 
         # Internal counter: unique IDs for req_id, TP/emergSL cl_ord_ids
         self._counter: int = 0
@@ -251,8 +251,8 @@ class ExecutionEngine:
         await self._wm.ws_private.send(orjson.dumps(entry_msg).decode())
 
         # EE-ADD-006: at-dispatch actions BEFORE any Kraken response
-        # (a) Create Position Mirror record (no async gap — EE-ID-002)
-        self._pm.create_record(symbol, cl_ord_id, entry_limit_price, entry_qty)
+        # (a) Create Position Mirror record via WSManager (HR-PM-009, no async gap — EE-ID-002)
+        self._wm.pm_create(symbol, cl_ord_id, entry_limit_price, entry_qty)
 
         # (b) Add to Pending Order Registry (available_USD tracking in Gate 7)
         self._wm.pending_orders[cl_ord_id] = entry_qty * entry_limit_price
@@ -347,8 +347,8 @@ class ExecutionEngine:
             event.get("cum_qty", str(ctx["entry_qty"]))
         ))
 
-        # EE-BA-001: update Position Mirror with actual fill data
-        self._pm.on_entry_filled(
+        # EE-BA-001: update Position Mirror with actual fill data via WSManager (HR-PM-009)
+        self._wm.pm_on_fill(
             symbol,
             entry_fill_price,
             entry_qty,
@@ -500,9 +500,9 @@ class ExecutionEngine:
             "reason":    reason,
         }))
 
-        # EE-REJ-001: remove from registry, clear PM, release semaphore
+        # EE-REJ-001: remove from registry, clear PM via WSManager, release semaphore
         self._wm.pending_orders.pop(cl_ord_id, None)
-        self._pm.clear_record(symbol)
+        self._wm.pm_clear(symbol)
         self._re.release_semaphore()
 
     async def _on_entry_expired(self, event: dict) -> None:
@@ -535,7 +535,7 @@ class ExecutionEngine:
             # No fill — clean up fully (EE-REJ-002)
             self._entry_orders.pop(cl_ord_id, None)
             self._wm.pending_orders.pop(cl_ord_id, None)
-            self._pm.clear_record(symbol)
+            self._wm.pm_clear(symbol)
             self._re.release_semaphore()
         else:
             # Partial fill — treat as entry fill, dispatch TP+emergSL (EE-REJ-002)
@@ -592,8 +592,8 @@ class ExecutionEngine:
         tp_order_id    = orders[0].get("order_id", "")
         emgsl_order_id = orders[1].get("order_id", "")
 
-        # EE-BA-006: update Position Mirror with Kraken order IDs
-        self._pm.on_batch_add_ack(symbol, tp_order_id, emgsl_order_id)
+        # EE-BA-006: update Position Mirror with Kraken order IDs via WSManager (HR-PM-009)
+        self._wm.pm_on_orders(symbol, tp_order_id, emgsl_order_id)
 
         # Clean up req_id_registry
         self._wm.req_id_registry.pop(req_id, None)
