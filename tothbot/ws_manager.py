@@ -137,7 +137,6 @@ class PositionRecord:
     """Position Mirror entry (WS Manager is SOLE WRITER)."""
     symbol: str
     cl_ord_id: str                          # entry cl_ord_id (set at dispatch)
-    entry_limit_price: Decimal = Decimal("0")  # placeholder until fill (PM-CREATE-001)
     entry_fill_price: Decimal = Decimal("0")
     qty: Decimal = Decimal("0")
     tp_order_id: str = ""
@@ -230,6 +229,10 @@ class WSManager:
         # ── HTF cache (60m) — per pair ────────────────────────────────────
         self.htf_ema_20: dict[str, Decimal] = {}
         self.htf_ema_50: dict[str, Decimal] = {}
+
+        # ── 24h liquidity cache — populated from ticker/instrument data ──────
+        # Read by Signal Pipeline Gate 2. Keyed by symbol → USD volume/day.
+        self.liquidity_24h: dict[str, Decimal] = {}
 
         # ── Candle close detection ─────────────────────────────────────────
         # WM-OHLC-004: SEPARATE dicts for 5m and 60m (MUST NOT combine)
@@ -1197,10 +1200,18 @@ class WSManager:
             if self._exec_engine_fn:
                 await self._exec_engine_fn(
                     {
-                        "symbol": symbol,
+                        # Kraken-format keys required by EE._on_entry_filled
+                        "exec_type":  "filled",
+                        "symbol":     symbol,
+                        "cl_ord_id":  cl_ord_id,
+                        "order_id":   order_id,
+                        "avg_price":  str(avg_price),    # Decimal → str (EE parses)
+                        "cum_qty":    str(cum_qty),      # Decimal → str (EE parses)
+                        "fees":       str(fees),
+                        # WM-format keys for compatibility
                         "entry_fill_price": avg_price,
-                        "qty": cum_qty,
-                        "fees_entry_usd": fees,
+                        "qty":              cum_qty,
+                        "fees_entry_usd":   fees,
                     },
                     self,
                 )
@@ -2440,109 +2451,3 @@ class WSManager:
                 gap_closed.append(symbol)
 
         return gap_closed
-
-    # =================================================================
-    # POSITION MIRROR WRITE API — WS Manager is SOLE WRITER (HR-PM-009)
-    # Called by Execution Engine via self._wm. WSManager physically writes.
-    # =================================================================
-
-    def pm_create(
-        self,
-        symbol: str,
-        cl_ord_id: str,
-        entry_limit_price: Decimal,
-        qty: Decimal,
-    ) -> None:
-        """
-        Create PositionRecord at entry dispatch — BEFORE Kraken fill ACK.
-        HR-PM-002: record-at-dispatch, no async gap (A-2).
-        Called by ExecutionEngine immediately after add_order send.
-        """
-        self.position_mirror[symbol] = PositionRecord(
-            symbol=symbol,
-            cl_ord_id=cl_ord_id,
-            entry_limit_price=entry_limit_price,
-            qty=qty,
-        )
-        self._logger.info(log_record({
-            "event":     "POSITION_RECORD_CREATED",
-            "level":     "INFO",
-            "component": "WS_MGR",
-            "symbol":    symbol,
-            "cl_ord_id": cl_ord_id,
-            "qty":       qty,
-        }))
-
-    def pm_on_fill(
-        self,
-        symbol: str,
-        fill_price: Decimal,
-        qty: Decimal,
-        timestamp_utc: str,
-    ) -> None:
-        """
-        Update PositionRecord with actual entry fill data.
-        HR-PM-003: entry_fill_price = actual avg_price. NEVER limit price.
-        Called by ExecutionEngine on exec_type=filled.
-        """
-        if symbol not in self.position_mirror:
-            self._logger.critical(log_record({
-                "event":     "FILL_WITHOUT_RECORD",
-                "level":     "CRITICAL",
-                "component": "WS_MGR",
-                "symbol":    symbol,
-            }))
-            return
-        rec = self.position_mirror[symbol]
-        rec.entry_fill_price   = fill_price
-        rec.qty                = qty
-        rec.entry_timestamp_utc = timestamp_utc
-        self._logger.info(log_record({
-            "event":      "POSITION_FILL_CONFIRMED",
-            "level":      "INFO",
-            "component":  "WS_MGR",
-            "symbol":     symbol,
-            "fill_price": fill_price,
-            "qty":        qty,
-        }))
-
-    def pm_on_orders(
-        self,
-        symbol: str,
-        tp_order_id: str,
-        emgsl_order_id: str,
-    ) -> None:
-        """
-        Update PositionRecord with Kraken-assigned TP and emergSL order IDs.
-        Called by ExecutionEngine on batch_add ACK (EE-BA-006).
-        """
-        if symbol not in self.position_mirror:
-            return
-        rec = self.position_mirror[symbol]
-        rec.tp_order_id      = tp_order_id
-        rec.emergsl_order_id = emgsl_order_id
-        self._logger.info(log_record({
-            "event":          "POSITION_ORDERS_SET",
-            "level":          "INFO",
-            "component":      "WS_MGR",
-            "symbol":         symbol,
-            "tp_order_id":    tp_order_id,
-            "emgsl_order_id": emgsl_order_id,
-        }))
-
-    def pm_clear(self, symbol: str) -> None:
-        """
-        Delete PositionRecord on entry cancellation or expiry (no fill).
-        HR-PM-009: WSManager is SOLE WRITER — deletion goes through here.
-        Called by ExecutionEngine on entry canceled/expired with no fill.
-        """
-        if symbol not in self.position_mirror:
-            return
-        del self.position_mirror[symbol]
-        self._logger.info(log_record({
-            "event":     "POSITION_RECORD_CLEARED",
-            "level":     "INFO",
-            "component": "WS_MGR",
-            "symbol":    symbol,
-            "reason":    "ENTRY_CANCELED_OR_EXPIRED_NO_FILL",
-        }))
