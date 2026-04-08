@@ -14,130 +14,110 @@ UT-FW-002: pytest-asyncio
 UT-FW-003: unittest.mock
 UT-FW-004: Do NOT use uvloop in tests (standard asyncio)
 """
-from __future__ import annotations
 
 import asyncio
 import logging
 import queue
+import tempfile
+import os
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, AsyncMock
 
 import pytest
+import pytest_asyncio
 
 
 # =============================================================
-# EVENT LOOP — UT-FW-004: standard asyncio, NOT uvloop
+# ASYNCIO CONFIGURATION
 # =============================================================
 
-# pytest-asyncio uses standard asyncio event loop by default.
-# No uvloop import here. uvloop is production-only (SS-PRE-005).
+# UT-FW-004: Standard asyncio only. uvloop prohibited in tests.
 
 
 # =============================================================
-# LOGGER FIXTURE
+# LOGGER FIXTURES
 # =============================================================
 
 @pytest.fixture
-def tothbot_logger():
+def log_queue():
     """
-    Minimal logger for injecting into components under test.
-    Routes to /dev/null — tests inspect side effects,
-    not log output.
+    Bounded queue mirroring the production logger queue.
+    HR-LG-001: bounded queue size 10_000.
+    Used by logger unit tests and any test needing
+    a real queue instance.
     """
-    logger = logging.getLogger("tothbot.test")
-    logger.handlers = [logging.NullHandler()]
+    return queue.Queue(maxsize=10_000)
+
+
+@pytest.fixture
+def test_logger():
+    """
+    Plain Python logger with NullHandler.
+    No I/O. No file creation. Safe for all unit tests.
+    Used by modules that require a logging.Logger instance.
+    """
+    logger = logging.getLogger(f"tothbot.test.{id(object())}")
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(logging.NullHandler())
     logger.propagate = False
     return logger
 
 
 # =============================================================
-# PARAMETER STORE FIXTURE — CIATS starting values
+# PARAMETER STORE FIXTURE
 # =============================================================
 
 @pytest.fixture
 def param_store():
     """
-    CIATS Parameter Store with canonical starting values.
-    Per TB00000 §9.17 and 1011010 dv1_6.
+    Minimal parameter store dict with CIATS starting values.
+    Used by RiskEngine, RegimeEngine, and CIATS unit tests.
+    All values are CIATS-owned starting values per 0500000.
     """
     return {
-        "tradeable_pct":           Decimal("0.50"),
-        "per_trade_pct":           Decimal("0.05"),
-        "max_concurrent":          20,
-        "mae_mult":                Decimal("1.5"),
-        "emergency_sl_mult":       Decimal("3.0"),
-        "cancel_timeout":          5.0,
-        "mpp_retry_count":         3,
-        "max_hold_candles":        24,
-        "entry_timeout_sec":       45,
-        "full_halt_drawdown":      Decimal("0.10"),
-        "session_pause_drawdown":  Decimal("0.05"),
-        "adx_threshold":           Decimal("25"),
-        "atr_percentile_thresh":   67,
-        "htf_ema_fast":            20,
-        "htf_ema_slow":            50,
-        "min_volume_usd_daily":    Decimal("500000"),
-        "sc_body_threshold":       Decimal("0.3"),
-        "sc_cooldown_seconds":     300,
-        "sc_consecutive_limit":    3,
-        "half_kelly_active":       False,
-        "kelly_win_rate":          None,
-        "kelly_avg_rr":            None,
+        "tradeable_pct":          Decimal("0.50"),
+        "per_trade_pct":          Decimal("0.05"),
+        "max_concurrent":         20,
+        "mae_mult":               Decimal("1.5"),
+        "emergency_sl_mult":      Decimal("3.0"),
+        "full_halt_drawdown":     Decimal("0.10"),
+        "session_pause_drawdown": Decimal("0.05"),
+        "adx_threshold":          Decimal("25"),
+        "atr_percentile_thresh":  Decimal("67"),
+        "htf_ema_fast":           20,
+        "htf_ema_slow":           50,
+        "min_volume_usd_daily":   Decimal("500000"),
     }
 
 
 # =============================================================
-# MOCK WS MANAGER — used by RiskEngine, ExitController
+# TEMP DIRECTORY FIXTURE
 # =============================================================
 
 @pytest.fixture
-def mock_ws_manager():
+def tmp_log_dir(tmp_path):
     """
-    Mock WSManager with all attributes consumed by RiskEngine
-    and other components. Tests set specific values per scenario.
+    Temporary directory for logger file output tests.
+    Cleaned up automatically by pytest tmp_path fixture.
     """
-    wm = MagicMock()
-    wm.spot_usd_balance   = Decimal("10000")
-    wm.pending_orders     = {}
-    wm.latest_bid         = {}
-    wm.batch_cancel       = AsyncMock()
-    wm.engine_state       = "online"
-    wm.system_state       = "NORMAL"
-    wm.pair_cache         = {}
-    wm.atr_14             = {}
-    wm.warm_up_state      = {}
-    return wm
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    return str(log_dir)
 
 
 # =============================================================
-# MOCK POSITION MIRROR — used by RiskEngine, SignalPipeline
+# ALERT EMAIL MOCK FIXTURE
 # =============================================================
 
 @pytest.fixture
-def mock_position_mirror():
+def mock_alert(monkeypatch):
     """
-    Mock PositionMirror with all attributes consumed by
-    RiskEngine and other components.
+    Monkeypatches _alert_operator_direct to suppress real
+    email sends during unit tests.
+    Returns the mock so tests can assert call counts.
     """
-    pm = MagicMock()
-    pm.all_records  = {}    # empty — no open positions by default
-    pm.open_count   = 0
-    return pm
-
-
-# =============================================================
-# PAIR SPEC FIXTURE — Kraken instrument data
-# =============================================================
-
-@pytest.fixture
-def btc_usd_pair_spec():
-    """
-    Realistic BTC/USD pair specification from Kraken instrument channel.
-    Values match production precision requirements.
-    """
-    return {
-        "price_increment": Decimal("0.1"),
-        "qty_increment":   Decimal("0.0001"),
-        "qty_min":         Decimal("0.0001"),
-        "cost_min":        Decimal("0.5"),
-    }
+    mock = MagicMock()
+    monkeypatch.setattr(
+        "tothbot.logger._alert_operator_direct", mock
+    )
+    return mock
