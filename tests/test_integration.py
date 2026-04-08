@@ -60,6 +60,9 @@ def _make_config() -> dict:
         "kraken_trade_api_secret": "TEST_TRADE_SECRET",
         "kraken_data_api_key":     "TEST_DATA_KEY",
         "kraken_data_api_secret":  "TEST_DATA_SECRET",
+        # paper_trading_mode: False — prevents KeyError in WSManager.__init__
+        # and ensures paper_mode=False in all integration tests.
+        "paper_trading_mode":      False,
     }
 
 

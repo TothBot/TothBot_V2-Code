@@ -823,6 +823,8 @@ class ExitController:
             "net_PL_USD":          net_pl,
             "net_gain_usd":        net_gain_usd,
             "net_loss_usd":        net_loss_usd,
+            # Paper trading flag — False in live mode, True in paper mode (0211005)
+            "paper_trade":         wm.paper_mode,
         }))
 
         # ── Update Selection Controller state (WM-SC-001/002) ─────────────

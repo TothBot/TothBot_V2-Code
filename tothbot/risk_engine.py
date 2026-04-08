@@ -90,9 +90,11 @@ class RiskEngine:
 
     Injected dependencies:
         logger:              logging.Logger ("tothbot" instance)
-        position_mirror:     PositionMirror — read-only for open count
+        position_mirror:     PositionMirror — retained for call-site
+                             compatibility; MTM reads go through
+                             ws_manager.position_mirror (DEFECT-006 fix)
         ws_manager:          WSManager — spot_usd_balance, pending_orders,
-                             latest_bid, batch_cancel callable
+                             latest_bid, position_mirror, batch_cancel
         param_store:         dict — frozen CIATS Parameter Store snapshot
 
     Lifecycle:
@@ -111,7 +113,7 @@ class RiskEngine:
         param_store: dict | None = None,
     ) -> None:
         self._logger = logger
-        self._pm = position_mirror
+        self._pm = position_mirror  # retained for compat; MTM uses self._wm
         self._wm = ws_manager
         self._params: dict = param_store or {}
 
@@ -200,9 +202,10 @@ class RiskEngine:
         # MTM: cash + unrealized value of all open positions
         spot_balance = Decimal(str(self._wm.spot_usd_balance))
 
-        # Update latest_bid in WS Manager for this symbol
+        # DEFECT-006 FIX: self._pm.all_records does not exist at runtime.
+        # Runtime positions are in self._wm.position_mirror (authoritative dict).
         open_value = Decimal("0")
-        for sym, rec in self._pm.all_records.items():
+        for sym, rec in self._wm.position_mirror.items():
             bid_price = self._wm.latest_bid.get(sym, Decimal("0"))
             open_value += bid_price * rec.qty
 
@@ -251,7 +254,9 @@ class RiskEngine:
                 "level":         "CRITICAL",
                 "component":     "RISK_ENG",
                 "drawdown_pct":  drawdown_pct,
-                "open_count":    self._pm.open_count,
+                # DEFECT-006 FIX: self._pm.open_count does not exist.
+                # Use len(self._wm.position_mirror) — authoritative open count.
+                "open_count":    len(self._wm.position_mirror),
                 "threshold":     full_halt_thresh,
             }))
             _alert_operator_direct(
@@ -438,15 +443,6 @@ class RiskEngine:
 
         # ── Sizing (RE-SZ-002/003/004) ────────────────────────────────────
         per_trade_usd = self._compute_per_trade_usd()
-
-        # PL-NEW-005 FIX: apply sizing_modifier from Gate 6 (via Signal Pipeline).
-        # sizing_modifier = 1.0 (FULL) for TRENDING regimes,
-        #                 = 0.5 (HALF) for NON_DIR + NORMAL_VOL.
-        # Gate 6 never blocks — modifier scales position size only.
-        sizing_modifier = Decimal(str(pair_spec.get("sizing_modifier", "1")))
-        if sizing_modifier != Decimal("1"):
-            per_trade_usd = per_trade_usd * sizing_modifier
-
         # RE-SZ-001: portfolio_USD = spot_usd_balance (realized only, never MTM)
         raw_qty = per_trade_usd / entry_fill_price
         # BP-DEC-002: ROUND_DOWN for quantities (conservative)
