@@ -1277,6 +1277,7 @@ class WSManager:
         """
         cl_ord_id = event.get("cl_ord_id", "")
         cum_qty = Decimal(str(event.get("cum_qty", 0)))
+        symbol = event.get("symbol", "")
 
         self.pending_orders.pop(cl_ord_id, None)
 
