@@ -39,7 +39,7 @@ Interfaces:
             risk_engine.acquire_semaphore()       — slot management
             risk_engine.release_semaphore()       — on no-fill outcomes
             position_mirror.on_entry_filled()     — PARTIAL_TRADE qty update
-            position_mirror.clear_record()        — on no-fill or below-min
+            position_mirror.close_position() — on no-fill or below-min
             ws_manager.ws_private.send()          — IOC market sell
             ws_manager.ws_token                   — auth token
             ws_manager.pending_orders             — registry clear
@@ -110,7 +110,7 @@ class LongModule:
                                      pair_specs, req_id_registry
       execution_engine: ExecutionEngine — on_gate8_output(), on_execution_event()
       risk_engine:      RiskEngine — acquire_semaphore(), release_semaphore()
-      position_mirror:  PositionMirror — on_entry_filled(), clear_record()
+      position_mirror:  PositionMirror — on_entry_filled(), close_position()
       logger:           logging.Logger ("tothbot" instance)
 
     Called by WSManager:
@@ -401,7 +401,7 @@ class LongModule:
                 "cl_ord_id": cl_ord_id,
             }))
 
-            # EE handles: PM.clear_record, pending_orders.pop, release_semaphore
+            # EE handles: PM.pm_clear (via wm), pending_orders.pop, release_semaphore
             await self._ee.on_execution_event(event)
             self._clear_context(symbol)
 
@@ -460,7 +460,7 @@ class LongModule:
                 ).get("asset_regime", "UNKNOWN"),
             }))
 
-            # EE handles: PM.clear_record, pending_orders.pop, release_semaphore
+            # EE handles: PM.pm_clear (via wm), pending_orders.pop, release_semaphore
             await self._ee.on_execution_event(event)
             self._clear_context(symbol)
 
@@ -603,8 +603,9 @@ class LongModule:
         # Clear Pending Order Registry
         self._wm.pending_orders.pop(cl_ord_id, None)
 
-        # Clear Position Mirror record
-        self._pm.clear_record(symbol)
+        # Clear Position Mirror record (PM-CLOSE-001)
+        # Position never fully opened — emergency IOC sell. No CIATS bus.
+        self._pm.close_position(symbol, "PARTIAL_FILL_BELOW_MINIMUM")
 
         # Release semaphore — position will not be opened
         self._re.release_semaphore()
