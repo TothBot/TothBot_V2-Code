@@ -32,7 +32,7 @@ from tothbot.ws_manager import (
 from tothbot.exit_controller import ExitController, CANCEL_TIMEOUT_WINDOW
 from tothbot.position_mirror import PositionMirror
 from tothbot.ciats import CIATS
-from tothbot.logger import initialize_logger, log_record
+from tothbot.logger import log_record
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -115,6 +115,20 @@ def _make_wm(
     wm.htf_ema_50[SYMBOL]      = Decimal("60000")
     wm.liquidity_24h[SYMBOL]   = Decimal("1_000_000")
     wm.last_interval_begin[SYMBOL] = "2026-04-07T12:00:00Z"
+
+    # Seed last_complete_candle so _process_ohlc_5m fires pipeline on new interval
+    from tothbot.ws_manager import OHLCCandle
+    wm.last_complete_candle[SYMBOL] = OHLCCandle(
+        symbol=SYMBOL,
+        interval=5,
+        interval_begin="2026-04-07T12:00:00Z",
+        open=Decimal("65000"),
+        high=Decimal("65500"),
+        low=Decimal("64800"),
+        close=Decimal("65200"),
+        volume=Decimal("10.5"),
+        vwap=Decimal("65100"),
+    )
 
     # ── Portfolio baseline (startup — set ONCE) ────────────────────
     wm.portfolio_baseline_USD = Decimal("10000")
@@ -603,6 +617,8 @@ async def test_IT005_drawdown_circuit_breaker():
         "data": [{"symbol": SYMBOL, "bid": "1", "ask": "2"}],
     }
     await wm._handle_ticker(ticker_msg)
+    # batch_cancel is dispatched via asyncio.ensure_future — yield once to execute it
+    await asyncio.sleep(0)
 
     # Step 2: system_state is FULL_HALT
     assert wm.system_state == STATE_FULL_HALT, (
@@ -640,50 +656,43 @@ async def test_IT006_logger_non_blocking():
             queue.Full immediately (< 5ms), hot path is never delayed.
     1021002 dv1_0 IT-006.
     """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        log_queue, log_listener, logger = initialize_logger(
-            log_dir=tmpdir,
-            log_filename="test_it006.log",
-        )
-        log_listener.start()
+    # initialize_logger() takes no args — uses fixed LOG_DIR from logger.py.
+    # Test the non-blocking contract directly via a bounded queue — same
+    # mechanism TothBotQueueHandler uses (queue.put_nowait, HR-LG-003).
+    bounded: queue.Queue = queue.Queue(maxsize=3)
 
-        try:
-            # Create a tiny bounded queue to replicate full-queue scenario
-            bounded: queue.Queue = queue.Queue(maxsize=3)
-            for _ in range(3):
-                bounded.put_nowait(
-                    logging.LogRecord(
-                        name="tothbot", level=logging.INFO,
-                        pathname="", lineno=0,
-                        msg="fill", args=(), exc_info=None,
-                    )
-                )
-
-            assert bounded.full(), "Test queue must be full before the overflow test"
-
-            # Step 2: Attempt one more put — must raise queue.Full immediately
-            start_ns = time.perf_counter_ns()
-            overflowed = False
-            try:
-                bounded.put_nowait(
-                    logging.LogRecord(
-                        name="tothbot", level=logging.INFO,
-                        pathname="", lineno=0,
-                        msg="overflow", args=(), exc_info=None,
-                    )
-                )
-            except queue.Full:
-                overflowed = True
-            elapsed_ms = (time.perf_counter_ns() - start_ns) / 1_000_000
-
-            # Step 3: Confirm non-blocking (< 5ms — generous to avoid flakiness)
-            assert overflowed, "put_nowait must raise queue.Full when queue is at maxsize"
-            assert elapsed_ms < 5.0, (
-                f"BP-LOG-002: Logger enqueue must not block: took {elapsed_ms:.2f}ms"
+    # Step 1: Fill queue to capacity
+    for _ in range(3):
+        bounded.put_nowait(
+            logging.LogRecord(
+                name="tothbot", level=logging.INFO,
+                pathname="", lineno=0,
+                msg="fill", args=(), exc_info=None,
             )
+        )
 
-        finally:
-            log_listener.stop()
+    assert bounded.full(), "Test queue must be full before overflow test"
+
+    # Step 2: One more put_nowait — must raise queue.Full immediately
+    start_ns = time.perf_counter_ns()
+    overflowed = False
+    try:
+        bounded.put_nowait(
+            logging.LogRecord(
+                name="tothbot", level=logging.INFO,
+                pathname="", lineno=0,
+                msg="overflow", args=(), exc_info=None,
+            )
+        )
+    except queue.Full:
+        overflowed = True
+    elapsed_ms = (time.perf_counter_ns() - start_ns) / 1_000_000
+
+    # Step 3: Non-blocking — raised immediately, well under 5ms
+    assert overflowed, "put_nowait must raise queue.Full when queue is at maxsize"
+    assert elapsed_ms < 5.0, (
+        f"BP-LOG-002: Logger enqueue must not block: took {elapsed_ms:.2f}ms"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
