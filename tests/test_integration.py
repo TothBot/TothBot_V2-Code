@@ -390,11 +390,17 @@ async def test_IT002_post_only_rejection():
     CL_ORD = "REJECT_CL_001"
 
     async def mock_exec_fn(event: dict, wm: WSManager) -> None:
-        """Simulate EE _on_entry_canceled: clear PM and pending_orders."""
-        if event.get("exec_type") == "canceled":
-            cl = event.get("cl_ord_id", "")
+        """
+        Simulate EE.on_execution_event / _on_entry_canceled.
+        WM now calls exec_engine_fn for canceled CASE C (fix applied to ws_manager.py).
+        EE checks cl_ord_id in _entry_orders; here we simulate the full cleanup.
+        """
+        exec_type = event.get("exec_type", "")
+        cl = event.get("cl_ord_id", "")
+        sym = event.get("symbol", SYMBOL)
+        if exec_type == "canceled" and cl == CL_ORD:
+            # EE._on_entry_canceled: pop pending, clear Mirror, release semaphore
             wm.pending_orders.pop(cl, None)
-            sym = event.get("symbol", SYMBOL)
             if sym in wm.position_mirror:
                 del wm.position_mirror[sym]
 
@@ -447,11 +453,15 @@ async def test_IT003_gtd_expiry_zero_fill():
     CL_ORD = "EXPIRE_CL_001"
 
     async def mock_exec_fn(event: dict, wm: WSManager) -> None:
-        """Simulate EE _on_entry_expired: clean up on zero fill."""
-        if event.get("exec_type") in ("expired",):
-            cl = event.get("cl_ord_id", "")
+        """
+        Simulate EE.on_execution_event / _on_entry_expired (cum_qty==0 path).
+        WM now calls exec_engine_fn for expired CASE C (fix applied to ws_manager.py).
+        """
+        exec_type = event.get("exec_type", "")
+        cl = event.get("cl_ord_id", "")
+        sym = event.get("symbol", SYMBOL)
+        if exec_type == "expired" and cl == CL_ORD:
             wm.pending_orders.pop(cl, None)
-            sym = event.get("symbol", SYMBOL)
             if sym in wm.position_mirror:
                 del wm.position_mirror[sym]
 
