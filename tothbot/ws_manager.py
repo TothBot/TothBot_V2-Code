@@ -1253,6 +1253,22 @@ class WSManager:
                 "cl_ord_id": cl_ord_id,
                 "reason": reason,
             }))
+            # Route to EE for entry order cleanup: clear Position Mirror,
+            # clear Pending Registry entry, release BoundedSemaphore.
+            # EE._on_entry_canceled handles this only if cl_ord_id is in
+            # EE._entry_orders — non-entry cancels (TP, emergSL) are no-ops.
+            if self._exec_engine_fn:
+                await self._exec_engine_fn(
+                    {
+                        "exec_type": "canceled",
+                        "symbol":    symbol,
+                        "cl_ord_id": cl_ord_id,
+                        "order_id":  event.get("order_id", ""),
+                        "cum_qty":   "0",
+                        "reason":    reason,
+                    },
+                    self,
+                )
 
     async def _handle_expired(self, event: dict) -> None:
         """
@@ -1277,6 +1293,21 @@ class WSManager:
                 "cl_ord_id": cl_ord_id,
                 "cum_qty": cum_qty,
             }))
+            # Route to EE for entry order cleanup (same pattern as _handle_canceled
+            # CASE C). EE._on_entry_expired handles cum_qty==0 path: clear Position
+            # Mirror, clear Pending Registry, release BoundedSemaphore.
+            # Non-entry expired events are no-ops in EE (cl_ord_id not in _entry_orders).
+            if self._exec_engine_fn:
+                await self._exec_engine_fn(
+                    {
+                        "exec_type": "expired",
+                        "symbol":    symbol,
+                        "cl_ord_id": cl_ord_id,
+                        "order_id":  event.get("order_id", ""),
+                        "cum_qty":   "0",
+                    },
+                    self,
+                )
 
     async def _handle_amended(self, event: dict) -> None:
         """
