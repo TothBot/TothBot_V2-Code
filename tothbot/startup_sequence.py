@@ -290,6 +290,7 @@ def _build_components(
     ee = ExecutionEngine(
         ws_manager=wm,
         risk_engine=re,
+        position_mirror=pm,
         logger=logger,
     )
 
