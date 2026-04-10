@@ -590,7 +590,29 @@ class WSManager:
         """
         Execute startup connection and subscription sequence.
         Steps 1-5 per 1011014. Indicator seeding (7a/7b) called separately.
+        Paper mode: skip private WS entirely — no auth needed.
+        FIX-WM-PT-001: gate private WS on paper_mode (DEFECT-WM-PT-002).
         """
+        if self.paper_mode:
+            # Paper mode: private WS not needed — order dispatch suppressed.
+            # Set paper trading balance from config (default $10,000).
+            paper_balance = Decimal(str(
+                self._config.get("paper_trading_balance", "10000")
+            ))
+            self.spot_usd_balance = paper_balance
+            self.portfolio_baseline_USD = paper_balance
+            self._logger.info(log_record({
+                "event": "PAPER_BALANCE_SET",
+                "level": "INFO",
+                "component": "WS_MGR",
+                "balance_usd": str(paper_balance),
+                "note": "Private WS skipped — paper mode active",
+            }))
+            # Connect public WS only
+            self._ws_public = await self._ws_connect(PUBLIC_WS_URI)
+            await self._subscribe_public()
+            return
+
         # Step 1: Acquire WS auth token
         self._ws_token = await self._rest_get_ws_token()
 
@@ -605,7 +627,15 @@ class WSManager:
     async def _main_loop(self) -> None:
         """
         Run concurrent receive loops + health monitoring tasks.
+        Paper mode: private recv loop omitted (_ws_private is None).
+        FIX-WM-PT-002: gate _recv_loop_private on paper_mode (DEFECT-WM-PT-002).
         """
+        if self.paper_mode:
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(self._recv_loop_public())
+                tg.create_task(self._ping_loop())
+                tg.create_task(self._zombie_monitor())
+            return
         async with asyncio.TaskGroup() as tg:
             tg.create_task(self._recv_loop_public())
             tg.create_task(self._recv_loop_private())
@@ -1796,7 +1826,6 @@ class WSManager:
             },
             "req_id": req_id,
         }
-
         # Paper mode gate — intercept batch_add dispatch (FC-001)
         if self.paper_mode:
             if symbol in self.position_mirror:
@@ -2006,34 +2035,36 @@ class WSManager:
                     "req_id": pub_req_id,
                 }))
 
-            # Ping private
-            if self._awaiting_pong_priv:
-                if (self._ping_sent_priv and
-                        now - self._ping_sent_priv > PING_TIMEOUT_SEC):
-                    self._logger.critical(log_record({
-                        "event": "PING_TIMEOUT",
-                        "level": "CRITICAL",
+            # Ping private — skipped in paper mode (_ws_private is None)
+            # FIX-WM-PT-003: guard private ping (DEFECT-WM-PT-002)
+            if self._ws_private is not None:
+                if self._awaiting_pong_priv:
+                    if (self._ping_sent_priv and
+                            now - self._ping_sent_priv > PING_TIMEOUT_SEC):
+                        self._logger.critical(log_record({
+                            "event": "PING_TIMEOUT",
+                            "level": "CRITICAL",
+                            "component": "WS_MGR",
+                            "connection_id": self.connection_id_private,
+                        }))
+                        await self._initiate_reconnect()
+                        return
+                else:
+                    priv_req_id = self._next_req_id()
+                    self._ping_req_id_priv = priv_req_id
+                    self._ping_sent_priv = now
+                    self._awaiting_pong_priv = True
+                    await self._send_private({
+                        "method": "ping",
+                        "req_id": priv_req_id,
+                    })
+                    self._logger.debug(log_record({
+                        "event": "PING_SENT",
+                        "level": "DEBUG",
                         "component": "WS_MGR",
                         "connection_id": self.connection_id_private,
+                        "req_id": priv_req_id,
                     }))
-                    await self._initiate_reconnect()
-                    return
-            else:
-                priv_req_id = self._next_req_id()
-                self._ping_req_id_priv = priv_req_id
-                self._ping_sent_priv = now
-                self._awaiting_pong_priv = True
-                await self._send_private({
-                    "method": "ping",
-                    "req_id": priv_req_id,
-                })
-                self._logger.debug(log_record({
-                    "event": "PING_SENT",
-                    "level": "DEBUG",
-                    "component": "WS_MGR",
-                    "connection_id": self.connection_id_private,
-                    "req_id": priv_req_id,
-                }))
 
     async def _zombie_monitor(self) -> None:
         """
@@ -2062,21 +2093,24 @@ class WSManager:
                 await self._initiate_reconnect()
                 return
 
-            if now - self._last_real_data_private > ZOMBIE_THRESHOLD_SEC:
-                elapsed = now - self._last_real_data_private
-                self._logger.critical(log_record({
-                    "event": "ZOMBIE_CONNECTION_DETECTED",
-                    "level": "CRITICAL",
-                    "component": "WS_MGR",
-                    "connection_id": self.connection_id_private,
-                    "elapsed_seconds": Decimal(str(round(elapsed, 1))),
-                }))
-                _alert_operator_direct(
-                    f"ZOMBIE connection detected (private). "
-                    f"No real data for {elapsed:.0f}s. Reconnecting."
-                )
-                await self._initiate_reconnect()
-                return
+            # Private zombie check — skipped in paper mode (_ws_private is None)
+            # FIX-WM-PT-004: guard private zombie (DEFECT-WM-PT-002)
+            if self._ws_private is not None:
+                if now - self._last_real_data_private > ZOMBIE_THRESHOLD_SEC:
+                    elapsed = now - self._last_real_data_private
+                    self._logger.critical(log_record({
+                        "event": "ZOMBIE_CONNECTION_DETECTED",
+                        "level": "CRITICAL",
+                        "component": "WS_MGR",
+                        "connection_id": self.connection_id_private,
+                        "elapsed_seconds": Decimal(str(round(elapsed, 1))),
+                    }))
+                    _alert_operator_direct(
+                        f"ZOMBIE connection detected (private). "
+                        f"No real data for {elapsed:.0f}s. Reconnecting."
+                    )
+                    await self._initiate_reconnect()
+                    return
 
     # =================================================================
     # SEQUENCE GAP DETECTION
