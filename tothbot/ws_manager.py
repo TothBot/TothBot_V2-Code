@@ -143,8 +143,8 @@ class PositionRecord:
     tp_cl_ord_id: str = ""
     emergsl_order_id: str = ""
     emergsl_cl_ord_id: str = ""
-    tp_price: Decimal = Decimal("0")        # paper mode: simulated TP price
-    emergsl_price: Decimal = Decimal("0")   # paper mode: simulated emergSL price
+    tp_price: Decimal = Decimal("0")          # paper mode: simulated TP price
+    emergsl_price: Decimal = Decimal("0")     # paper mode: simulated emergSL price
     entry_timestamp_utc: str = ""
     hold_candle_count: int = 0
     mae_pct_reached: Decimal = Decimal("0")
@@ -200,7 +200,7 @@ class WSManager:
         # CIATS Parameter Store — frozen snapshot at pipeline start (AR-I-4)
         self._ciats_params: dict = ciats_param_store or {}
 
-        # Paper trading mode — gated by PAPER_TRADING_MODE env var (TB00063 §2.4.2)
+        # Paper trading mode — activated by PAPER_TRADING_MODE=true env var
         self.paper_mode: bool = bool(config.get("paper_trading_mode", False))
 
         # ── Connection state ──────────────────────────────────────────────
@@ -831,79 +831,54 @@ class WSManager:
                     self,
                 )
 
-            # Paper trading fill simulation — ticker price crossing (TB00063 §2.4.10)
+            # Paper fill detection (TB00063 §2.4.10, FC-005)
             if self.paper_mode and symbol in self.position_mirror:
                 pos = self.position_mirror[symbol]
                 ask = item.get("ask")
 
-                # Paper TP detection: ask crosses tp_price
+                # Paper TP: ask >= tp_price AND PAPER_TP_ prefix guard
                 if (
                     ask is not None
                     and pos.tp_price > Decimal("0")
                     and Decimal(str(ask)) >= pos.tp_price
                     and pos.tp_order_id.startswith("PAPER_TP_")
+                    and self._exit_ctrl_fn
                 ):
                     self._logger.info(log_record({
-                        "event":     "PAPER_TP_FILL_DETECTED",
-                        "level":     "INFO",
+                        "event": "PAPER_TP_FILL_DETECTED",
+                        "level": "INFO",
                         "component": "WS_MGR",
-                        "symbol":    symbol,
-                        "ask":       ask,
-                        "tp_price":  str(pos.tp_price),
+                        "symbol": symbol,
+                        "ask": ask,
+                        "tp_price": pos.tp_price,
                     }))
-                    fee_usd = pos.qty * pos.tp_price * Decimal("0.0026")
-                    if self._exit_ctrl_fn:
-                        await self._exit_ctrl_fn(
-                            symbol,
-                            {
-                                "trigger":     "tp_filled",
-                                "fill_price":  pos.tp_price,
-                                "qty":         pos.qty,
-                                "fees":        fee_usd,
-                                "exit_reason": "TP_FILL",
-                            },
-                            self,
-                        )
-                    # Clear paper TP flag to prevent re-fire
-                    pos.tp_price = Decimal("0")
+                    pos.tp_price = Decimal("0")  # prevent re-fire
+                    await self._exit_ctrl_fn(symbol, {"trigger": "tp_filled"}, self)
 
-                # Paper emergSL detection: bid crosses emergsl_price
-                # PT-VAL-004: emergSL MUST NOT fire in paper trading.
-                # If it fires: CRITICAL log + alert + close position.
+                # Paper emergSL: bid <= emergsl_price AND PAPER_SL_ prefix guard
                 elif (
                     bid is not None
                     and pos.emergsl_price > Decimal("0")
                     and Decimal(str(bid)) <= pos.emergsl_price
                     and pos.emergsl_order_id.startswith("PAPER_SL_")
+                    and self._exit_ctrl_fn
                 ):
                     self._logger.critical(log_record({
-                        "event":         "PAPER_EMERG_SL_TRIGGERED",
-                        "level":         "CRITICAL",
-                        "component":     "WS_MGR",
-                        "symbol":        symbol,
-                        "bid":           bid,
-                        "emergsl_price": str(pos.emergsl_price),
-                        "note":          "PT-VAL-004 VIOLATION — investigate before live trading",
+                        "event": "PAPER_EMERG_SL_TRIGGERED",
+                        "level": "CRITICAL",
+                        "component": "WS_MGR",
+                        "symbol": symbol,
+                        "bid": bid,
+                        "emergsl_price": pos.emergsl_price,
+                        "note": "PT-VAL-004 VIOLATION — emergSL must never fire in paper mode",
                     }))
                     _alert_operator_direct(
-                        f"PAPER_EMERG_SL_TRIGGERED for {symbol} "
-                        f"bid={bid} emergsl={pos.emergsl_price}. "
-                        f"PT-VAL-004 VIOLATION. DO NOT GO LIVE until resolved."
+                        f"PT-VAL-004 VIOLATION: paper emergSL triggered for {symbol}. "
+                        f"bid={bid} <= emergsl_price={pos.emergsl_price}. "
+                        "Indicates defect in MAE logic. Closing position."
                     )
-                    fee_usd = pos.qty * Decimal(str(bid)) * Decimal("0.0026")
-                    if self._exit_ctrl_fn:
-                        await self._exit_ctrl_fn(
-                            symbol,
-                            {
-                                "trigger":     "tp_filled",   # reuse exit path
-                                "fill_price":  Decimal(str(bid)),
-                                "qty":         pos.qty,
-                                "fees":        fee_usd,
-                                "exit_reason": "EMERGENCY_SL_FIRED",
-                            },
-                            self,
-                        )
-                    pos.emergsl_price = Decimal("0")
+                    pos.emergsl_price = Decimal("0")  # prevent re-fire
+                    await self._exit_ctrl_fn(symbol, {"trigger": "ticker_bbo", "bid": bid}, self)
 
     async def _handle_instrument(self, msg: dict, is_public: bool = True) -> None:
         """
@@ -1675,21 +1650,20 @@ class WSManager:
                 cl_ord_id=cl_ord_id,
             )
 
-        # Paper mode gate — intercept dispatch, simulate fill (TB00063 §2.4.3)
+        # Paper mode gate — intercept ALL order dispatch (FC-001)
         if self.paper_mode:
             self._logger.info(log_record({
-                "event":     "PAPER_ORDER_SIMULATED",
-                "level":     "INFO",
+                "event": "PAPER_ORDER_SIMULATED",
+                "level": "INFO",
                 "component": "WS_MGR",
-                "symbol":    symbol,
+                "symbol": symbol,
                 "cl_ord_id": cl_ord_id,
                 "limit_price": limit_price,
-                "order_qty":   order_qty,
+                "order_qty": order_qty,
             }))
             asyncio.create_task(
                 self._simulate_entry_fill(symbol, cl_ord_id, limit_price, order_qty)
             )
-            # Switch ticker to bbo mode (position now open — Section 16)
             await self._update_ticker_event_trigger(symbol, "bbo")
             return
 
@@ -1718,22 +1692,24 @@ class WSManager:
         order_qty: Decimal,
     ) -> None:
         """
-        Simulate entry fill in paper trading mode (TB00063 §2.4.4).
-        100ms delay to avoid same-tick race with PositionRecord write.
-        Fill price = limit_price (conservative paper approximation).
-        Fee = order_qty × limit_price × 0.0026 (Kraken taker rate FC-007).
-        Calls _handle_filled() with a synthetic filled event dict.
+        Simulate entry fill for paper trading mode (TB00063 §2.4.4, FC-006).
+        100ms delay avoids same-tick race. Fee = 0.26% taker (FC-007).
+        Drives downstream fill pipeline identically to live Kraken fill.
         """
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.1)  # 100ms — avoids same-tick race
         fee_usd = order_qty * limit_price * Decimal("0.0026")
         synthetic_order_id = f"PAPER_ENTRY_{cl_ord_id}"
         synthetic_event = {
-            "order_id":  synthetic_order_id,
-            "cl_ord_id": cl_ord_id,
-            "symbol":    symbol,
-            "cum_qty":   str(order_qty),
-            "avg_price": str(limit_price),
-            "fees":      [{"asset": "USD", "qty": str(fee_usd)}],
+            "order_id":         synthetic_order_id,
+            "cl_ord_id":        cl_ord_id,
+            "symbol":           symbol,
+            "exec_type":        "filled",
+            "side":             "buy",
+            "last_price":       str(limit_price),
+            "last_qty":         str(order_qty),
+            "cum_cost":         str(order_qty * limit_price),
+            "fee_usd_equiv":    str(fee_usd),
+            "timestamp":        datetime.now(timezone.utc).isoformat(),
         }
         await self._handle_filled(synthetic_event)
 
@@ -1821,23 +1797,23 @@ class WSManager:
             "req_id": req_id,
         }
 
-        # Paper mode gate — store TP/emergSL prices, skip dispatch (TB00063 §2.4.5)
+        # Paper mode gate — intercept batch_add dispatch (FC-001)
         if self.paper_mode:
-            pos = self.position_mirror.get(symbol)
-            if pos is not None:
-                pos.tp_price          = tp_price
-                pos.emergsl_price     = sl_trigger
-                pos.tp_order_id       = f"PAPER_TP_{tp_cl_ord_id}"
-                pos.emergsl_order_id  = f"PAPER_SL_{sl_cl_ord_id}"
+            if symbol in self.position_mirror:
+                pos = self.position_mirror[symbol]
+                pos.tp_price = tp_price
+                pos.emergsl_price = sl_trigger
+                pos.tp_order_id = f"PAPER_TP_{tp_cl_ord_id}"
+                pos.emergsl_order_id = f"PAPER_SL_{sl_cl_ord_id}"
+                pos.tp_cl_ord_id = tp_cl_ord_id
+                pos.emergsl_cl_ord_id = sl_cl_ord_id
             self._logger.info(log_record({
-                "event":        "PAPER_BATCH_ADD_SIMULATED",
-                "level":        "INFO",
-                "component":    "WS_MGR",
-                "symbol":       symbol,
-                "tp_price":     tp_price,
-                "sl_trigger":   sl_trigger,
-                "tp_cl_ord_id": tp_cl_ord_id,
-                "sl_cl_ord_id": sl_cl_ord_id,
+                "event": "PAPER_BATCH_ADD_SIMULATED",
+                "level": "INFO",
+                "component": "WS_MGR",
+                "symbol": symbol,
+                "tp_price": tp_price,
+                "sl_trigger": sl_trigger,
             }))
             return
 
@@ -1865,13 +1841,13 @@ class WSManager:
         Individual cancel with per-order ACK tracking (Section 6.6).
         Used for Layer 2 MAE exit cancel. NOT batch_cancel.
         """
-        # Paper mode gate (TB00063 §2.4.6)
+        # Paper mode gate (FC-001)
         if self.paper_mode:
             self._logger.info(log_record({
-                "event":     "PAPER_CANCEL_SIMULATED",
-                "level":     "INFO",
+                "event": "PAPER_CANCEL_SIMULATED",
+                "level": "INFO",
                 "component": "WS_MGR",
-                "order_id":  order_id,
+                "order_id": order_id,
             }))
             return
 
@@ -1896,13 +1872,13 @@ class WSManager:
         Use ONLY for emergSL qty amendment. NOT price. NOT entry orders.
         Saves 7 rate units vs cancel+resubmit (WM-EC-007).
         """
-        # Paper mode gate (TB00063 §2.4.7) — no-op, log only
+        # Paper mode gate (FC-001) — emergSL is simulated via ticker in paper mode
         if self.paper_mode:
             self._logger.info(log_record({
-                "event":     "PAPER_AMEND_SIMULATED",
-                "level":     "INFO",
+                "event": "PAPER_AMEND_SIMULATED",
+                "level": "INFO",
                 "component": "WS_MGR",
-                "order_id":  order_id,
+                "order_id": order_id,
                 "order_qty": order_qty,
             }))
             return
@@ -1929,14 +1905,14 @@ class WSManager:
         # This method is batch_cancel — NOT cancel_all_orders_after.
         # cancel_all_orders_after is NEVER called in TothBot V2.
 
-        # Paper mode gate (TB00063 §2.4.8) — FULL_HALT fires normally, cancel is no-op
+        # Paper mode gate — FULL_HALT fires normally; no real orders to cancel
         if self.paper_mode:
             self._logger.warning(log_record({
-                "event":     "PAPER_CANCEL_SIMULATED",
-                "level":     "HIGH",
+                "event": "PAPER_CANCEL_SIMULATED",
+                "level": "HIGH",
                 "component": "WS_MGR",
-                "note":      "FULL_HALT in paper mode — batch_cancel suppressed",
-                "count":     len(self.pending_orders),
+                "note": "FULL_HALT in paper mode — batch_cancel suppressed",
+                "count": len(self.pending_orders),
             }))
             return
 
@@ -1958,17 +1934,16 @@ class WSManager:
 
     async def dispatch_market_sell(self, symbol: str, qty: Decimal) -> None:
         """Market sell — used ONLY for partial fill protection cleanup."""
-        # Paper mode gate (TB00063 §2.4.9) — partial fill path is near-impossible
-        # in paper mode (simulated entry fills at limit price immediately)
+        # Paper mode gate (FC-001) — simulated entries fill immediately; rarely fires
         if self.paper_mode:
             bid = self.latest_bid.get(symbol, Decimal("0"))
             self._logger.info(log_record({
-                "event":     "PAPER_MARKET_SELL_SIMULATED",
-                "level":     "INFO",
+                "event": "PAPER_MARKET_SELL_SIMULATED",
+                "level": "INFO",
                 "component": "WS_MGR",
-                "symbol":    symbol,
-                "qty":       qty,
-                "bid":       bid,
+                "symbol": symbol,
+                "qty": qty,
+                "bid": bid,
             }))
             return
 
