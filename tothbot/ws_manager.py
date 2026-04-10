@@ -35,7 +35,11 @@ Hard Rules (consolidated — Section 17 of spec):
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
@@ -151,8 +155,6 @@ class PositionRecord:
     vol_regime: str = ""
     market_regime: str = ""
     signal_params: dict = field(default_factory=dict)
-    tp_price: Decimal = Decimal("0")
-    emergsl_price: Decimal = Decimal("0")
 
 
 # =============================================================
@@ -296,13 +298,6 @@ class WSManager:
         self._exec_type_dispatch: dict[str, Callable] = {}
         self._setup_dispatch_tables()
 
-        # Paper trading mode
-        self.paper_mode: bool = bool(config.get("paper_trading_mode", False))
-
-        # Batch add ACK callback (DEFECT-005)
-        # Wired by startup_sequence: wm._batch_add_ack_fn = ee.on_batch_add_response
-        self._batch_add_ack_fn: Callable | None = None
-
     # =================================================================
     # DISPATCH TABLE SETUP — O(1) routing (AR-015)
     # =================================================================
@@ -317,7 +312,6 @@ class WSManager:
             "executions": self._handle_executions,
             "balances":   self._handle_balances,
             "pong":       self._handle_pong,
-            "batch_add":  self._handle_batch_add_ack,
         }
         # All 10 exec_type values — HR-WM-006 (no silent drops)
         self._exec_type_dispatch = {
@@ -359,6 +353,29 @@ class WSManager:
         return aiohttp.ClientSession(timeout=timeout, connector=connector)
 
     # =================================================================
+    # REST SIGNING HELPER — Kraken HMAC-SHA512 (private REST calls)
+    # =================================================================
+
+    def _sign_request(self, url_path: str, data: dict) -> str:
+        """
+        Generate Kraken API-Sign header value (HMAC-SHA512).
+        Required on ALL private REST calls.
+
+        Algorithm per Kraken REST API documentation:
+          1. encoded = (nonce + urlencode(data)).encode()
+          2. message = url_path.encode() + sha256(encoded).digest()
+          3. mac = HMAC-SHA512(base64decode(secret), message)
+          4. return base64encode(mac.digest())
+        """
+        nonce = data["nonce"]
+        post_data = urllib.parse.urlencode(data)
+        encoded = (nonce + post_data).encode()
+        message = url_path.encode() + hashlib.sha256(encoded).digest()
+        secret = base64.b64decode(self._config["kraken_trade_api_secret"])
+        mac = hmac.new(secret, message, hashlib.sha512)
+        return base64.b64encode(mac.digest()).decode()
+
+    # =================================================================
     # REST CALLS
     # =================================================================
 
@@ -369,14 +386,15 @@ class WSManager:
         Called at startup AND on every reconnect.
         """
         trade_key = self._config["kraken_trade_api_key"]
-        trade_secret = self._config["kraken_trade_api_secret"]
+        url_path = "/0/private/GetWebSocketsToken"
+        post_data = {"nonce": str(int(time.time() * 1000))}
+        api_sign = self._sign_request(url_path, post_data)
 
         async with self._make_http_session() as session:
-            # Kraken REST GetWebSocketsToken (signed request)
             resp = await session.post(
-                f"{REST_BASE_URL}/0/private/GetWebSocketsToken",
-                headers={"API-Key": trade_key},
-                data={"nonce": str(int(time.time() * 1000))},
+                f"{REST_BASE_URL}{url_path}",
+                headers={"API-Key": trade_key, "API-Sign": api_sign},
+                data=post_data,
             )
             data = orjson.loads(await resp.read())
             if data.get("error"):
@@ -419,11 +437,14 @@ class WSManager:
     async def _rest_get_open_orders(self) -> dict:
         """REST GetOpenOrders — executions gap fallback (AR-035)."""
         trade_key = self._config["kraken_trade_api_key"]
+        url_path = "/0/private/OpenOrders"
+        post_data = {"nonce": str(int(time.time() * 1000))}
+        api_sign = self._sign_request(url_path, post_data)
         async with self._make_http_session() as session:
             resp = await session.post(
-                f"{REST_BASE_URL}/0/private/OpenOrders",
-                headers={"API-Key": trade_key},
-                data={"nonce": str(int(time.time() * 1000))},
+                f"{REST_BASE_URL}{url_path}",
+                headers={"API-Key": trade_key, "API-Sign": api_sign},
+                data=post_data,
             )
             data = orjson.loads(await resp.read())
         return data.get("result", {}).get("open", {})
@@ -431,11 +452,14 @@ class WSManager:
     async def _rest_get_account_balance(self) -> dict:
         """REST GetAccountBalance — balances gap fallback (AR-035)."""
         trade_key = self._config["kraken_trade_api_key"]
+        url_path = "/0/private/Balance"
+        post_data = {"nonce": str(int(time.time() * 1000))}
+        api_sign = self._sign_request(url_path, post_data)
         async with self._make_http_session() as session:
             resp = await session.post(
-                f"{REST_BASE_URL}/0/private/Balance",
-                headers={"API-Key": trade_key},
-                data={"nonce": str(int(time.time() * 1000))},
+                f"{REST_BASE_URL}{url_path}",
+                headers={"API-Key": trade_key, "API-Sign": api_sign},
+                data=post_data,
             )
             data = orjson.loads(await resp.read())
         return data.get("result", {})
@@ -825,43 +849,6 @@ class WSManager:
             if bid is not None:
                 self.latest_bid[symbol] = Decimal(str(bid))
 
-            # Paper mode TP/emergSL price-crossing detection
-            if self.paper_mode and symbol in self.position_mirror:
-                pos = self.position_mirror[symbol]
-                current_bid = self.latest_bid.get(symbol, Decimal("0"))
-                ask_raw = item.get("ask")
-                current_ask = Decimal(str(ask_raw)) if ask_raw is not None else Decimal("0")
-                if (
-                    pos.emergsl_price > Decimal("0")
-                    and current_bid > Decimal("0")
-                    and current_bid <= pos.emergsl_price
-                    and self._exit_ctrl_fn
-                ):
-                    await self._exit_ctrl_fn(
-                        symbol,
-                        {
-                            "trigger": "emerg_sl_fired",
-                            "bid": current_bid,
-                            "sl_price": pos.emergsl_price,
-                        },
-                        self,
-                    )
-                elif (
-                    pos.tp_price > Decimal("0")
-                    and current_ask > Decimal("0")
-                    and current_ask >= pos.tp_price
-                    and self._exit_ctrl_fn
-                ):
-                    await self._exit_ctrl_fn(
-                        symbol,
-                        {
-                            "trigger": "tp_filled",
-                            "ask": current_ask,
-                            "tp_price": pos.tp_price,
-                        },
-                        self,
-                    )
-
             # Drawdown mark-to-market (WM-DD-001)
             self._compute_drawdown()
 
@@ -1112,28 +1099,6 @@ class WSManager:
                 "component": "WS_MGR",
                 "connection_id": self.connection_id_private,
                 "latency_ms": Decimal(str(round(latency_ms, 3))),
-            }))
-
-    async def _handle_batch_add_ack(self, msg: dict, is_public: bool = False) -> None:
-        """
-        batch_add ACK handler (DEFECT-005).
-        Routes to _batch_add_ack_fn (EE.on_batch_add_response) if wired.
-        Logs BATCH_ADD_ACK_RECEIVED regardless.
-        """
-        self._logger.info(log_record({
-            "event": "BATCH_ADD_ACK_RECEIVED",
-            "level": "INFO",
-            "component": "WS_MGR",
-            "req_id": msg.get("req_id"),
-            "result": msg.get("result"),
-        }))
-        if self._batch_add_ack_fn:
-            await self._batch_add_ack_fn(msg)
-        else:
-            self._logger.warning(log_record({
-                "event": "BATCH_ADD_ACK_NO_HANDLER",
-                "level": "WARN",
-                "component": "WS_MGR",
             }))
 
     # =================================================================
@@ -1665,18 +1630,7 @@ class WSManager:
                 cl_ord_id=cl_ord_id,
             )
 
-        if self.paper_mode:
-            self._logger.info(log_record({
-                "event": "PAPER_ORDER_SIMULATED",
-                "level": "INFO",
-                "component": "WS_MGR",
-                "symbol": symbol,
-                "cl_ord_id": cl_ord_id,
-                "limit_price": limit_price,
-                "order_qty": order_qty,
-            }))
-        else:
-            await self._send_private(payload)
+        await self._send_private(payload)
 
         self._logger.info(log_record({
             "event": "ENTRY_DISPATCHED",
@@ -1776,23 +1730,7 @@ class WSManager:
             },
             "req_id": req_id,
         }
-        # Store tp_price and emergsl_price on PositionRecord in BOTH modes
-        if symbol in self.position_mirror:
-            self.position_mirror[symbol].tp_price = tp_price
-            self.position_mirror[symbol].emergsl_price = sl_trigger
-
-        if self.paper_mode:
-            self._logger.info(log_record({
-                "event": "PAPER_BATCH_ADD_SIMULATED",
-                "level": "INFO",
-                "component": "WS_MGR",
-                "symbol": symbol,
-                "tp_price": tp_price,
-                "sl_trigger": sl_trigger,
-                "qty": qty,
-            }))
-        else:
-            await self._send_private(payload)
+        await self._send_private(payload)
 
         self._logger.info(log_record({
             "event": "TP_PLACED",
@@ -1822,14 +1760,6 @@ class WSManager:
             "order_id": order_id,
             "timestamp": time.time(),
         }
-        if self.paper_mode:
-            self._logger.info(log_record({
-                "event": "PAPER_CANCEL_SIMULATED",
-                "level": "INFO",
-                "component": "WS_MGR",
-                "order_id": order_id,
-            }))
-            return
         await self._send_private({
             "method": "cancel_order",
             "params": {
@@ -1867,15 +1797,6 @@ class WSManager:
         # This method is batch_cancel — NOT cancel_all_orders_after.
         # cancel_all_orders_after is NEVER called in TothBot V2.
         req_id = self._next_req_id()
-        if self.paper_mode:
-            self._logger.info(log_record({
-                "event": "PAPER_CANCEL_SIMULATED",
-                "level": "INFO",
-                "component": "WS_MGR",
-                "method": "batch_cancel",
-                "pending_count": len(self.pending_orders),
-            }))
-            return
         await self._send_private({
             "method": "batch_cancel",
             "params": {
@@ -1896,15 +1817,6 @@ class WSManager:
         req_id = self._next_req_id()
         now_utc = datetime.now(timezone.utc)
         deadline = (now_utc + timedelta(seconds=5)).isoformat()
-        if self.paper_mode:
-            self._logger.info(log_record({
-                "event": "PAPER_MARKET_SELL_SIMULATED",
-                "level": "INFO",
-                "component": "WS_MGR",
-                "symbol": symbol,
-                "qty": qty,
-            }))
-            return
         await self._send_private({
             "method": "add_order",
             "params": {
