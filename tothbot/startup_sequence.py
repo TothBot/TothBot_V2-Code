@@ -19,13 +19,13 @@ Responsibilities:
        ExecutionEngine, ExitController, SignalPipeline,
        LongModule, SelectionController, CIATS, WSManager.
   6. Launch CIATS as a background asyncio.Task.
-  7. Run WSManager.run() — drives startup Steps 2-10
+  7. Run WSManager.run() — drives startup Steps 2–10
      and continuous operation thereafter.
 
-Steps 2-10 (WS connect, subscribe, reconcile, warm-up,
+Steps 2–10 (WS connect, subscribe, reconcile, warm-up,
 regime seed, READY detection, pipeline, watchdog) are
 owned and executed by WSManager per 1011014 dv1_3 Sections
-6-9. startup_sequence.py does NOT duplicate WS logic.
+6–9. startup_sequence.py does NOT duplicate WS logic.
 
 Startup Sequence (1011014 dv1_3 Section 6):
   Step 1   Kraken Status API check         — THIS MODULE
@@ -43,7 +43,7 @@ sd_notify READY=1: sent by WSManager.run() after Step 9
 (SS-STARTUP-026). This module does NOT send sd_notify.
 
 Reconnect sequence (1011014 dv1_3 Section 9):
-  Steps R1-R11 owned entirely by WSManager.
+  Steps R1–R11 owned entirely by WSManager.
   portfolio_baseline_USD NEVER reset on reconnect.
   system_state PRESERVED across reconnect.
 
@@ -177,11 +177,6 @@ def _load_config() -> dict:
         )
         sys.exit(1)
 
-    # Paper trading mode — set PAPER_TRADING_MODE=true in environment to enable.
-    # All order sends suppressed. Position Mirror and P&L tracking active.
-    # Kraken TP/emergSL detection simulated via ticker bid/ask crossing.
-    paper_mode = os.environ.get("PAPER_TRADING_MODE", "false").lower() == "true"
-
     return {
         # Kraken DATA key pair — market data, public REST (AR-004)
         "kraken_data_api_key":    os.environ["KRAKEN_DATA_API_KEY"],
@@ -198,8 +193,10 @@ def _load_config() -> dict:
         "alert_to":     os.environ.get("ALERT_EMAIL_TO",    "alert@tothbot.com"),
         # Log file path — used by CIATS for tail (1011010 dv1_6)
         "log_file_path": os.environ.get("TOTHBOT_LOG_FILE", LOG_FILE),
-        # Paper trading mode — passed to WSManager (0211005)
-        "paper_trading_mode": paper_mode,
+        # Paper trading mode — intercept all order dispatch when true (TB00063 §2.4.11)
+        "paper_trading_mode": os.environ.get(
+            "PAPER_TRADING_MODE", "false"
+        ).lower() == "true",
     }
 
 
@@ -240,8 +237,8 @@ def _build_components(
       2. RegimeEngine      — no TothBot deps
       3. WSManager         — must exist before RiskEngine (wm ref)
       4. RiskEngine        — needs wm, pm, logger
-      5. ExecutionEngine   — needs wm, re, logger
-      6. ExitController    — needs re, rge, logger
+      5. ExecutionEngine   — needs wm, re, pm, logger
+      6. ExitController    — needs wm, re, pm, logger
       7. SignalPipeline    — needs wm, re, pm, rge
       8. LongModule        — needs wm, re, pm, ee
       9. SelectionController — needs sp (signal_pipeline ref)
@@ -285,19 +282,11 @@ def _build_components(
     )
 
     # ── 5. ExecutionEngine ────────────────────────────────────
-    # position_mirror param is optional (default=None) — WM is SOLE WRITER
-    # per HR-PM-009. EE writes to wm.position_mirror directly.
     ee = ExecutionEngine(
         ws_manager=wm,
         risk_engine=re,
-        position_mirror=pm,
         logger=logger,
     )
-
-    # ── Wire batch_add ACK callback (DEFECT-005 fix) ──────────
-    # WSManager._handle_batch_add_ack() calls self._batch_add_ack_fn(msg).
-    # Must be wired after both wm and ee are instantiated.
-    wm._batch_add_ack_fn = ee.on_batch_add_response
 
     # ── 6. ExitController ─────────────────────────────────────
     ec = ExitController(
@@ -412,7 +401,7 @@ async def _async_main() -> None:
 
     Startup sequence per 1011014 dv1_3:
       Step 1   — THIS FUNCTION (Kraken Status API check)
-      Steps 2-10 — WSManager.run()
+      Steps 2–10 — WSManager.run()
 
     CIATS runs as an asyncio.Task in the same event loop.
     Fatal exceptions propagate up to run() which exits(1).
@@ -432,22 +421,21 @@ async def _async_main() -> None:
         "pairs":     len(universe),
     }))
 
-    # ── Log paper trading mode at startup ──────────────────────
+    # ── Log paper trading mode (TB00063 §2.4.11) ───────────────
     paper_mode = config.get("paper_trading_mode", False)
     if paper_mode:
         logger.info(log_record({
             "event":     "PAPER_TRADING_MODE_ON",
             "level":     "INFO",
             "component": "STARTUP",
-            "note":      "Paper trading active — all order sends suppressed. "
-                         "P&L and Position Mirror tracking live.",
+            "note":      "Order dispatch suppressed. Fills simulated.",
         }))
     else:
         logger.info(log_record({
             "event":     "PAPER_TRADING_MODE_OFF",
             "level":     "INFO",
             "component": "STARTUP",
-            "note":      "Live trading mode — orders will be sent to Kraken.",
+            "note":      "LIVE TRADING MODE — real orders will be placed.",
         }))
 
     # ── STEP 1: Kraken Status API Check (SS-STARTUP-001/002/003) ─
@@ -475,7 +463,7 @@ async def _async_main() -> None:
         name="ciats",
     )
 
-    # ── Run WSManager — Steps 2-10 and continuous operation ────
+    # ── Run WSManager — Steps 2–10 and continuous operation ────
     # WSManager.run() blocks until fatal failure or shutdown.
     # systemd WatchdogSec=120 restarts TothBot on fatal exit.
     # Open positions protected by resting emergSL orders (AR-046).

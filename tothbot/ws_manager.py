@@ -35,11 +35,7 @@ Hard Rules (consolidated — Section 17 of spec):
 from __future__ import annotations
 
 import asyncio
-import base64
-import hashlib
-import hmac
 import time
-import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
@@ -147,6 +143,8 @@ class PositionRecord:
     tp_cl_ord_id: str = ""
     emergsl_order_id: str = ""
     emergsl_cl_ord_id: str = ""
+    tp_price: Decimal = Decimal("0")        # paper mode: simulated TP price
+    emergsl_price: Decimal = Decimal("0")   # paper mode: simulated emergSL price
     entry_timestamp_utc: str = ""
     hold_candle_count: int = 0
     mae_pct_reached: Decimal = Decimal("0")
@@ -201,6 +199,9 @@ class WSManager:
 
         # CIATS Parameter Store — frozen snapshot at pipeline start (AR-I-4)
         self._ciats_params: dict = ciats_param_store or {}
+
+        # Paper trading mode — gated by PAPER_TRADING_MODE env var (TB00063 §2.4.2)
+        self.paper_mode: bool = bool(config.get("paper_trading_mode", False))
 
         # ── Connection state ──────────────────────────────────────────────
         self._ws_public: Any = None
@@ -353,29 +354,6 @@ class WSManager:
         return aiohttp.ClientSession(timeout=timeout, connector=connector)
 
     # =================================================================
-    # REST SIGNING HELPER — Kraken HMAC-SHA512 (private REST calls)
-    # =================================================================
-
-    def _sign_request(self, url_path: str, data: dict) -> str:
-        """
-        Generate Kraken API-Sign header value (HMAC-SHA512).
-        Required on ALL private REST calls.
-
-        Algorithm per Kraken REST API documentation:
-          1. encoded = (nonce + urlencode(data)).encode()
-          2. message = url_path.encode() + sha256(encoded).digest()
-          3. mac = HMAC-SHA512(base64decode(secret), message)
-          4. return base64encode(mac.digest())
-        """
-        nonce = data["nonce"]
-        post_data = urllib.parse.urlencode(data)
-        encoded = (nonce + post_data).encode()
-        message = url_path.encode() + hashlib.sha256(encoded).digest()
-        secret = base64.b64decode(self._config["kraken_trade_api_secret"])
-        mac = hmac.new(secret, message, hashlib.sha512)
-        return base64.b64encode(mac.digest()).decode()
-
-    # =================================================================
     # REST CALLS
     # =================================================================
 
@@ -386,15 +364,14 @@ class WSManager:
         Called at startup AND on every reconnect.
         """
         trade_key = self._config["kraken_trade_api_key"]
-        url_path = "/0/private/GetWebSocketsToken"
-        post_data = {"nonce": str(int(time.time() * 1000))}
-        api_sign = self._sign_request(url_path, post_data)
+        trade_secret = self._config["kraken_trade_api_secret"]
 
         async with self._make_http_session() as session:
+            # Kraken REST GetWebSocketsToken (signed request)
             resp = await session.post(
-                f"{REST_BASE_URL}{url_path}",
-                headers={"API-Key": trade_key, "API-Sign": api_sign},
-                data=post_data,
+                f"{REST_BASE_URL}/0/private/GetWebSocketsToken",
+                headers={"API-Key": trade_key},
+                data={"nonce": str(int(time.time() * 1000))},
             )
             data = orjson.loads(await resp.read())
             if data.get("error"):
@@ -437,14 +414,11 @@ class WSManager:
     async def _rest_get_open_orders(self) -> dict:
         """REST GetOpenOrders — executions gap fallback (AR-035)."""
         trade_key = self._config["kraken_trade_api_key"]
-        url_path = "/0/private/OpenOrders"
-        post_data = {"nonce": str(int(time.time() * 1000))}
-        api_sign = self._sign_request(url_path, post_data)
         async with self._make_http_session() as session:
             resp = await session.post(
-                f"{REST_BASE_URL}{url_path}",
-                headers={"API-Key": trade_key, "API-Sign": api_sign},
-                data=post_data,
+                f"{REST_BASE_URL}/0/private/OpenOrders",
+                headers={"API-Key": trade_key},
+                data={"nonce": str(int(time.time() * 1000))},
             )
             data = orjson.loads(await resp.read())
         return data.get("result", {}).get("open", {})
@@ -452,14 +426,11 @@ class WSManager:
     async def _rest_get_account_balance(self) -> dict:
         """REST GetAccountBalance — balances gap fallback (AR-035)."""
         trade_key = self._config["kraken_trade_api_key"]
-        url_path = "/0/private/Balance"
-        post_data = {"nonce": str(int(time.time() * 1000))}
-        api_sign = self._sign_request(url_path, post_data)
         async with self._make_http_session() as session:
             resp = await session.post(
-                f"{REST_BASE_URL}{url_path}",
-                headers={"API-Key": trade_key, "API-Sign": api_sign},
-                data=post_data,
+                f"{REST_BASE_URL}/0/private/Balance",
+                headers={"API-Key": trade_key},
+                data={"nonce": str(int(time.time() * 1000))},
             )
             data = orjson.loads(await resp.read())
         return data.get("result", {})
@@ -859,6 +830,80 @@ class WSManager:
                     {"trigger": "ticker_bbo", "bid": self.latest_bid.get(symbol)},
                     self,
                 )
+
+            # Paper trading fill simulation — ticker price crossing (TB00063 §2.4.10)
+            if self.paper_mode and symbol in self.position_mirror:
+                pos = self.position_mirror[symbol]
+                ask = item.get("ask")
+
+                # Paper TP detection: ask crosses tp_price
+                if (
+                    ask is not None
+                    and pos.tp_price > Decimal("0")
+                    and Decimal(str(ask)) >= pos.tp_price
+                    and pos.tp_order_id.startswith("PAPER_TP_")
+                ):
+                    self._logger.info(log_record({
+                        "event":     "PAPER_TP_FILL_DETECTED",
+                        "level":     "INFO",
+                        "component": "WS_MGR",
+                        "symbol":    symbol,
+                        "ask":       ask,
+                        "tp_price":  str(pos.tp_price),
+                    }))
+                    fee_usd = pos.qty * pos.tp_price * Decimal("0.0026")
+                    if self._exit_ctrl_fn:
+                        await self._exit_ctrl_fn(
+                            symbol,
+                            {
+                                "trigger":     "tp_filled",
+                                "fill_price":  pos.tp_price,
+                                "qty":         pos.qty,
+                                "fees":        fee_usd,
+                                "exit_reason": "TP_FILL",
+                            },
+                            self,
+                        )
+                    # Clear paper TP flag to prevent re-fire
+                    pos.tp_price = Decimal("0")
+
+                # Paper emergSL detection: bid crosses emergsl_price
+                # PT-VAL-004: emergSL MUST NOT fire in paper trading.
+                # If it fires: CRITICAL log + alert + close position.
+                elif (
+                    bid is not None
+                    and pos.emergsl_price > Decimal("0")
+                    and Decimal(str(bid)) <= pos.emergsl_price
+                    and pos.emergsl_order_id.startswith("PAPER_SL_")
+                ):
+                    self._logger.critical(log_record({
+                        "event":         "PAPER_EMERG_SL_TRIGGERED",
+                        "level":         "CRITICAL",
+                        "component":     "WS_MGR",
+                        "symbol":        symbol,
+                        "bid":           bid,
+                        "emergsl_price": str(pos.emergsl_price),
+                        "note":          "PT-VAL-004 VIOLATION — investigate before live trading",
+                    }))
+                    _alert_operator_direct(
+                        f"PAPER_EMERG_SL_TRIGGERED for {symbol} "
+                        f"bid={bid} emergsl={pos.emergsl_price}. "
+                        f"PT-VAL-004 VIOLATION. DO NOT GO LIVE until resolved."
+                    )
+                    fee_usd = pos.qty * Decimal(str(bid)) * Decimal("0.0026")
+                    if self._exit_ctrl_fn:
+                        await self._exit_ctrl_fn(
+                            symbol,
+                            {
+                                "trigger":     "tp_filled",   # reuse exit path
+                                "fill_price":  Decimal(str(bid)),
+                                "qty":         pos.qty,
+                                "fees":        fee_usd,
+                                "exit_reason": "EMERGENCY_SL_FIRED",
+                            },
+                            self,
+                        )
+                    pos.emergsl_price = Decimal("0")
 
     async def _handle_instrument(self, msg: dict, is_public: bool = True) -> None:
         """
@@ -1630,6 +1675,24 @@ class WSManager:
                 cl_ord_id=cl_ord_id,
             )
 
+        # Paper mode gate — intercept dispatch, simulate fill (TB00063 §2.4.3)
+        if self.paper_mode:
+            self._logger.info(log_record({
+                "event":     "PAPER_ORDER_SIMULATED",
+                "level":     "INFO",
+                "component": "WS_MGR",
+                "symbol":    symbol,
+                "cl_ord_id": cl_ord_id,
+                "limit_price": limit_price,
+                "order_qty":   order_qty,
+            }))
+            asyncio.create_task(
+                self._simulate_entry_fill(symbol, cl_ord_id, limit_price, order_qty)
+            )
+            # Switch ticker to bbo mode (position now open — Section 16)
+            await self._update_ticker_event_trigger(symbol, "bbo")
+            return
+
         await self._send_private(payload)
 
         self._logger.info(log_record({
@@ -1646,6 +1709,33 @@ class WSManager:
 
         # Switch ticker to bbo mode (position now open — Section 16)
         await self._update_ticker_event_trigger(symbol, "bbo")
+
+    async def _simulate_entry_fill(
+        self,
+        symbol: str,
+        cl_ord_id: str,
+        limit_price: Decimal,
+        order_qty: Decimal,
+    ) -> None:
+        """
+        Simulate entry fill in paper trading mode (TB00063 §2.4.4).
+        100ms delay to avoid same-tick race with PositionRecord write.
+        Fill price = limit_price (conservative paper approximation).
+        Fee = order_qty × limit_price × 0.0026 (Kraken taker rate FC-007).
+        Calls _handle_filled() with a synthetic filled event dict.
+        """
+        await asyncio.sleep(0.1)
+        fee_usd = order_qty * limit_price * Decimal("0.0026")
+        synthetic_order_id = f"PAPER_ENTRY_{cl_ord_id}"
+        synthetic_event = {
+            "order_id":  synthetic_order_id,
+            "cl_ord_id": cl_ord_id,
+            "symbol":    symbol,
+            "cum_qty":   str(order_qty),
+            "avg_price": str(limit_price),
+            "fees":      [{"asset": "USD", "qty": str(fee_usd)}],
+        }
+        await self._handle_filled(synthetic_event)
 
     async def batch_add(
         self,
@@ -1730,6 +1820,27 @@ class WSManager:
             },
             "req_id": req_id,
         }
+
+        # Paper mode gate — store TP/emergSL prices, skip dispatch (TB00063 §2.4.5)
+        if self.paper_mode:
+            pos = self.position_mirror.get(symbol)
+            if pos is not None:
+                pos.tp_price          = tp_price
+                pos.emergsl_price     = sl_trigger
+                pos.tp_order_id       = f"PAPER_TP_{tp_cl_ord_id}"
+                pos.emergsl_order_id  = f"PAPER_SL_{sl_cl_ord_id}"
+            self._logger.info(log_record({
+                "event":        "PAPER_BATCH_ADD_SIMULATED",
+                "level":        "INFO",
+                "component":    "WS_MGR",
+                "symbol":       symbol,
+                "tp_price":     tp_price,
+                "sl_trigger":   sl_trigger,
+                "tp_cl_ord_id": tp_cl_ord_id,
+                "sl_cl_ord_id": sl_cl_ord_id,
+            }))
+            return
+
         await self._send_private(payload)
 
         self._logger.info(log_record({
@@ -1754,6 +1865,16 @@ class WSManager:
         Individual cancel with per-order ACK tracking (Section 6.6).
         Used for Layer 2 MAE exit cancel. NOT batch_cancel.
         """
+        # Paper mode gate (TB00063 §2.4.6)
+        if self.paper_mode:
+            self._logger.info(log_record({
+                "event":     "PAPER_CANCEL_SIMULATED",
+                "level":     "INFO",
+                "component": "WS_MGR",
+                "order_id":  order_id,
+            }))
+            return
+
         req_id = self._next_req_id()
         self.req_id_registry[req_id] = {
             "method": "cancel_order",
@@ -1775,6 +1896,17 @@ class WSManager:
         Use ONLY for emergSL qty amendment. NOT price. NOT entry orders.
         Saves 7 rate units vs cancel+resubmit (WM-EC-007).
         """
+        # Paper mode gate (TB00063 §2.4.7) — no-op, log only
+        if self.paper_mode:
+            self._logger.info(log_record({
+                "event":     "PAPER_AMEND_SIMULATED",
+                "level":     "INFO",
+                "component": "WS_MGR",
+                "order_id":  order_id,
+                "order_qty": order_qty,
+            }))
+            return
+
         req_id = self._next_req_id()
         await self._send_private({
             "method": "amend_order",
@@ -1796,6 +1928,18 @@ class WSManager:
         # EXPLICIT PROHIBITION CHECK (WM-DMS-001, HR-WM-010)
         # This method is batch_cancel — NOT cancel_all_orders_after.
         # cancel_all_orders_after is NEVER called in TothBot V2.
+
+        # Paper mode gate (TB00063 §2.4.8) — FULL_HALT fires normally, cancel is no-op
+        if self.paper_mode:
+            self._logger.warning(log_record({
+                "event":     "PAPER_CANCEL_SIMULATED",
+                "level":     "HIGH",
+                "component": "WS_MGR",
+                "note":      "FULL_HALT in paper mode — batch_cancel suppressed",
+                "count":     len(self.pending_orders),
+            }))
+            return
+
         req_id = self._next_req_id()
         await self._send_private({
             "method": "batch_cancel",
@@ -1814,6 +1958,20 @@ class WSManager:
 
     async def dispatch_market_sell(self, symbol: str, qty: Decimal) -> None:
         """Market sell — used ONLY for partial fill protection cleanup."""
+        # Paper mode gate (TB00063 §2.4.9) — partial fill path is near-impossible
+        # in paper mode (simulated entry fills at limit price immediately)
+        if self.paper_mode:
+            bid = self.latest_bid.get(symbol, Decimal("0"))
+            self._logger.info(log_record({
+                "event":     "PAPER_MARKET_SELL_SIMULATED",
+                "level":     "INFO",
+                "component": "WS_MGR",
+                "symbol":    symbol,
+                "qty":       qty,
+                "bid":       bid,
+            }))
+            return
+
         req_id = self._next_req_id()
         now_utc = datetime.now(timezone.utc)
         deadline = (now_utc + timedelta(seconds=5)).isoformat()
