@@ -1,0 +1,48 @@
+# DocDCN:     1011013
+# DocTitle:   TothBot_Systemd_Service_Unit
+# DocVersion: dv1_4
+# DocOwner:   Bill
+# DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot_service.txt
+# DocDate:    04-11-2026
+# DocTime:    23:59:59 UTC
+#
+# ============================================================
+# REVISION HISTORY
+# ============================================================
+#
+#   dv1_4  04-11-2026  Document control header added per
+#                      BP-HDR-001. Governed by 1011013
+#                      VPS_Deployment_Coding_Spec dv1_4.
+#                      DocVersion tracks governing spec
+#                      version. TB00080 corrective action.
+#                      First DC-compliant version. Unit
+#                      file content unchanged.
+#                      Deploy to VPS as: tothbot.service
+#
+# ============================================================
+# TothBot V2 — systemd Service Unit File
+# Governing spec: 1011013 VPS_Deployment_Coding_Spec dv1_4
+# Deploy to VPS: /etc/systemd/system/tothbot.service
+# ============================================================
+
+[Unit]
+Description=TothBot V2 Automated Cryptocurrency Trading System
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+ExecStart=/root/tothbot_env/bin/python3 -m tothbot
+WorkingDirectory=/root/TothBot_V2-Code
+EnvironmentFile=/root/.tothbot.env
+Restart=on-failure
+RestartSec=5
+WatchdogSec=120
+LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tothbot
+
+[Install]
+WantedBy=multi-user.target

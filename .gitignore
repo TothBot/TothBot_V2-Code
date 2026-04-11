@@ -1,0 +1,57 @@
+# DocDCN:     1011001
+# DocTitle:   Git_Ignore_Configuration
+# DocVersion: dv1_0
+# DocOwner:   Bill
+# DocPath:    github.com/TothBot/TothBot_V2-Code/.gitignore
+# DocDate:    04-11-2026
+# DocTime:    23:59:59 UTC
+#
+# ============================================================
+# REVISION HISTORY
+# ============================================================
+#
+#   dv1_0  04-11-2026  Document control header added per
+#                      BP-HDR-001. Governed by 1011001
+#                      Engineering_Best_Practices dv1_7.
+#                      TB00080 corrective action. First
+#                      DC-compliant version. Content
+#                      unchanged from prior uncontrolled
+#                      state.
+#
+# ============================================================
+# TothBot V2 — Git Ignore Configuration
+# Governing spec: 1011001 Engineering_Best_Practices dv1_7
+# Repository: github.com/TothBot/TothBot_V2-Code
+# ============================================================
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+
+# Never commit logs or secrets
+logs/
+*.log
+.env
+secrets/
+*.key
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/

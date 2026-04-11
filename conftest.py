@@ -1,15 +1,20 @@
 """
 DocDCN:     1021001
 DocTitle:   Shared_Test_Fixtures_Component
-DocVersion: dv1_0
+DocVersion: dv1_1
 DocOwner:   Bill
-DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/conftest.py
-DocDate:    04-05-2026
+DocPath:    github.com/TothBot/TothBot_V2-Code/conftest.py
+DocDate:    04-11-2026
 DocTime:    23:59:59 UTC
 
 ============================================================
 REVISION HISTORY
 ============================================================
+
+  dv1_1  04-11-2026  DocPath corrected. Was incorrectly
+                     set to tothbot/conftest.py. Correct
+                     path is repo root: conftest.py.
+                     TB00080 corrective action.
 
   dv1_0  04-05-2026  Initial Phase 8 implementation.
                      Written to 1021001 Unit_Test_Specification
