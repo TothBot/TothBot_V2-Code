@@ -611,6 +611,8 @@ class WSManager:
             # Connect public WS only
             self._ws_public = await self._ws_connect(PUBLIC_WS_URI)
             await self._subscribe_public()
+            # Reset zombie timer — clock starts from connection live, not __init__
+            self._last_real_data_public = time.monotonic()
             return
 
         # Step 1: Acquire WS auth token
@@ -623,6 +625,9 @@ class WSManager:
         # Step 4: Subscribe all channels
         await self._subscribe_public()
         await self._subscribe_private()
+        # Reset zombie timers — clock starts from connection live, not __init__
+        self._last_real_data_public = time.monotonic()
+        self._last_real_data_private = time.monotonic()
 
     async def _main_loop(self) -> None:
         """
