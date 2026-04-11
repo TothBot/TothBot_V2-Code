@@ -195,7 +195,7 @@ class ExecutionEngine:
         mae_pct           = Decimal(str(output["mae_pct"]))
 
         # pair_spec from WSManager pair_specs (pair_cache)
-        pair_spec = self._wm.pair_cache.get(symbol, {})
+        pair_spec = self._wm.pair_specs.get(symbol, {})
         price_incr = Decimal(str(pair_spec["price_increment"]))
         qty_incr   = Decimal(str(pair_spec["qty_increment"]))
         qty_min    = Decimal(str(pair_spec["qty_min"]))
@@ -248,31 +248,11 @@ class ExecutionEngine:
             "req_id": req_id,
         }
 
-        await self._wm._ws_private.send(orjson.dumps(entry_msg).decode())
-
-        # Recover atr_14 BEFORE pm.create() so entry_atr_14 is accurate.
-        # mae_pct = atr_14 * mae_mult / entry_limit_price →
-        # atr_14  = mae_pct * entry_limit_price / mae_mult
-        mae_pct  = Decimal(str(output["mae_pct"]))
-        mae_mult = Decimal(str(self._re._params.get("mae_mult", "1.5")))
-        atr_14   = (mae_pct * entry_limit_price / mae_mult).quantize(
-            Decimal("0.00000001"), rounding=ROUND_DOWN
-        )
+        await self._wm.ws_private.send(orjson.dumps(entry_msg).decode())
 
         # EE-ADD-006: at-dispatch actions BEFORE any Kraken response
         # (a) Create Position Mirror record (no async gap — EE-ID-002)
-        self._pm.create(
-            symbol=symbol,
-            entry_limit_price=entry_limit_price,
-            qty=entry_qty,
-            cl_ord_id_entry=cl_ord_id,
-            tp_cl_ord_id="",                              # set on batch_add ACK
-            emgsl_cl_ord_id="",                          # set on batch_add ACK
-            entry_atr_14=atr_14,
-            asset_regime=output.get("asset_regime", ""),
-            market_regime=output.get("market_regime", ""),
-            signal_params=output.get("signal_params", {}),
-        )
+        self._pm.create_record(symbol, cl_ord_id, entry_limit_price, entry_qty)
 
         # (b) Add to Pending Order Registry (available_USD tracking in Gate 7)
         self._wm.pending_orders[cl_ord_id] = entry_qty * entry_limit_price
@@ -284,7 +264,15 @@ class ExecutionEngine:
             "symbol": symbol,
         }
 
-        # (d) Store entry context for post-fill processing
+        # Recover atr_14 for post-fill recomputation (EE-BA-002).
+        # mae_pct = atr_14 * mae_mult / entry_limit_price  →
+        # atr_14 = mae_pct * entry_limit_price / mae_mult
+        mae_mult = Decimal(str(self._re._params.get("mae_mult", "1.5")))
+        atr_14   = (mae_pct * entry_limit_price / mae_mult).quantize(
+            Decimal("0.00000001"), rounding=ROUND_DOWN
+        )
+
+        # Store entry context for post-fill processing
         self._entry_orders[cl_ord_id] = {
             "symbol":            symbol,
             "entry_qty":         entry_qty,
@@ -452,12 +440,12 @@ class ExecutionEngine:
                         "deadline":      _deadline_now_plus_5s(),  # HR-EE-003
                     },
                 ],
-                "token": self._wm._ws_token,
+                "token": self._wm.ws_token,
             },
             "req_id": req_id,
         }
 
-        await self._wm._ws_private.send(orjson.dumps(ba_msg).decode())
+        await self._wm.ws_private.send(orjson.dumps(ba_msg).decode())
 
         # Track batch_add for ACK correlation (EE-BA-006)
         self._batch_pending[req_id] = {
@@ -514,7 +502,7 @@ class ExecutionEngine:
 
         # EE-REJ-001: remove from registry, clear PM, release semaphore
         self._wm.pending_orders.pop(cl_ord_id, None)
-        self._pm.close_position(symbol, "POST_ONLY_REJECTED")
+        self._pm.clear_record(symbol)
         self._re.release_semaphore()
 
     async def _on_entry_expired(self, event: dict) -> None:
@@ -547,7 +535,7 @@ class ExecutionEngine:
             # No fill — clean up fully (EE-REJ-002)
             self._entry_orders.pop(cl_ord_id, None)
             self._wm.pending_orders.pop(cl_ord_id, None)
-            self._pm.close_position(symbol, "GTD_EXPIRED_ZERO_FILL")
+            self._pm.clear_record(symbol)
             self._re.release_semaphore()
         else:
             # Partial fill — treat as entry fill, dispatch TP+emergSL (EE-REJ-002)

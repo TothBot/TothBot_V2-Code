@@ -90,11 +90,9 @@ class RiskEngine:
 
     Injected dependencies:
         logger:              logging.Logger ("tothbot" instance)
-        position_mirror:     PositionMirror — retained for call-site
-                             compatibility; MTM reads go through
-                             ws_manager.position_mirror (DEFECT-006 fix)
+        position_mirror:     PositionMirror — read-only for open count
         ws_manager:          WSManager — spot_usd_balance, pending_orders,
-                             latest_bid, position_mirror, batch_cancel
+                             latest_bid, batch_cancel callable
         param_store:         dict — frozen CIATS Parameter Store snapshot
 
     Lifecycle:
@@ -113,7 +111,7 @@ class RiskEngine:
         param_store: dict | None = None,
     ) -> None:
         self._logger = logger
-        self._pm = position_mirror  # retained for compat; MTM uses self._wm
+        self._pm = position_mirror
         self._wm = ws_manager
         self._params: dict = param_store or {}
 
@@ -202,10 +200,9 @@ class RiskEngine:
         # MTM: cash + unrealized value of all open positions
         spot_balance = Decimal(str(self._wm.spot_usd_balance))
 
-        # DEFECT-006 FIX: self._pm.all_records does not exist at runtime.
-        # Runtime positions are in self._wm.position_mirror (authoritative dict).
+        # Update latest_bid in WS Manager for this symbol
         open_value = Decimal("0")
-        for sym, rec in self._wm.position_mirror.items():
+        for sym, rec in self._pm.all_records.items():
             bid_price = self._wm.latest_bid.get(sym, Decimal("0"))
             open_value += bid_price * rec.qty
 
@@ -254,9 +251,7 @@ class RiskEngine:
                 "level":         "CRITICAL",
                 "component":     "RISK_ENG",
                 "drawdown_pct":  drawdown_pct,
-                # DEFECT-006 FIX: self._pm.open_count does not exist.
-                # Use len(self._wm.position_mirror) — authoritative open count.
-                "open_count":    len(self._wm.position_mirror),
+                "open_count":    self._pm.open_count,
                 "threshold":     full_halt_thresh,
             }))
             _alert_operator_direct(

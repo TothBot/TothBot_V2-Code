@@ -490,18 +490,48 @@ class WSManager:
             "method": "subscribe",
             "params": {"channel": "status"},
         })
-        # ohlc(5) — 5m candles (SYSTEM CLOCK)
-        await self._send_public({
-            "method": "subscribe",
-            "params": {"channel": "ohlc", "interval": 5},
-        })
-        # ohlc(60) — 1H HTF cache for Gate 4
-        await self._send_public({
-            "method": "subscribe",
-            "params": {"channel": "ohlc", "interval": 60},
-        })
-        # Ticker subscriptions are managed per-pair after warm-up
+        # ohlc subscribed in _handle_instrument after monitored_universe is built
+        # Kraken WS v2 ohlc requires a symbol list — subscribing without one fails
+        # Ticker subscriptions managed per-pair after warm-up
         # (Section 16 — event_trigger mode per position state)
+
+    async def _subscribe_ohlc_channels(self) -> None:
+        """
+        Subscribe ohlc(5) and ohlc(60) for monitored universe.
+        Called from _handle_instrument after snapshot builds monitored_universe.
+        Kraken WS v2 ohlc requires a symbol list — cannot subscribe without one.
+        """
+        if not self.monitored_universe:
+            self._logger.warning(log_record({
+                "event": "OHLC_SUBSCRIBE_SKIPPED",
+                "level": "WARN",
+                "component": "WS_MGR",
+                "note": "monitored_universe empty — ohlc not subscribed",
+            }))
+            return
+        await self._send_public({
+            "method": "subscribe",
+            "params": {
+                "channel": "ohlc",
+                "interval": 5,
+                "symbol": self.monitored_universe,
+            },
+        })
+        await self._send_public({
+            "method": "subscribe",
+            "params": {
+                "channel": "ohlc",
+                "interval": 60,
+                "symbol": self.monitored_universe,
+            },
+        })
+        self._logger.info(log_record({
+            "event": "OHLC_SUBSCRIBED",
+            "level": "INFO",
+            "component": "WS_MGR",
+            "pairs": len(self.monitored_universe),
+            "intervals": [5, 60],
+        }))
 
     async def _subscribe_private(self) -> None:
         """
@@ -955,6 +985,9 @@ class WSManager:
                 "component": "WS_MGR",
                 "pair_count": len(self.pair_cache),
             }))
+            # Subscribe ohlc now that universe is known (HR-WM-004 — keeps
+            # _last_real_data_public fresh; subscription requires symbol list)
+            asyncio.create_task(self._subscribe_ohlc_channels())
 
     def _build_monitored_universe(self) -> None:
         """

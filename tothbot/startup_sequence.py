@@ -193,10 +193,6 @@ def _load_config() -> dict:
         "alert_to":     os.environ.get("ALERT_EMAIL_TO",    "alert@tothbot.com"),
         # Log file path — used by CIATS for tail (1011010 dv1_6)
         "log_file_path": os.environ.get("TOTHBOT_LOG_FILE", LOG_FILE),
-        # Paper trading mode — intercept all order dispatch when true (TB00063 §2.4.11)
-        "paper_trading_mode": os.environ.get(
-            "PAPER_TRADING_MODE", "false"
-        ).lower() == "true",
     }
 
 
@@ -285,7 +281,6 @@ def _build_components(
     ee = ExecutionEngine(
         ws_manager=wm,
         risk_engine=re,
-        position_mirror=pm,
         logger=logger,
     )
 
@@ -421,23 +416,6 @@ async def _async_main() -> None:
         "universe":  universe,
         "pairs":     len(universe),
     }))
-
-    # ── Log paper trading mode (TB00063 §2.4.11) ───────────────
-    paper_mode = config.get("paper_trading_mode", False)
-    if paper_mode:
-        logger.info(log_record({
-            "event":     "PAPER_TRADING_MODE_ON",
-            "level":     "INFO",
-            "component": "STARTUP",
-            "note":      "Order dispatch suppressed. Fills simulated.",
-        }))
-    else:
-        logger.info(log_record({
-            "event":     "PAPER_TRADING_MODE_OFF",
-            "level":     "INFO",
-            "component": "STARTUP",
-            "note":      "LIVE TRADING MODE — real orders will be placed.",
-        }))
 
     # ── STEP 1: Kraken Status API Check (SS-STARTUP-001/002/003) ─
     # Non-blocking. Startup always continues regardless of outcome.
