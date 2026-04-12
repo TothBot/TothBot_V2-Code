@@ -1,15 +1,37 @@
 """
+DocDCN:     1021002
+DocTitle:   Integration_Test_Suite
+DocVersion: dv1_0
+DocOwner:   Bill
+DocPath:    github.com/TothBot/TothBot_V2-Code/tests/test_integration.py
+DocDate:    04-12-2026
+DocTime:    23:59:59 UTC
+
+============================================================
+REVISION HISTORY
+============================================================
+
+  dv1_0   04-12-2026  DC header added per 0311001 v1_1,
+                      0311004 v1_1, 1011001 dv1_7.
+                      Integration tests IT-001 through
+                      IT-008. All Kraken WS/REST mocked.
+                      No live API calls. Governed by
+                      1021002 Integration_Test_
+                      Specification dv1_0.
+
+============================================================
+
 TothBot V2 — Integration Test Suite
 ====================================
 Governing spec: 1021002 Integration_Test_Specification dv1_0
-8 integration scenarios. All Kraken WS/REST mocked. No live API calls.
+8 integration scenarios. All Kraken WS/REST mocked.
+No live API calls.
 
 Hard rules (1021002 Section 3):
   No live Kraken API calls.
   Do NOT use uvloop.
   Tests must be deterministic and repeatable.
 """
-
 import asyncio
 import logging
 import os

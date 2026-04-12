@@ -1,20 +1,35 @@
 """
+DocDCN:     1021001
+DocTitle:   Regime_Engine_Unit_Tests
+DocVersion: dv1_0
+DocOwner:   Bill
+DocPath:    github.com/TothBot/TothBot_V2-Code/tests/test_regime_engine.py
+DocDate:    04-12-2026
+DocTime:    23:59:59 UTC
+
+============================================================
+REVISION HISTORY
+============================================================
+
+  dv1_0   04-12-2026  DC header added per 0311001 v1_1,
+                      0311004 v1_1, 1011001 dv1_7.
+                      Unit tests UT-RE-001 through
+                      UT-RE-007. Module:
+                      tothbot/regime_engine.py.
+                      Governed by 1021001
+                      Unit_Test_Specification dv1_0.
+
+============================================================
+
 TothBot V2 — Unit Tests: Regime Engine
 =============================================================
 Test spec:   1021001 Unit_Test_Specification dv1_0 §4.4
 Module:      tothbot/regime_engine.py
 Coding spec: 1011012 Regime_Engine_Coding_Spec dv1_4
-BP standard: 1011001 Engineering_Best_Practices dv1_6
+BP standard: 1011001 Engineering_Best_Practices dv1_7
 =============================================================
 
 Tests: UT-RE-001 through UT-RE-007
-
-Fixes from v1_0:
-  UT-RE-001: Rewritten to avoid AsyncMock context manager issue.
-             Tests response[:-1] exclusion via source code analysis
-             and via patching _compute_and_cache to capture call.
-  UT-RE-007: Fixed source scan to exclude comment/docstring lines.
-             Searches only executable code lines.
 
 UT-FW-004: Standard asyncio. Do NOT use uvloop.
 """

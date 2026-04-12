@@ -1,10 +1,31 @@
 """
+DocDCN:     1021001
+DocTitle:   Logger_Unit_Tests
+DocVersion: dv1_0
+DocOwner:   Bill
+DocPath:    github.com/TothBot/TothBot_V2-Code/tests/test_logger.py
+DocDate:    04-12-2026
+DocTime:    23:59:59 UTC
+
+============================================================
+REVISION HISTORY
+============================================================
+
+  dv1_0   04-12-2026  DC header added per 0311001 v1_1,
+                      0311004 v1_1, 1011001 dv1_7.
+                      Unit tests UT-LG-001 through
+                      UT-LG-006. Module: tothbot/logger.py.
+                      Governed by 1021001
+                      Unit_Test_Specification dv1_0.
+
+============================================================
+
 TothBot V2 — Unit Tests: Logger
 =============================================================
 Test spec:   1021001 Unit_Test_Specification dv1_0 §4.1
 Module:      tothbot/logger.py
 Coding spec: 1011007 Logger_Coding_Spec dv1_2
-BP standard: 1011001 Engineering_Best_Practices dv1_6
+BP standard: 1011001 Engineering_Best_Practices dv1_7
 =============================================================
 
 Tests: UT-LG-001 through UT-LG-006

@@ -1,9 +1,32 @@
 """
+DocDCN:     1021001
+DocTitle:   Test_Shared_Fixtures
+DocVersion: dv1_0
+DocOwner:   Bill
+DocPath:    github.com/TothBot/TothBot_V2-Code/tests/conftest.py
+DocDate:    04-12-2026
+DocTime:    23:59:59 UTC
+
+============================================================
+REVISION HISTORY
+============================================================
+
+  dv1_0   04-12-2026  DC header added per 0311001 v1_1,
+                      0311004 v1_1, 1011001 dv1_7.
+                      Shared pytest fixtures for all Tier 1
+                      unit tests and integration tests.
+                      Governed by 1021001
+                      Unit_Test_Specification dv1_0 and
+                      1021002 Integration_Test_Specification
+                      dv1_0.
+
+============================================================
+
 TothBot V2 — Shared Test Fixtures
 =============================================================
 Test specs: 1021001 Unit_Test_Specification dv1_0
             1021002 Integration_Test_Specification dv1_0
-BP standard: 1011001 Engineering_Best_Practices dv1_6
+BP standard: 1011001 Engineering_Best_Practices dv1_7
 =============================================================
 
 Shared fixtures used across Tier 1 unit tests and
@@ -14,7 +37,6 @@ UT-FW-002: pytest-asyncio
 UT-FW-003: unittest.mock
 UT-FW-004: Do NOT use uvloop in tests (standard asyncio)
 """
-
 import asyncio
 import logging
 import queue
