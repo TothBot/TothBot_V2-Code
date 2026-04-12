@@ -1,10 +1,23 @@
 """
-TothBot V2 — Logger Component
-=============================================================
-Coding spec:  1011007 Logger_Coding_Spec dv1_2
-BP standard:  1011001 Engineering_Best_Practices dv1_6
-Parent spec:  0511006 Logger_Specification dv1_0
-=============================================================
+DocDCN:     1011007
+DocTitle:   Logger
+DocVersion: dv1_2
+DocOwner:   Bill
+DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/logger.py
+DocDate:    04-12-2026
+DocTime:    23:59:59 UTC
+
+============================================================
+REVISION HISTORY
+============================================================
+
+  dv1_2   04-12-2026  DC header added per 0311001 v1_1, 0311004 v1_1,
+                      1011001 dv1_7. No code logic changes.
+
+  dv1_2   04-05-2026  Initial Phase 8 implementation.
+                      Written to 1011007 Logger_Coding_Spec dv1_2.
+
+============================================================
 
 The Logger is the sole data interface between TothBot and CIATS.
 It NEVER blocks the trading hot path under any condition.
@@ -23,6 +36,7 @@ Hard Rules (HR-LG-001 through HR-LG-011):
   HR-LG-009: All numeric values: string repr of Decimal. No float.
   HR-LG-010: Log format: NDJSON (one JSON object per line).
   HR-LG-011: Queue full -> stderr + HIGH alert. Do not block.
+============================================================
 """
 from __future__ import annotations
 

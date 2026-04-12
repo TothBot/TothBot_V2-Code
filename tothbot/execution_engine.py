@@ -1,10 +1,23 @@
 """
-TothBot V2 — Execution Engine
-=============================================================
-Coding spec:  1011004 Execution_Engine_Coding_Spec dv1_0
-BP standard:  1011001 Engineering_Best_Practices dv1_6
-Parent spec:  0511003 Execution_Engine_Specification dv1_0
-=============================================================
+DocDCN:     1011004
+DocTitle:   Execution_Engine
+DocVersion: dv1_0
+DocOwner:   Bill
+DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/execution_engine.py
+DocDate:    04-12-2026
+DocTime:    23:59:59 UTC
+
+============================================================
+REVISION HISTORY
+============================================================
+
+  dv1_0   04-12-2026  DC header added per 0311001 v1_1, 0311004 v1_1,
+                      1011001 dv1_7. No code logic changes.
+
+  dv1_0   04-05-2026  Initial Phase 8 implementation.
+                      Written to 1011004 Execution_Engine_Coding_Spec dv1_0.
+
+============================================================
 
 Owns all order dispatch to Kraken for position entry and
 TP/emergSL placement. No order dispatch code lives anywhere
@@ -39,6 +52,7 @@ Hard Rules:
     checked before dispatch.
   amend_order is primary amendment. edit_order PROHIBITED.
   Never send cancel_all_orders_after.
+============================================================
 """
 from __future__ import annotations
 

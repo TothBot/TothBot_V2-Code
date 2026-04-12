@@ -1,10 +1,23 @@
 """
-TothBot V2 — Regime Engine Component
-=============================================================
-Coding spec:  1011012 Regime_Engine_Coding_Spec dv1_4
-BP standard:  1011001 Engineering_Best_Practices dv1_6
-Parent spec:  0711002 Regime_Taxonomy_Specification dv1_0
-=============================================================
+DocDCN:     1011012
+DocTitle:   Regime_Engine
+DocVersion: dv1_4
+DocOwner:   Bill
+DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/regime_engine.py
+DocDate:    04-12-2026
+DocTime:    23:59:59 UTC
+
+============================================================
+REVISION HISTORY
+============================================================
+
+  dv1_4   04-12-2026  DC header added per 0311001 v1_1, 0311004 v1_1,
+                      1011001 dv1_7. No code logic changes.
+
+  dv1_4   04-05-2026  Initial Phase 8 implementation.
+                      Written to 1011012 Regime_Engine_Coding_Spec dv1_4.
+
+============================================================
 
 Classifies market regime for each pair daily at 00:00 UTC.
 Regime classification is the highest-priority correctness
@@ -29,6 +42,7 @@ Hard Rules:
   BTC/USD ALWAYS in trading universe (RE-TAG-002).
   regime_cache updated atomically per pair.
   Stale regime: use prior day, log REGIME_STALE_WARNING.
+============================================================
 """
 from __future__ import annotations
 

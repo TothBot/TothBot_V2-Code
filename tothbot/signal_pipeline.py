@@ -1,11 +1,23 @@
 """
-TothBot V2 — Signal Pipeline
-=============================================================
-Coding spec:  1011003 Signal_Pipeline_Coding_Spec dv1_0
-BP standard:  1011001 Engineering_Best_Practices dv1_6
-Parent specs: 0511002 Signal_Pipeline_Specification dv1_0
-              0711001 SSS_Signal_Model_Specification dv1_0
-=============================================================
+DocDCN:     1011003
+DocTitle:   Signal_Pipeline
+DocVersion: dv1_0
+DocOwner:   Bill
+DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/signal_pipeline.py
+DocDate:    04-12-2026
+DocTime:    23:59:59 UTC
+
+============================================================
+REVISION HISTORY
+============================================================
+
+  dv1_0   04-12-2026  DC header added per 0311001 v1_1, 0311004 v1_1,
+                      1011001 dv1_7. No code logic changes.
+
+  dv1_0   04-05-2026  Initial Phase 8 implementation.
+                      Written to 1011003 Signal_Pipeline_Coding_Spec dv1_0.
+
+============================================================
 
 8-gate trading evaluation engine. Fires on every 5-minute
 OHLC candle close. Evaluates each monitored symbol for
@@ -36,6 +48,7 @@ Hard Rules:
   All arithmetic: Decimal. No float. No math.floor/ceil.
   Pipeline does NOT fire during WS reconnect.
   SSS signal_params always logged — pass or fail.
+============================================================
 """
 from __future__ import annotations
 

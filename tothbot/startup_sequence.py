@@ -1,10 +1,23 @@
 """
-TothBot V2 — Startup Sequence
-=============================================================
-Coding spec:  1011014 Startup_Sequence_Coding_Spec dv1_3
-BP standard:  1011001 Engineering_Best_Practices dv1_6
-Parent spec:  0500000 System_Architecture_Overview dv1_18
-=============================================================
+DocDCN:     1011014
+DocTitle:   Startup_Sequence
+DocVersion: dv1_3
+DocOwner:   Bill
+DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/startup_sequence.py
+DocDate:    04-12-2026
+DocTime:    23:59:59 UTC
+
+============================================================
+REVISION HISTORY
+============================================================
+
+  dv1_3   04-12-2026  DC header added per 0311001 v1_1, 0311004 v1_1,
+                      1011001 dv1_7. No code logic changes.
+
+  dv1_3   04-05-2026  Initial Phase 8 implementation.
+                      Written to 1011014 Startup_Sequence_Coding_Spec dv1_3.
+
+============================================================
 
 Top-level entry point and system orchestrator for TothBot V2.
 
@@ -64,6 +77,7 @@ Deployment:
   Keys:   /root/.tothbot.env (chmod 600, sourced by systemd EnvironmentFile)
   Entry:  python -m tothbot.startup_sequence  (or via tothbot.service)
   Logs:   /root/TothBot_V2-Code/logs/tothbot.log
+============================================================
 """
 from __future__ import annotations
 

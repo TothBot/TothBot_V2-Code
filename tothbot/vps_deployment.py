@@ -1,10 +1,23 @@
 """
-TothBot V2 — VPS Deployment Infrastructure
-=============================================================
-Coding spec:  1011013 VPS_Deployment_Coding_Spec dv1_4
-BP standard:  1011001 Engineering_Best_Practices dv1_6
-Parent spec:  0211002 Operations_Infrastructure_Specification dv1_0
-=============================================================
+DocDCN:     1011013
+DocTitle:   VPS_Deployment
+DocVersion: dv1_4
+DocOwner:   Bill
+DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/vps_deployment.py
+DocDate:    04-12-2026
+DocTime:    23:59:59 UTC
+
+============================================================
+REVISION HISTORY
+============================================================
+
+  dv1_4   04-12-2026  DC header added per 0311001 v1_1, 0311004 v1_1,
+                      1011001 dv1_7. No code logic changes.
+
+  dv1_4   04-05-2026  Initial Phase 8 implementation.
+                      Written to 1011013 VPS_Deployment_Coding_Spec dv1_4.
+
+============================================================
 
 Infrastructure module. Three runtime responsibilities:
   1. Watchdog loop — pings systemd every 30 seconds. (VD-WD-001 through -006)
@@ -33,6 +46,7 @@ Deployment:
 Note: Recommended migration to Hillsboro OR (Hetzner) to reduce
 round-trip latency to Kraken matching engine on AWS us-west-2.
 Evaluate at paper trading start. Update IP whitelist on migration.
+============================================================
 """
 from __future__ import annotations
 

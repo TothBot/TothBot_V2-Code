@@ -1,10 +1,26 @@
 """
-TothBot V2 — Position Mirror Component
-=============================================================
-Coding spec:  1011006 Position_Mirror_Coding_Spec dv1_0
-BP standard:  1011001 Engineering_Best_Practices dv1_6
-Parent spec:  0511005 Position_Mirror_Specification dv1_0
-=============================================================
+DocDCN:     1011006
+DocTitle:   Position_Mirror
+DocVersion: dv1_1
+DocOwner:   Bill
+DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/position_mirror.py
+DocDate:    04-12-2026
+DocTime:    23:59:59 UTC
+
+============================================================
+REVISION HISTORY
+============================================================
+
+  dv1_1   04-12-2026  DC header added per 0311001 v1_1, 0311004 v1_1,
+                      1011001 dv1_7. No code logic changes.
+                      DocVersion updated dv1_0 → dv1_1: governing spec
+                      updated 04-07-2026 to match actual implementation
+                      (field names, method names). Code unchanged.
+
+  dv1_0   04-05-2026  Initial Phase 8 implementation.
+                      Written to 1011006 Position_Mirror_Coding_Spec dv1_0.
+
+============================================================
 
 Single source of truth for all open position state at runtime.
 O(1) symbol-keyed dict. WS Manager is the SOLE writer.
@@ -21,6 +37,7 @@ Hard Rules:
   HR-PM-007: Unexpected snap_orders: alert + log. No auto-trade.
   HR-PM-008: One position per symbol. Dict enforces this.
   HR-PM-009: WS Manager is SOLE writer. No other component writes.
+============================================================
 """
 from __future__ import annotations
 

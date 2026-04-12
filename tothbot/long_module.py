@@ -1,10 +1,23 @@
 """
-TothBot V2 — Long Module
-=============================================================
-Coding spec:  1011008 Long_Module_Coding_Spec dv1_0
-BP standard:  1011001 Engineering_Best_Practices dv1_6
-Parent spec:  0811001 Long_Module_Specification dv1_0
-=============================================================
+DocDCN:     1011008
+DocTitle:   Long_Module
+DocVersion: dv1_0
+DocOwner:   Bill
+DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/long_module.py
+DocDate:    04-12-2026
+DocTime:    23:59:59 UTC
+
+============================================================
+REVISION HISTORY
+============================================================
+
+  dv1_0   04-12-2026  DC header added per 0311001 v1_1, 0311004 v1_1,
+                      1011001 dv1_7. No code logic changes.
+
+  dv1_0   04-05-2026  Initial Phase 8 implementation.
+                      Written to 1011008 Long_Module_Coding_Spec dv1_0.
+
+============================================================
 
 Entry dispatch orchestration and position protection engine.
 Owns the entry order state machine per symbol.
@@ -46,6 +59,7 @@ Interfaces:
             ws_manager.pair_specs                 — qty_min, cost_min
             ws_manager.req_id_registry            — IOC req_id tracking
             logger                                — all events
+============================================================
 """
 from __future__ import annotations
 

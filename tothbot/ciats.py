@@ -1,10 +1,23 @@
 """
-TothBot V2 — CIATS (Continuous Improvement and Autonomous Trading System)
-=============================================================
-Coding spec:  1011010 CIATS_Coding_Spec dv1_6
-BP standard:  1011001 Engineering_Best_Practices dv1_6
-Parent spec:  0211001 CIATS_Specification dv1_0
-=============================================================
+DocDCN:     1011010
+DocTitle:   CIATS
+DocVersion: dv1_6
+DocOwner:   Bill
+DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/ciats.py
+DocDate:    04-12-2026
+DocTime:    23:59:59 UTC
+
+============================================================
+REVISION HISTORY
+============================================================
+
+  dv1_6   04-12-2026  DC header added per 0311001 v1_1, 0311004 v1_1,
+                      1011001 dv1_7. No code logic changes.
+
+  dv1_6   04-05-2026  Initial Phase 8 implementation.
+                      Written to 1011010 CIATS_Coding_Spec dv1_6.
+
+============================================================
 
 Self-improvement engine. Reads only from Logger output files.
 Writes only to Parameter Store. Never blocks trading hot path.
@@ -51,6 +64,7 @@ Hard rules:
   Kelly W and R from NET realized P/L — never gross.
   Negative Kelly (K_full <= 0): CRITICAL alert, no update.
   Net 1:1.5 R:R is HARDCODED — CIATS does not touch it. Ever.
+============================================================
 """
 from __future__ import annotations
 

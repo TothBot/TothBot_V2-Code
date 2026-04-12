@@ -1,10 +1,34 @@
 """
-TothBot V2 — WS Manager Component
-=============================================================
-Coding spec:  1011002 WS_Manager_Coding_Spec dv1_12
-BP standard:  1011001 Engineering_Best_Practices dv1_6
-Parent spec:  0511001 WS_Manager_Specification dv1_0
-=============================================================
+DocDCN:     1011002
+DocTitle:   WS_Manager
+DocVersion: dv1_13
+DocOwner:   Bill
+DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/ws_manager.py
+DocDate:    04-12-2026
+DocTime:    23:59:59 UTC
+
+============================================================
+REVISION HISTORY
+============================================================
+
+  dv1_13  04-12-2026  DC header added per 0311001 v1_1, 0311004 v1_1,
+                      1011001 dv1_7. No code logic changes.
+
+  dv1_13  04-11-2026  DEFECT-WM-OHLC-001: ohlc subscription requires
+                      symbol list. Fixed: _subscribe_ohlc_channels()
+                      triggered from _handle_instrument() after universe
+                      built. Commit cd1de43.
+                      Governed by 1011002 WS_Manager_Coding_Spec dv1_13.
+
+  dv1_12  04-10-2026  DEFECT-WM-ZOM-001: zombie timer reset moved from
+                      __init__ to end of _startup_connect_and_subscribe()
+                      both paths. Commit 4241bf3.
+                      Governed by 1011002 WS_Manager_Coding_Spec dv1_12.
+
+  dv1_11  04-05-2026  Initial Phase 8 implementation.
+                      Written to 1011002 WS_Manager_Coding_Spec dv1_11.
+
+============================================================
 
 TothBot's sole interface to all Kraken WebSocket v2 connections.
 Central event processor. All Kraken push events flow through here.
@@ -31,6 +55,7 @@ Hard Rules (consolidated — Section 17 of spec):
   HR-WM-018: RSI(14) uses Wilder's SMMA (alpha=1/14). NOT EMA (2/15).
   HR-WM-019: Subscription ACK warnings[] parsed and logged.
   HR-WM-020: Both DATA and TRADE keys IP-whitelisted to 87.99.141.44.
+============================================================
 """
 from __future__ import annotations
 

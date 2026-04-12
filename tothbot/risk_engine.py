@@ -1,12 +1,23 @@
 """
-TothBot V2 — Risk Engine Component
-=============================================================
-Coding spec:  1011011 Risk_Engine_Coding_Spec dv1_3
-BP standard:  1011001 Engineering_Best_Practices dv1_6
-Parent specs: 0611001 Position_Sizing_Rules dv1_0
-              0611002 Drawdown_and_Halt_Rules dv1_0
-              0611003 Concentration_and_Exposure_Rules dv1_0
-=============================================================
+DocDCN:     1011011
+DocTitle:   Risk_Engine
+DocVersion: dv1_3
+DocOwner:   Bill
+DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/risk_engine.py
+DocDate:    04-12-2026
+DocTime:    23:59:59 UTC
+
+============================================================
+REVISION HISTORY
+============================================================
+
+  dv1_3   04-12-2026  DC header added per 0311001 v1_1, 0311004 v1_1,
+                      1011001 dv1_7. No code logic changes.
+
+  dv1_3   04-05-2026  Initial Phase 8 implementation.
+                      Written to 1011011 Risk_Engine_Coding_Spec dv1_3.
+
+============================================================
 
 Implements Gate 7 (Risk Guard) and Gate 8 (Position Sizer).
 Final filter before order dispatch.
@@ -27,6 +38,7 @@ Hard Rules:
   Gate 7 uses available_USD (cash minus pending orders).
   emergSL remains active in all halt states.
   batch_cancel on full halt cancels ENTRY GTD only.
+============================================================
 """
 from __future__ import annotations
 

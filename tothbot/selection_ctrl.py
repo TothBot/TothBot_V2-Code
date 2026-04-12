@@ -1,10 +1,23 @@
 """
-TothBot V2 — Selection Controller
-=============================================================
-Coding spec:  1011009 Selection_Controller_Coding_Spec dv1_0
-BP standard:  1011001 Engineering_Best_Practices dv1_6
-Parent spec:  0811002 Selection_Controller_Specification dv1_0
-=============================================================
+DocDCN:     1011009
+DocTitle:   Selection_Controller
+DocVersion: dv1_0
+DocOwner:   Bill
+DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/selection_ctrl.py
+DocDate:    04-12-2026
+DocTime:    23:59:59 UTC
+
+============================================================
+REVISION HISTORY
+============================================================
+
+  dv1_0   04-12-2026  DC header added per 0311001 v1_1, 0311004 v1_1,
+                      1011001 dv1_7. No code logic changes.
+
+  dv1_0   04-05-2026  Initial Phase 8 implementation.
+                      Written to 1011009 Selection_Controller_Coding_Spec dv1_0.
+
+============================================================
 
 Gate 5 of the 8-gate trading pipeline. Applies 6 quality
 gates in strict sequence to every SSS PASS signal.
@@ -47,6 +60,7 @@ Win/Loss classification (SC-024, AR-073):
                       SIGNAL_DECAY | MOMENTUM_LOSS
         -> consecutive_loss_count[symbol] += 1
         -> cooldown_registry[symbol] = time.monotonic()
+============================================================
 """
 from __future__ import annotations
 

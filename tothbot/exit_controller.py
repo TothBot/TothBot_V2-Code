@@ -1,11 +1,23 @@
 """
-TothBot V2 — Exit Controller
-=============================================================
-Coding spec:  1011005 Exit_Controller_Coding_Spec dv1_2
-BP standard:  1011001 Engineering_Best_Practices dv1_6
-Parent specs: 0811003 Exit_Controller_Specification dv1_0
-              0511004 Exit_Controller_Specification dv1_2
-=============================================================
+DocDCN:     1011005
+DocTitle:   Exit_Controller
+DocVersion: dv1_2
+DocOwner:   Bill
+DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/exit_controller.py
+DocDate:    04-12-2026
+DocTime:    23:59:59 UTC
+
+============================================================
+REVISION HISTORY
+============================================================
+
+  dv1_2   04-12-2026  DC header added per 0311001 v1_1, 0311004 v1_1,
+                      1011001 dv1_7. No code logic changes.
+
+  dv1_2   04-05-2026  Initial Phase 8 implementation.
+                      Written to 1011005 Exit_Controller_Coding_Spec dv1_2.
+
+============================================================
 
 Owns all normal position exits. Never opens positions.
 
@@ -56,6 +68,7 @@ Cancel ACK note:
   On wake: symbol absent from position_mirror → TP already processed → abort.
   Symbol present → cancel assumed confirmed → proceed.
   This satisfies the 5-second cancel_timeout_window per HR-EC-003.
+============================================================
 """
 from __future__ import annotations
 
