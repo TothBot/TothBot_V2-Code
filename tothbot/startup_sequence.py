@@ -1,15 +1,20 @@
 """
 DocDCN:     1011014
 DocTitle:   Startup_Sequence
-DocVersion: dv1_3
+DocVersion: dv1_4
 DocOwner:   Bill
 DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/startup_sequence.py
-DocDate:    04-12-2026
-DocTime:    23:59:59 UTC
+DocDate:    04-13-2026
+DocTime:    02:30:00 UTC
 
 ============================================================
 REVISION HISTORY
 ============================================================
+
+  dv1_4   04-13-2026  DEFECT FIX: ExecutionEngine instantiation missing
+                      position_mirror=pm argument. Added position_mirror=pm
+                      to ExecutionEngine() call in _build_components().
+                      Crash on startup resolved.
 
   dv1_3   04-12-2026  DC header added per 0311001 v1_1, 0311004 v1_1,
                       1011001 dv1_7. No code logic changes.
@@ -295,6 +300,7 @@ def _build_components(
     ee = ExecutionEngine(
         ws_manager=wm,
         risk_engine=re,
+        position_mirror=pm,
         logger=logger,
     )
 
