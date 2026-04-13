@@ -1,7 +1,7 @@
 """
 DocDCN:     1011002
 DocTitle:   WS_Manager
-DocVersion: dv1_14
+DocVersion: dv1_15
 DocOwner:   Bill
 DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/ws_manager.py
 DocDate:    04-13-2026
@@ -10,6 +10,15 @@ DocTime:    23:59:59 UTC
 ============================================================
 REVISION HISTORY
 ============================================================
+
+  dv1_15  04-13-2026  DEFECT-SS-005 fix: seed_indicators_from_rest()
+                      now calls self._signal_pipeline.seed_indicators()
+                      to populate SignalPipeline._sss_state. Without
+                      this call, pipeline PRE gate rejected every
+                      candle with SSS_NOT_SEEDED. Added _signal_pipeline
+                      attribute (wired by startup_sequence). Kraken
+                      REST list format converted to dict format for
+                      pipeline.seed_indicators() compatibility.
 
   dv1_14  04-13-2026  DEFECT-SS-004 fix + OI-NEW-001 fix.
                       _subscribe_ohlc_channels(): removed
@@ -242,6 +251,9 @@ class WSManager:
         self._exec_engine_fn = exec_engine_fn
         self._exit_ctrl_fn = exit_ctrl_fn
         self._regime_engine_fn = regime_engine_fn
+
+        # Direct pipeline reference for SSS seeding (DEFECT-SS-005)
+        self._signal_pipeline: Any = None
 
         # CIATS Parameter Store — frozen snapshot at pipeline start (AR-I-4)
         self._ciats_params: dict = ciats_param_store or {}
@@ -2418,6 +2430,16 @@ class WSManager:
 
         # Seed 5m indicators from 5m candles
         self._seed_5m_indicators(symbol, candles_5m)
+
+        # Seed SignalPipeline SSS state (DEFECT-SS-005)
+        # Pipeline has its own _sss_state dict that must be seeded
+        # separately from WSManager's indicator caches.
+        if self._signal_pipeline is not None:
+            ohlc_dicts = [
+                {"close": str(c[4]), "volume": str(c[6])}
+                for c in candles_5m
+            ]
+            self._signal_pipeline.seed_indicators(symbol, ohlc_dicts)
 
         # Seed HTF EMAs from 60m candles
         self._seed_htf_ema(symbol, candles_60m)

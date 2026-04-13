@@ -1,15 +1,21 @@
 """
 DocDCN:     1011014
 DocTitle:   Startup_Sequence
-DocVersion: dv1_5
+DocVersion: dv1_6
 DocOwner:   Bill
 DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/startup_sequence.py
 DocDate:    04-13-2026
-DocTime:    03:00:00 UTC
+DocTime:    23:59:59 UTC
 
 ============================================================
 REVISION HISTORY
 ============================================================
+
+  dv1_6   04-13-2026  DEFECT-SS-005 fix: added wm._signal_pipeline = sp
+                      wiring so WSManager.seed_indicators_from_rest()
+                      can call SignalPipeline.seed_indicators() to
+                      populate _sss_state. Without this, pipeline PRE
+                      gate rejected every candle with SSS_NOT_SEEDED.
 
   dv1_5   04-13-2026  DEFECT FIX: PAPER_TRADING_MODE env var never read
                       by _load_config(). paper_trading_mode key missing
@@ -398,6 +404,7 @@ def _build_components(
     # WSManager calls exit_ctrl_fn(symbol, event, wm) — wire ec directly.
     #
     wm._signal_pipeline_fn = _pipeline_wrapper
+    wm._signal_pipeline    = sp                   # Direct ref for SSS seeding (DEFECT-SS-005)
     wm._exec_engine_fn     = _exec_wrapper
     wm._exit_ctrl_fn       = ec                   # ExitController.__call__
     wm._regime_engine_fn   = _regime_wrapper
