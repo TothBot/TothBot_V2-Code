@@ -1,0 +1,25 @@
+# DocDCN:     1011001
+# DocTitle:   Config_Directory_Placeholder
+# DocVersion: dv1_0
+# DocOwner:   Bill
+# DocPath:    github.com/TothBot/TothBot_V2-Code/config/.gitkeep
+# DocDate:    04-12-2026
+# DocTime:    23:59:59 UTC
+#
+# ============================================================
+# REVISION HISTORY
+# ============================================================
+#
+#   dv1_0  04-12-2026  Initial DC-compliant version.
+#                      Placeholder to track empty config/
+#                      directory in git. DC header added
+#                      per BP-HDR-001 and EC-011. Governed
+#                      by 1011001 Engineering_Best_Practices
+#                      dv1_7. OI-011 corrective action.
+#                      TB00088.
+#
+# ============================================================
+# TothBot V2 — Config Directory Placeholder
+# Governing spec: 1011001 Engineering_Best_Practices dv1_7
+# This file exists only to allow git to track this directory.
+# ============================================================
