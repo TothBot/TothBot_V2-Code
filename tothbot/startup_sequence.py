@@ -1,15 +1,23 @@
 """
 DocDCN:     1011014
 DocTitle:   Startup_Sequence
-DocVersion: dv1_4
+DocVersion: dv1_5
 DocOwner:   Bill
 DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/startup_sequence.py
 DocDate:    04-13-2026
-DocTime:    02:30:00 UTC
+DocTime:    03:00:00 UTC
 
 ============================================================
 REVISION HISTORY
 ============================================================
+
+  dv1_5   04-13-2026  DEFECT FIX: PAPER_TRADING_MODE env var never read
+                      by _load_config(). paper_trading_mode key missing
+                      from config dict. WSManager.paper_mode always False.
+                      Private WS auth always attempted in paper mode.
+                      Fix: added paper_trading_mode to _load_config()
+                      return dict. Added PAPER_TRADING_MODE_ON/OFF log
+                      event in _async_main() after config load.
 
   dv1_4   04-13-2026  DEFECT FIX: ExecutionEngine instantiation missing
                       position_mirror=pm argument. Added position_mirror=pm
@@ -212,6 +220,8 @@ def _load_config() -> dict:
         "alert_to":     os.environ.get("ALERT_EMAIL_TO",    "alert@tothbot.com"),
         # Log file path — used by CIATS for tail (1011010 dv1_6)
         "log_file_path": os.environ.get("TOTHBOT_LOG_FILE", LOG_FILE),
+        # Paper trading mode — PT-MODE-001 (0211005 dv1_0)
+        "paper_trading_mode": os.environ.get("PAPER_TRADING_MODE", "false").lower() == "true",
     }
 
 
@@ -435,6 +445,15 @@ async def _async_main() -> None:
         "component": "STARTUP",
         "universe":  universe,
         "pairs":     len(universe),
+    }))
+
+    # Log paper trading mode state (PT-MODE-001)
+    _paper_mode_event = "PAPER_TRADING_MODE_ON" if config.get("paper_trading_mode") else "PAPER_TRADING_MODE_OFF"
+    logger.info(log_record({
+        "event":     _paper_mode_event,
+        "level":     "INFO",
+        "component": "STARTUP",
+        "note":      "Paper trading active — no real orders sent to Kraken" if config.get("paper_trading_mode") else "Live trading mode",
     }))
 
     # ── STEP 1: Kraken Status API Check (SS-STARTUP-001/002/003) ─
