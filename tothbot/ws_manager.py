@@ -1,15 +1,36 @@
 """
 DocDCN:     1011002
 DocTitle:   WS_Manager
-DocVersion: dv1_13
+DocVersion: dv1_14
 DocOwner:   Bill
 DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/ws_manager.py
-DocDate:    04-12-2026
+DocDate:    04-13-2026
 DocTime:    23:59:59 UTC
 
 ============================================================
 REVISION HISTORY
 ============================================================
+
+  dv1_14  04-13-2026  DEFECT-SS-004 fix + OI-NEW-001 fix.
+                      _subscribe_ohlc_channels(): removed
+                      interval=60 WS subscription. Kraken WS v2
+                      rejects second ohlc interval per symbol
+                      with "Already subscribed to one ohlc
+                      interval on this symbol" (OI-NEW-001).
+                      1H HTF cache now sourced from REST only
+                      (HR-WM-021). After ohlc(5) subscription
+                      sent, added:
+                        asyncio.create_task(_warm_up_all_pairs())
+                      New method _warm_up_all_pairs(): calls
+                      asyncio.gather across monitored_universe
+                      to seed indicators from REST for all pairs.
+                      Logs SYSTEM_OPERATIONAL when ≥1 pair READY.
+                      This is the DEFECT-SS-004 fix: REST warm-up
+                      was never called during startup. No pair
+                      ever reached READY. Pipeline never fired.
+                      Governed by 1011002 WS_Manager_Coding_Spec
+                      dv1_14, 1011014 Startup_Sequence_Coding_Spec
+                      dv1_4.
 
   dv1_13  04-12-2026  DC header added per 0311001 v1_1, 0311004 v1_1,
                       1011001 dv1_7. No code logic changes.
@@ -522,9 +543,17 @@ class WSManager:
 
     async def _subscribe_ohlc_channels(self) -> None:
         """
-        Subscribe ohlc(5) and ohlc(60) for monitored universe.
+        Subscribe ohlc(5) for monitored universe.
         Called from _handle_instrument after snapshot builds monitored_universe.
         Kraken WS v2 ohlc requires a symbol list — cannot subscribe without one.
+
+        NOTE: ohlc(60) NOT subscribed via WS. Kraken WS v2 rejects a second
+        ohlc interval per symbol: "Already subscribed to one ohlc interval on
+        this symbol." (OI-NEW-001 confirmed.) 1H HTF cache sourced from REST
+        only via seed_indicators_from_rest() (HR-WM-021).
+
+        After subscription: triggers REST warm-up for all pairs (WM-WARMUP-001).
+        Paper mode: identical path. No difference from live mode.
         """
         if not self.monitored_universe:
             self._logger.warning(log_record({
@@ -542,21 +571,17 @@ class WSManager:
                 "symbol": self.monitored_universe,
             },
         })
-        await self._send_public({
-            "method": "subscribe",
-            "params": {
-                "channel": "ohlc",
-                "interval": 60,
-                "symbol": self.monitored_universe,
-            },
-        })
         self._logger.info(log_record({
             "event": "OHLC_SUBSCRIBED",
             "level": "INFO",
             "component": "WS_MGR",
             "pairs": len(self.monitored_universe),
-            "intervals": [5, 60],
+            "intervals": [5],
+            "note": "interval=60 not subscribed — REST-only per HR-WM-021",
         }))
+        # Trigger REST warm-up for all pairs immediately after subscription
+        # (DEFECT-SS-004 fix / WM-WARMUP-001). Runs as concurrent asyncio task.
+        asyncio.create_task(self._warm_up_all_pairs())
 
     async def _subscribe_private(self) -> None:
         """
@@ -2319,6 +2344,53 @@ class WSManager:
     # =================================================================
     # INDICATOR SEEDING — from REST GetOHLCData (Section 9.2/9.3)
     # =================================================================
+
+    async def _warm_up_all_pairs(self) -> None:
+        """
+        Seed indicators for all pairs in monitored_universe (WM-WARMUP-001/002).
+        asyncio.gather() parallelizes across pairs — each pair staggers
+        its own Call A → sleep(1.1) → Call B internally (AR-036).
+        return_exceptions=True: one pair failure does not abort others.
+        Logs SYSTEM_OPERATIONAL when at least one pair reaches READY (SS-STARTUP-022).
+        Called from _subscribe_ohlc_channels() after ohlc(5) subscription sent.
+        Paper mode: identical path (WM-WARMUP-001).
+        """
+        if not self.monitored_universe:
+            return
+
+        self._logger.info(log_record({
+            "event": "WARMUP_REST_STARTED",
+            "level": "INFO",
+            "component": "WS_MGR",
+            "pairs": len(self.monitored_universe),
+        }))
+
+        await asyncio.gather(
+            *[self.seed_indicators_from_rest(s) for s in self.monitored_universe],
+            return_exceptions=True,
+        )
+
+        ready_count = sum(
+            1 for s in self.monitored_universe
+            if self.warm_up_state.get(s) == WARMUP_READY
+        )
+        self._logger.info(log_record({
+            "event": "WARMUP_REST_COMPLETE",
+            "level": "INFO",
+            "component": "WS_MGR",
+            "ready_pairs": ready_count,
+            "total_pairs": len(self.monitored_universe),
+        }))
+
+        if ready_count > 0:
+            self._logger.info(log_record({
+                "event": "SYSTEM_OPERATIONAL",
+                "level": "INFO",
+                "component": "WS_MGR",
+                "ready_pairs": ready_count,
+                "total_pairs": len(self.monitored_universe),
+                "note": "Pipeline active for READY pairs",
+            }))
 
     async def seed_indicators_from_rest(self, symbol: str) -> None:
         """
