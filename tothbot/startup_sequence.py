@@ -1,15 +1,34 @@
 """
 DocDCN:     1011014
 DocTitle:   Startup_Sequence
-DocVersion: dv1_6
+DocVersion: dv1_7
 DocOwner:   Bill
 DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/startup_sequence.py
-DocDate:    04-13-2026
+DocDate:    04-14-2026
 DocTime:    23:59:59 UTC
 
 ============================================================
 REVISION HISTORY
 ============================================================
+
+  dv1_7   04-14-2026  DEFECT-SS-009 fix: _regime_wrapper passed
+                      no universe to rge.run_daily_computation().
+                      rge._universe was set at construction time
+                      from _load_universe(config) which returns
+                      ["BTC/USD"] only — the full 50-pair universe
+                      is built by WSManager from the instrument
+                      snapshot and is not known at construction.
+                      Result: regime computed for BTC/USD only.
+                      All 49 other pairs had NO_REGIME_DATA.
+                      Gate 3 blocked all non-BTC entries.
+                      Fix: _regime_wrapper now passes
+                      list(wm.monitored_universe) to
+                      run_daily_computation(). Python closure
+                      captures wm by reference — at call time
+                      wm.monitored_universe contains the full
+                      ranked universe. Also fixes the daily 00:00
+                      UTC regime refresh (same wrapper used).
+                      Governed by 1011014 dv1_5 SS-WIRE-001.
 
   dv1_6   04-13-2026  DEFECT-SS-005 fix: added wm._signal_pipeline = sp
                       wiring so WSManager.seed_indicators_from_rest()
@@ -395,10 +414,15 @@ def _build_components(
 
     # WSManager._trigger_daily_regime_refresh calls:
     #   regime_engine_fn(daily_candles, "BTC/USD")
-    # rge.run_daily_computation() fetches its own OHLC — ignore passed args.
+    # rge.run_daily_computation() fetches its own OHLC.
+    # SS-WIRE-001: pass wm.monitored_universe so all 50 pairs
+    # get regime data — not just BTC/USD (DEFECT-SS-009 fix).
+    # Python closure captures wm by reference — at call time
+    # wm.monitored_universe contains the full ranked universe.
     #
-    async def _regime_wrapper(candles, symbol: str) -> None:  # noqa: args unused
-        await rge.run_daily_computation()
+    async def _regime_wrapper(candles, symbol: str) -> None:  # noqa: candles unused
+        universe = list(wm.monitored_universe) if wm.monitored_universe else None
+        await rge.run_daily_computation(universe=universe)
 
     # ExitController is callable via __call__(symbol, event, wm).
     # WSManager calls exit_ctrl_fn(symbol, event, wm) — wire ec directly.
