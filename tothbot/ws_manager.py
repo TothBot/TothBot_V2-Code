@@ -1,7 +1,7 @@
 """
 DocDCN:     1011002
 DocTitle:   WS_Manager
-DocVersion: dv1_17
+DocVersion: dv1_18
 DocOwner:   Bill
 DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/ws_manager.py
 DocDate:    04-14-2026
@@ -10,6 +10,25 @@ DocTime:    23:59:59 UTC
 ============================================================
 REVISION HISTORY
 ============================================================
+
+  dv1_18  04-14-2026  DEFECT-SS-008 fix: quote_currency derived
+                      from symbol name, not instrument snapshot
+                      field. Kraken WS v2 instrument snapshot
+                      does NOT provide a "quote_currency" field.
+                      pair.get("quote_currency", "") always
+                      returned "" → all pairs failed the
+                      quote_currency in ("USD","USDC") filter
+                      in _build_monitored_universe() and in
+                      _warm_up_all_pairs() candidates list.
+                      Result: candidates=[] → _rest_get_ticker([])
+                      → {} → LIQUIDITY_SEED_FAILED on every
+                      startup. Gate 2 blocked all entries.
+                      Fix: derive quote_currency from symbol by
+                      splitting on "/" at index [1].
+                      "BTC/USD".split("/")[1] → "USD".
+                      All Kraken WS v2 symbols are BASE/QUOTE.
+                      Single line change in _handle_instrument().
+                      Governed by 1011002 dv1_17 WM-PS-006.
 
   dv1_17  04-14-2026  DEFECT-SS-007 fix: REST AssetPairs pair
                       map build. Instrument snapshot confirmed
@@ -327,7 +346,9 @@ class WSManager:
         # ── Instrument / pair universe ────────────────────────────────────
         self.pair_cache: dict[str, dict] = {}
         # pair_cache[symbol] = {price_increment, qty_increment, qty_min,
-        #                        cost_min, status}
+        #                        cost_min, status, quote_currency}
+        # quote_currency derived from symbol (split "/")[1] — NOT from
+        # instrument snapshot field (WM-PS-006, DEFECT-SS-008).
         self.monitored_universe: list[str] = []
         self.pair_status: dict[str, str] = {}
 
@@ -1204,7 +1225,7 @@ class WSManager:
                 "qty_min":         Decimal(str(pair.get("qty_min", "0"))),
                 "cost_min":        Decimal(str(pair.get("cost_min", "0"))),
                 "status":          status,
-                "quote_currency":  pair.get("quote_currency", ""),
+                "quote_currency":  symbol.split("/")[1] if "/" in symbol else "",
             }
 
             # Build REST Ticker name maps from altname field (WM-LIQ-003)
