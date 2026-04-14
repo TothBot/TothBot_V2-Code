@@ -1,15 +1,34 @@
 """
 DocDCN:     1011002
 DocTitle:   WS_Manager
-DocVersion: dv1_16
+DocVersion: dv1_17
 DocOwner:   Bill
 DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/ws_manager.py
-DocDate:    04-13-2026
+DocDate:    04-14-2026
 DocTime:    23:59:59 UTC
 
 ============================================================
 REVISION HISTORY
 ============================================================
+
+  dv1_17  04-14-2026  DEFECT-SS-007 fix: REST AssetPairs pair
+                      map build. Instrument snapshot confirmed
+                      to NOT contain altname field — dv1_16
+                      map-building from altname in
+                      _handle_instrument() was inert (always
+                      empty string). Fix: new method
+                      _rest_build_pair_maps() calls
+                      GET /0/public/AssetPairs at startup.
+                      Uses altname (e.g. "XBTUSD") and wsname
+                      (e.g. "XBT/USD") fields from response.
+                      Normalizes wsname: XBT/ → BTC/,
+                      /XBT → /BTC to match WS v2 format.
+                      Populates _wsname_to_classic and
+                      _classic_to_wsname correctly.
+                      Modified _warm_up_all_pairs(): calls
+                      await self._rest_build_pair_maps()
+                      BEFORE first _rest_get_ticker() call.
+                      Governed by 1011002 dv1_16 WM-LIQ-011.
 
   dv1_16  04-13-2026  DEFECT-SS-006 fix: REST Ticker liquidity population.
                       New attribute _wsname_to_classic: maps WS v2 name
@@ -2510,6 +2529,77 @@ class WSManager:
             }))
 
     # =================================================================
+    # REST AssetPairs PAIR MAP BUILD — WM-LIQ-011
+    # =================================================================
+
+    async def _rest_build_pair_maps(self) -> None:
+        """
+        Build _wsname_to_classic and _classic_to_wsname from REST AssetPairs.
+        Called from _warm_up_all_pairs() BEFORE _rest_get_ticker() (WM-LIQ-011).
+        Calls GET /0/public/AssetPairs (public, no auth required).
+        Instrument snapshot does NOT contain altname — maps MUST come from here.
+        Normalizes wsname: "XBT/USD" → "BTC/USD" to match WS v2 pair names.
+        Logs PAIR_MAPS_BUILT on success. Logs PAIR_MAP_BUILD_FAILED on any error.
+        Never raises — caller handles empty maps as fail-safe via Gate 2.
+        """
+        try:
+            async with self._make_http_session() as session:
+                resp = await session.get(
+                    f"{REST_BASE_URL}/0/public/AssetPairs"
+                )
+                data = orjson.loads(await resp.read())
+
+            errors = data.get("error", [])
+            if errors:
+                self._logger.warning(log_record({
+                    "event": "PAIR_MAP_BUILD_FAILED",
+                    "level": "WARN",
+                    "component": "WS_MGR",
+                    "reason": str(errors),
+                }))
+                return
+
+            count = 0
+            for classic_key, info in data.get("result", {}).items():
+                altname = info.get("altname", "")
+                wsname_raw = info.get("wsname", "")
+                if not altname or not wsname_raw:
+                    continue
+
+                # Normalize wsname: WS v2 uses "BTC/USD", AssetPairs uses "XBT/USD"
+                ws_v2_name = wsname_raw.replace("XBT/", "BTC/").replace("/XBT", "/BTC")
+
+                if ws_v2_name in self.pair_cache:
+                    self._wsname_to_classic[ws_v2_name] = altname
+                    self._classic_to_wsname[altname] = ws_v2_name
+                    # Also store normalized classic key for reverse lookup
+                    norm = self._normalize_classic_key(classic_key)
+                    self._classic_to_wsname[norm] = ws_v2_name
+                    count += 1
+                elif wsname_raw in self.pair_cache:
+                    # Fallback: no BTC/XBT substitution needed for this pair
+                    self._wsname_to_classic[wsname_raw] = altname
+                    self._classic_to_wsname[altname] = wsname_raw
+                    norm = self._normalize_classic_key(classic_key)
+                    self._classic_to_wsname[norm] = wsname_raw
+                    count += 1
+
+            self._logger.info(log_record({
+                "event": "PAIR_MAPS_BUILT",
+                "level": "INFO",
+                "component": "WS_MGR",
+                "pairs_mapped": count,
+            }))
+
+        except Exception as exc:  # noqa: BP-ERR-001
+            self._logger.warning(log_record({
+                "event": "PAIR_MAP_BUILD_FAILED",
+                "level": "WARN",
+                "component": "WS_MGR",
+                "reason": str(exc),
+            }))
+
+    # =================================================================
     # INDICATOR SEEDING — from REST GetOHLCData (Section 9.2/9.3)
     # =================================================================
 
@@ -2545,6 +2635,10 @@ class WSManager:
             if spec.get("quote_currency") in ("USD", "USDC")
             and spec.get("status") == "online"
         ]
+
+        # Build WS name → REST altname maps from AssetPairs (WM-LIQ-011, dv1_17 fix)
+        # Must be called BEFORE _rest_get_ticker() — maps required for Ticker lookup.
+        await self._rest_build_pair_maps()
 
         liquidity_result = await self._rest_get_ticker(candidates)
 
