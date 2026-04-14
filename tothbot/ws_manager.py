@@ -1,7 +1,7 @@
 """
 DocDCN:     1011002
 DocTitle:   WS_Manager
-DocVersion: dv1_18
+DocVersion: dv1_19
 DocOwner:   Bill
 DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/ws_manager.py
 DocDate:    04-14-2026
@@ -10,6 +10,30 @@ DocTime:    23:59:59 UTC
 ============================================================
 REVISION HISTORY
 ============================================================
+
+  dv1_19  04-14-2026  DEFECT-WM-CRASH-001 fix (Fix 1):
+                      run() except block now extracts
+                      ExceptionGroup sub-exceptions (Python 3.11+
+                      TaskGroup raises ExceptionGroup — str(exc)
+                      only shows outer wrapper, losing actual root
+                      cause). Fix: isinstance(exc, ExceptionGroup)
+                      check iterates exc.exceptions[], logs each
+                      sub-exception type, message, and traceback.
+                      Full traceback string also logged via
+                      traceback.format_exc(). Adds import traceback.
+                      Governed by 1011002 dv1_18 WM-RUN-001.
+
+                      DEFECT-RE-002 fix (Fix 2):
+                      Regime engine never seeded at startup.
+                      _trigger_daily_regime_refresh() called
+                      (awaited) at end of _warm_up_all_pairs()
+                      after WARMUP_REST_COMPLETE, before
+                      SYSTEM_OPERATIONAL. Ensures regime cache
+                      populated before pipeline goes live.
+                      Gate 3 (NO_REGIME_DATA) blocks all entries
+                      during the ~55s computation window — correct
+                      fail-safe behavior. Governed by 1011002
+                      dv1_18 WM-WARMUP-004.
 
   dv1_18  04-14-2026  DEFECT-SS-008 fix: quote_currency derived
                       from symbol name, not instrument snapshot
@@ -162,6 +186,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
@@ -856,14 +881,27 @@ class WSManager:
             await self._startup_connect_and_subscribe()
             await self._main_loop()
         except Exception as exc:
+            # WM-RUN-001: Extract ExceptionGroup sub-exceptions (Python 3.11+
+            # TaskGroup raises ExceptionGroup — str(exc) only shows outer wrapper).
+            tb_str = traceback.format_exc()
+            sub_msgs: list[str] = []
+            if isinstance(exc, ExceptionGroup):
+                for i, sub in enumerate(exc.exceptions):
+                    sub_tb = "".join(traceback.format_tb(sub.__traceback__))
+                    sub_msgs.append(
+                        f"[{i}] {type(sub).__name__}: {sub} | tb: {sub_tb}"
+                    )
             self._logger.critical(log_record({
                 "event": "WS_MGR_FATAL",
                 "level": "CRITICAL",
                 "component": "WS_MGR",
                 "error": str(exc),
+                "traceback": tb_str[-2000:],
+                "sub_exceptions": sub_msgs or None,
             }))
             _alert_operator_direct(
-                f"WS Manager fatal error: {exc}. systemd will restart."
+                f"WS Manager fatal error: {type(exc).__name__}: {exc}. "
+                f"systemd will restart."
             )
             raise
 
@@ -2757,6 +2795,24 @@ class WSManager:
             "ready_pairs": ready_count,
             "total_pairs": len(self.monitored_universe),
         }))
+
+        # WM-WARMUP-004: Seed regime cache at startup before declaring SYSTEM_OPERATIONAL.
+        # Gate 3 blocks all entries with NO_REGIME_DATA until this completes (~55s).
+        # Awaited (not a task) — SYSTEM_OPERATIONAL must not fire until regime is ready.
+        if self._regime_engine_fn:
+            self._logger.info(log_record({
+                "event": "REGIME_STARTUP_SEED_STARTED",
+                "level": "INFO",
+                "component": "WS_MGR",
+                "pairs": len(self.monitored_universe),
+                "note": "Gate 3 blocks entries until complete",
+            }))
+            await self._trigger_daily_regime_refresh()
+            self._logger.info(log_record({
+                "event": "REGIME_STARTUP_SEED_COMPLETE",
+                "level": "INFO",
+                "component": "WS_MGR",
+            }))
 
         if ready_count > 0:
             self._logger.info(log_record({
