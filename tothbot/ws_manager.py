@@ -1,7 +1,7 @@
 """
 DocDCN:     1011002
 DocTitle:   WS_Manager
-DocVersion: dv1_15
+DocVersion: dv1_16
 DocOwner:   Bill
 DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/ws_manager.py
 DocDate:    04-13-2026
@@ -10,6 +10,39 @@ DocTime:    23:59:59 UTC
 ============================================================
 REVISION HISTORY
 ============================================================
+
+  dv1_16  04-13-2026  DEFECT-SS-006 fix: REST Ticker liquidity population.
+                      New attribute _wsname_to_classic: maps WS v2 name
+                      (e.g. "BTC/USD") → Kraken REST altname (e.g. "XBTUSD").
+                      New attribute _classic_to_wsname: reverse map.
+                      Both maps built from instrument snapshot altname field.
+                      New method _rest_get_ticker(candidates): fetches
+                      GET /0/public/Ticker for a list of WS pair names.
+                      Maps to altnames for request. Parses response using
+                      _normalize_classic_key() to handle Kraken legacy
+                      XXBTZUSD ↔ XBTUSD naming. Returns dict[ws_name,
+                      Decimal] of 24h USD volume (v[1] * p[1]).
+                      New static method _normalize_classic_key(): converts
+                      Kraken classic response keys (XXBTZUSD) to altname
+                      form (XBTUSD) for reverse map lookup.
+                      New method _liquidity_refresh_loop(): long-lived
+                      asyncio task. Sleeps liquidity_refresh_hours (CIATS
+                      starting value: 4). Refreshes monitored_universe
+                      liquidity_24h on each cycle. Catches all exceptions.
+                      Preserves prior cache values on failure (WM-LIQ-008a).
+                      Modified _warm_up_all_pairs(): fetches ALL online
+                      USD/USDC candidates before seeding indicators.
+                      Populates liquidity_24h. Re-ranks monitored_universe
+                      by volume after fetch (volume data not available at
+                      _build_monitored_universe() time). Filters by
+                      UNIVERSE_MIN_VOLUME_USD. Retries once after 2s on
+                      startup failure. Launches _liquidity_refresh_loop()
+                      task after initial population attempt.
+                      Modified _handle_instrument(): builds _wsname_to_classic
+                      and _classic_to_wsname from altname field in snapshot.
+                      New constant LIQUIDITY_REFRESH_HOURS = 4.
+                      Governed by 1011002 dv1_15 Section 9.6
+                      WM-LIQ-001 through WM-LIQ-010.
 
   dv1_15  04-13-2026  DEFECT-SS-005 fix: seed_indicators_from_rest()
                       now calls self._signal_pipeline.seed_indicators()
@@ -168,6 +201,9 @@ ENTRY_GTD_SEC: int = 30               # GTD expiry for entry orders
 UNIVERSE_TOP_N: int = 50
 UNIVERSE_MIN_VOLUME_USD: Decimal = Decimal("500000")
 
+# Liquidity refresh interval — CIATS-owned starting value (WM-LIQ-007)
+LIQUIDITY_REFRESH_HOURS: int = 4
+
 
 # =============================================================
 # DATA STRUCTURES
@@ -296,6 +332,12 @@ class WSManager:
         # ── 24h liquidity cache — populated from ticker/instrument data ──────
         # Read by Signal Pipeline Gate 2. Keyed by symbol → USD volume/day.
         self.liquidity_24h: dict[str, Decimal] = {}
+
+        # ── Pair name maps for REST Ticker (WM-LIQ-003) ───────────────────
+        # Built from instrument snapshot altname field.
+        # WS v2 name (e.g. "BTC/USD") ↔ Kraken REST altname (e.g. "XBTUSD").
+        self._wsname_to_classic: dict[str, str] = {}   # "BTC/USD" → "XBTUSD"
+        self._classic_to_wsname: dict[str, str] = {}   # "XBTUSD" → "BTC/USD"
 
         # ── Candle close detection ─────────────────────────────────────────
         # WM-OHLC-004: SEPARATE dicts for 5m and 60m (MUST NOT combine)
@@ -492,6 +534,113 @@ class WSManager:
             )
             data = orjson.loads(await resp.read())
         return data.get("result", {})
+
+    async def _rest_get_ticker(
+        self, candidates: list[str]
+    ) -> dict[str, Decimal]:
+        """
+        Fetch 24h USD volume via REST Ticker (WM-LIQ-002, REST-TKR-001 through -006).
+        Input: list of WS v2 pair names (e.g., ["BTC/USD", "ETH/USD"]).
+        Maps WS names → classic altnames via _wsname_to_classic (WM-LIQ-003).
+        Calls GET /0/public/Ticker — public, no auth required (REST-TKR-002).
+        Parses response: usd_vol = Decimal(v[1]) * Decimal(p[1]) per pair (REST-TKR-005).
+        Maps response keys back to WS names via _classic_to_wsname with normalization
+        to handle Kraken legacy key format (e.g. XXBTZUSD vs XBTUSD, WM-LIQ-003).
+        Returns dict[ws_name → usd_volume_24h]. All values are Decimal (HR-WM-008).
+        On error: logs LIQUIDITY_REFRESH_FAILED, returns empty dict (WM-LIQ-008a).
+        Never raises — caller handles empty dict as failure (WM-LIQ-008c).
+        """
+        if not candidates:
+            return {}
+
+        # Map WS names → classic altnames for request (WM-LIQ-003)
+        altname_to_wsname: dict[str, str] = {}
+        for ws_name in candidates:
+            altname = self._wsname_to_classic.get(ws_name)
+            if not altname:
+                self._logger.warning(log_record({
+                    "event": "LIQUIDITY_PAIR_NOT_FOUND",
+                    "level": "WARN",
+                    "component": "WS_MGR",
+                    "pair": ws_name,
+                    "classic_name": "NO_MAPPING",
+                }))
+                continue
+            altname_to_wsname[altname] = ws_name
+
+        if not altname_to_wsname:
+            return {}
+
+        pair_str = ",".join(altname_to_wsname.keys())
+        result: dict[str, Decimal] = {}
+
+        try:
+            async with self._make_http_session() as session:
+                resp = await session.get(
+                    f"{REST_BASE_URL}/0/public/Ticker",
+                    params={"pair": pair_str},
+                )
+                data = orjson.loads(await resp.read())
+
+            if data.get("error"):
+                raise RuntimeError(f"Ticker error: {data['error']}")
+
+            ticker_result = data.get("result", {})
+            for classic_key, ticker_data in ticker_result.items():
+                # Try direct lookup first (REST-TKR-006)
+                ws_name = self._classic_to_wsname.get(classic_key)
+                if ws_name is None:
+                    # Normalize: handle Kraken legacy XXBTZUSD → XBTUSD (WM-LIQ-003)
+                    normalized = self._normalize_classic_key(classic_key)
+                    ws_name = self._classic_to_wsname.get(normalized)
+                if ws_name is None:
+                    self._logger.warning(log_record({
+                        "event": "LIQUIDITY_PAIR_NOT_FOUND",
+                        "level": "WARN",
+                        "component": "WS_MGR",
+                        "pair": classic_key,
+                        "classic_name": classic_key,
+                    }))
+                    continue
+
+                # Compute 24h USD volume: v[1] * p[1] (REST-TKR-005)
+                # v[1] = 24h base volume, p[1] = 24h VWAP in USD. Both strings.
+                v_24h = ticker_data.get("v", ["0", "0"])[1]
+                p_24h = ticker_data.get("p", ["0", "0"])[1]
+                usd_vol = Decimal(str(v_24h)) * Decimal(str(p_24h))
+                result[ws_name] = usd_vol
+
+            return result
+
+        except Exception as exc:  # noqa: BP-ERR-001
+            self._logger.warning(log_record({
+                "event": "LIQUIDITY_REFRESH_FAILED",
+                "level": "WARN",
+                "component": "WS_MGR",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "error": str(exc),
+            }))
+            return {}
+
+    @staticmethod
+    def _normalize_classic_key(key: str) -> str:
+        """
+        Normalize Kraken classic Ticker response key to altname form (WM-LIQ-003).
+        Handles Kraken legacy X/Z prefix scheme: XXBTZUSD → XBTUSD.
+        Strips Z-prefix from fiat quote (ZUSD→USD) and leading X-prefix from
+        legacy crypto base (XXBT→XBT, XETH→ETH).
+        Required because REST Ticker response uses full classic names
+        while instrument snapshot altname field uses shorter altnames.
+        """
+        _Z_FIATS = ("ZUSD", "ZEUR", "ZGBP", "ZCAD", "ZJPY", "ZCHF", "ZAUD")
+        for z_fiat in _Z_FIATS:
+            if key.endswith(z_fiat):
+                base_part = key[: -len(z_fiat)]
+                fiat_part = z_fiat[1:]  # strip Z prefix (e.g. ZUSD → USD)
+                if base_part.startswith("X"):
+                    base_part = base_part[1:]  # strip X from legacy crypto (e.g. XXBT→XBT, XETH→ETH)
+                return base_part + fiat_part
+        return key
 
     # =================================================================
     # WS CONNECTION — WM-CONN-002 template
@@ -1038,6 +1187,13 @@ class WSManager:
                 "status":          status,
                 "quote_currency":  pair.get("quote_currency", ""),
             }
+
+            # Build REST Ticker name maps from altname field (WM-LIQ-003)
+            # altname = Kraken REST classic name (e.g. "XBTUSD") for pair "BTC/USD"
+            altname = pair.get("altname", "")
+            if altname:
+                self._wsname_to_classic[symbol] = altname
+                self._classic_to_wsname[altname] = symbol
 
         if msg_type == "snapshot":
             self._build_monitored_universe()
@@ -2360,14 +2516,19 @@ class WSManager:
     async def _warm_up_all_pairs(self) -> None:
         """
         Seed indicators for all pairs in monitored_universe (WM-WARMUP-001/002).
-        asyncio.gather() parallelizes across pairs — each pair staggers
-        its own Call A → sleep(1.1) → Call B internally (AR-036).
+        DEFECT-SS-006: Step 0 added — fetch 24h liquidity for ALL online
+        USD/USDC candidates via REST Ticker before seeding indicators (WM-LIQ-004).
+        After liquidity fetch: re-rank monitored_universe by actual USD volume
+        (volume not available during _build_monitored_universe — placeholder order
+        replaced here). Filter by UNIVERSE_MIN_VOLUME_USD. Top N=50. BTC/USD always in.
+        Launch _liquidity_refresh_loop() asyncio task (WM-LIQ-006).
+        asyncio.gather() parallelizes indicator seeding across pairs.
         return_exceptions=True: one pair failure does not abort others.
         Logs SYSTEM_OPERATIONAL when at least one pair reaches READY (SS-STARTUP-022).
         Called from _subscribe_ohlc_channels() after ohlc(5) subscription sent.
         Paper mode: identical path (WM-WARMUP-001).
         """
-        if not self.monitored_universe:
+        if not self.monitored_universe and not self.pair_cache:
             return
 
         self._logger.info(log_record({
@@ -2377,6 +2538,94 @@ class WSManager:
             "pairs": len(self.monitored_universe),
         }))
 
+        # ── Step 0: Fetch 24h liquidity for ALL online USD/USDC candidates ──
+        # Must fetch ALL (not just monitored_universe) to rank by volume (WM-LIQ-004)
+        candidates = [
+            sym for sym, spec in self.pair_cache.items()
+            if spec.get("quote_currency") in ("USD", "USDC")
+            and spec.get("status") == "online"
+        ]
+
+        liquidity_result = await self._rest_get_ticker(candidates)
+
+        if liquidity_result:
+            self.liquidity_24h.update(liquidity_result)
+            self._logger.info(log_record({
+                "event": "LIQUIDITY_SEEDED",
+                "level": "INFO",
+                "component": "WS_MGR",
+                "pairs_count": len(liquidity_result),
+                "threshold": str(UNIVERSE_MIN_VOLUME_USD),
+            }))
+            for sym, vol in liquidity_result.items():
+                self._logger.debug(log_record({
+                    "event": "LIQUIDITY_SEEDED_DETAIL",
+                    "level": "DEBUG",
+                    "component": "WS_MGR",
+                    "symbol": sym,
+                    "usd_volume_24h": str(vol),
+                }))
+        else:
+            # Retry once after 2s (WM-LIQ-008b)
+            await asyncio.sleep(2)
+            liquidity_result = await self._rest_get_ticker(candidates)
+            if liquidity_result:
+                self.liquidity_24h.update(liquidity_result)
+                self._logger.info(log_record({
+                    "event": "LIQUIDITY_SEEDED",
+                    "level": "INFO",
+                    "component": "WS_MGR",
+                    "pairs_count": len(liquidity_result),
+                    "threshold": str(UNIVERSE_MIN_VOLUME_USD),
+                }))
+            else:
+                self._logger.warning(log_record({
+                    "event": "LIQUIDITY_SEED_FAILED",
+                    "level": "WARN",
+                    "component": "WS_MGR",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "reason": "startup_failure",
+                    "note": "Gate 2 will block all entries until refresh succeeds",
+                }))
+                # Gate 2 blocks all entries — system is fail-safe (WM-LIQ-010)
+
+        # ── Step 0b: Re-rank monitored_universe by actual volume ─────────────
+        # _build_monitored_universe() used alphabetical order as placeholder.
+        # Now that volume data is available, apply proper ranking (WM-PS-002/003).
+        if self.liquidity_24h:
+            min_vol = Decimal(str(
+                self._ciats_params.get("min_volume_usd_daily", UNIVERSE_MIN_VOLUME_USD)
+            ))
+            # Filter candidates by volume threshold
+            ranked = [
+                (sym, vol)
+                for sym, vol in self.liquidity_24h.items()
+                if vol >= min_vol and sym in self.pair_cache
+            ]
+            # Sort by volume descending
+            ranked.sort(key=lambda x: x[1], reverse=True)
+            # Take top N
+            top_symbols = [sym for sym, _ in ranked[:UNIVERSE_TOP_N]]
+            # BTC/USD always included (AR-074, WM-PS-003)
+            if "BTC/USD" not in top_symbols and "BTC/USD" in self.pair_cache:
+                if len(top_symbols) >= UNIVERSE_TOP_N:
+                    top_symbols[-1] = "BTC/USD"  # replace last entry
+                else:
+                    top_symbols.append("BTC/USD")
+            self.monitored_universe = top_symbols
+            self._logger.info(log_record({
+                "event": "UNIVERSE_RANKED_BY_VOLUME",
+                "level": "INFO",
+                "component": "WS_MGR",
+                "universe_size": len(self.monitored_universe),
+                "volume_threshold_usd": str(min_vol),
+            }))
+
+        # ── Step 0c: Launch periodic liquidity refresh task (WM-LIQ-006) ────
+        # Launched regardless of seed success — will populate on next cycle.
+        asyncio.create_task(self._liquidity_refresh_loop())
+
+        # ── Step 1: Seed indicators for all monitored pairs (WM-WARMUP-002) ─
         await asyncio.gather(
             *[self.seed_indicators_from_rest(s) for s in self.monitored_universe],
             return_exceptions=True,
@@ -2403,6 +2652,60 @@ class WSManager:
                 "total_pairs": len(self.monitored_universe),
                 "note": "Pipeline active for READY pairs",
             }))
+
+    async def _liquidity_refresh_loop(self) -> None:
+        """
+        Periodic REST Ticker refresh for monitored_universe (WM-LIQ-005/006).
+        Long-lived asyncio task for the lifetime of the TothBot process.
+        Sleeps liquidity_refresh_hours (CIATS starting value: 4) between cycles.
+        On each cycle: refreshes liquidity_24h for monitored_universe pairs only.
+        On success: liquidity_24h.update() — existing values preserved for other pairs.
+        On failure: NEVER zeros out existing values (WM-LIQ-008a).
+        Never raises — catches all exceptions, logs, sleeps, retries (WM-LIQ-008c).
+        """
+        while True:
+            try:
+                refresh_hours = int(
+                    self._ciats_params.get(
+                        "liquidity_refresh_hours", LIQUIDITY_REFRESH_HOURS
+                    )
+                )
+                await asyncio.sleep(refresh_hours * 3600)
+
+                result = await self._rest_get_ticker(
+                    list(self.monitored_universe)
+                )
+
+                if result:
+                    self.liquidity_24h.update(result)
+                    self._logger.info(log_record({
+                        "event": "LIQUIDITY_REFRESHED",
+                        "level": "INFO",
+                        "component": "WS_MGR",
+                        "pairs_count": len(result),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }))
+                else:
+                    self._logger.warning(log_record({
+                        "event": "LIQUIDITY_REFRESH_FAILED",
+                        "level": "WARN",
+                        "component": "WS_MGR",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "error": "empty_result",
+                        "note": "Prior cache values preserved",
+                    }))
+                    # Prior cache preserved — Gate 2 still functional (WM-LIQ-008a)
+
+            except Exception as exc:  # noqa: BP-ERR-001
+                self._logger.warning(log_record({
+                    "event": "LIQUIDITY_REFRESH_FAILED",
+                    "level": "WARN",
+                    "component": "WS_MGR",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "error": str(exc),
+                    "note": "Prior cache values preserved",
+                }))
+                # Continue loop — next sleep cycle will retry (WM-LIQ-008c)
 
     async def seed_indicators_from_rest(self, symbol: str) -> None:
         """
