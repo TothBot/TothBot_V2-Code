@@ -1,15 +1,36 @@
 """
 DocDCN:     1011002
 DocTitle:   WS_Manager
-DocVersion: dv1_19
+DocVersion: dv1_20
 DocOwner:   Bill
 DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/ws_manager.py
-DocDate:    04-14-2026
-DocTime:    23:59:59 UTC
+DocDate:    04-18-2026
+DocTime:    22:00:00 UTC
 
 ============================================================
 REVISION HISTORY
 ============================================================
+
+  dv1_20  04-18-2026  DEFECT-WM-RECONNECT-001 fix.
+                      Transient WS disconnect errors (ConnectionClosedError,
+                      ConnectionClosedOK, ConnectionResetError) now caught
+                      locally in _recv_loop_public, _recv_loop_private,
+                      _send_public, _send_private. Each catch site logs
+                      RECONNECT_TRIGGERED and invokes _initiate_reconnect()
+                      (existing N=10 / base=1s / cap=30s retry schedule —
+                      now declared as module-level constants, no magic
+                      numbers). Receive loops resume on the new connection
+                      after reconnect completes. Send helpers swallow the
+                      failed send and schedule reconnect as a background
+                      task. _initiate_reconnect gained an asyncio.Event
+                      gate (_reconnect_done_event) and a terminal
+                      _fatal_reconnect_failure flag so concurrent disconnect
+                      detection collapses to one reconnect cycle and
+                      post-fatal retry races are prevented. _main_loop
+                      TaskGroup now receives only truly fatal conditions —
+                      transient CloudFlare-cycle disconnects are fully
+                      handled at loop level. Governed by 1011002 dv1_19
+                      WM-RECONNECT-016, WM-RECONNECT-017, WM-RECONNECT-018.
 
   dv1_19  04-14-2026  DEFECT-WM-CRASH-001 fix (Fix 1):
                       run() except block now extracts
@@ -197,6 +218,9 @@ import orjson
 
 # websockets v14+ — use asyncio client (AR-060, WM-CONN-007)
 from websockets.asyncio.client import connect
+# WM-RECONNECT-016: transient disconnect exception types caught locally
+# in recv loops and send helpers. Must NOT propagate to _main_loop TaskGroup.
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 from tothbot.logger import _alert_operator_direct, log_record
 
@@ -220,9 +244,27 @@ PING_TIMEOUT_SEC: int = 10             # A-7: no pong in 10s = reconnect
 ZOMBIE_THRESHOLD_SEC: int = 90          # A-8 (WM-ZOM-003)
 
 # Reconnect
-MAX_RECONNECT_ATTEMPTS: int = 10        # WM-RECONNECT-002
+MAX_RECONNECT_ATTEMPTS: int = 10        # WM-RECONNECT-002 / WM-RECONNECT-017
 RECONNECT_WINDOW_SEC: int = 120         # WM-RECONNECT-002
 RECONNECT_STALE_CACHE_SEC: int = 900    # WM-RECONNECT-014: 15 minutes
+
+# WM-RECONNECT-017: exponential backoff schedule for _initiate_reconnect.
+# Schedule with factor=2, base=1.0, cap=30.0, N=10:
+#   1s, 2s, 4s, 8s, 16s, 30s, 30s, 30s, 30s, 30s (total worst case ~155s).
+RECONNECT_BACKOFF_BASE_SEC: float = 1.0
+RECONNECT_BACKOFF_CAP_SEC: float = 30.0
+RECONNECT_BACKOFF_FACTOR: float = 2.0
+
+# WM-RECONNECT-016: transient WS disconnect errors.
+# Any of these raised by the WS iterator (async for in recv loops) or by
+# ws.send() in send helpers MUST be caught locally and trigger orderly
+# reconnect. They MUST NOT propagate to the _main_loop TaskGroup.
+# ConnectionResetError is a Python built-in (OSError subclass — TCP RST).
+_TRANSIENT_WS_ERRORS: tuple[type[BaseException], ...] = (
+    ConnectionClosedError,
+    ConnectionClosedOK,
+    ConnectionResetError,
+)
 
 # REST timeouts — BP-ASYNC-004
 REST_TOTAL_TIMEOUT: int = 10
@@ -458,6 +500,16 @@ class WSManager:
         self._reconnect_start_time: float | None = None
         self._reconnect_attempt: int = 0
         self._disconnect_time: float | None = None
+        # WM-RECONNECT-018: event gate so concurrent disconnect detection
+        # by both recv loops collapses to a single reconnect cycle. Set
+        # when no reconnect is in progress; cleared by _initiate_reconnect
+        # on entry and re-set in its finally block.
+        self._reconnect_done_event: asyncio.Event = asyncio.Event()
+        self._reconnect_done_event.set()
+        # WM-RECONNECT-018: terminal flag. Set by _initiate_reconnect when
+        # all attempts are exhausted. Prevents siblings from starting a
+        # second retry cycle while TaskGroup teardown is in flight.
+        self._fatal_reconnect_failure: bool = False
 
         # ── Dispatch tables ───────────────────────────────────────────────
         self._channel_dispatch: dict[str, Callable] = {}
@@ -731,16 +783,70 @@ class WSManager:
     # =================================================================
 
     async def _send_public(self, payload: dict) -> None:
-        """Send JSON message on public WS connection."""
-        await self._ws_public.send(
-            orjson.dumps(payload).decode()
-        )
+        """
+        Send JSON message on public WS connection.
+
+        WM-RECONNECT-016: a transient disconnect raised by ws.send() is
+        caught locally. The send is lost (the process does not terminate);
+        SEND_DISCONNECT and RECONNECT_TRIGGERED are logged; an orderly
+        reconnect is scheduled as a background task so the caller is not
+        blocked. Compare to pre-dv1_20 behavior where this raise
+        propagated out of the caller (e.g. _ping_loop) into the
+        _main_loop TaskGroup and crashed the process.
+        """
+        try:
+            await self._ws_public.send(
+                orjson.dumps(payload).decode()
+            )
+        except _TRANSIENT_WS_ERRORS as exc:
+            self._logger.warning(log_record({
+                "event": "SEND_DISCONNECT",
+                "level": "HIGH",
+                "component": "WS_MGR",
+                "endpoint": "public",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }))
+            self._logger.warning(log_record({
+                "event": "RECONNECT_TRIGGERED",
+                "level": "HIGH",
+                "component": "WS_MGR",
+                "source": "_send_public",
+                "error_type": type(exc).__name__,
+            }))
+            if not self._is_reconnecting and not self._fatal_reconnect_failure:
+                asyncio.create_task(self._initiate_reconnect())
 
     async def _send_private(self, payload: dict) -> None:
-        """Send JSON message on private WS connection."""
-        await self._ws_private.send(
-            orjson.dumps(payload).decode()
-        )
+        """
+        Send JSON message on private WS connection.
+
+        WM-RECONNECT-016: same transient-catch behavior as _send_public.
+        A failed private send during CloudFlare cycling is logged and
+        swallowed; reconnect is scheduled; the process does not terminate.
+        """
+        try:
+            await self._ws_private.send(
+                orjson.dumps(payload).decode()
+            )
+        except _TRANSIENT_WS_ERRORS as exc:
+            self._logger.warning(log_record({
+                "event": "SEND_DISCONNECT",
+                "level": "HIGH",
+                "component": "WS_MGR",
+                "endpoint": "private",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }))
+            self._logger.warning(log_record({
+                "event": "RECONNECT_TRIGGERED",
+                "level": "HIGH",
+                "component": "WS_MGR",
+                "source": "_send_private",
+                "error_type": type(exc).__name__,
+            }))
+            if not self._is_reconnecting and not self._fatal_reconnect_failure:
+                asyncio.create_task(self._initiate_reconnect())
 
     # =================================================================
     # SUBSCRIPTIONS
@@ -971,54 +1077,104 @@ class WSManager:
     # =================================================================
 
     async def _recv_loop_public(self) -> None:
-        """Receive loop for public WS. Dispatches all inbound messages."""
-        async for raw in self._ws_public:
+        """
+        Receive loop for public WS. Dispatches all inbound messages.
+
+        WM-RECONNECT-016: the async-for iterator (which raises
+        ConnectionClosedError / ConnectionClosedOK / ConnectionResetError
+        on CloudFlare cycling — see DEFECT-WM-RECONNECT-001) is wrapped
+        in an outer try/except. On transient disconnect the helper
+        _handle_recv_loop_disconnect awaits an orderly reconnect and the
+        outer while-loop then resumes iteration on the NEW self._ws_public
+        object assigned inside _execute_reconnect_sequence.
+
+        A clean (non-exception) exit of the async-for is unusual but is
+        ALSO treated as a disconnect — trigger reconnect and resume.
+
+        WM-RECONNECT-018: the _fatal_reconnect_failure flag is the only
+        path that terminates this loop. It is set by _initiate_reconnect
+        after all attempts are exhausted; when observed here, we return
+        cleanly and let the TaskGroup propagate the fatal RuntimeError
+        raised by whichever task first hit exhaustion.
+        """
+        while True:
+            if self._fatal_reconnect_failure:
+                return
             try:
-                msg = orjson.loads(raw)
-                channel = msg.get("channel") or msg.get("method", "")
-                handler = self._channel_dispatch.get(channel)
-                if handler:
-                    await handler(msg, is_public=True)
-                else:
-                    self._logger.warning(log_record({
-                        "event": "UNKNOWN_MESSAGE_TYPE",
-                        "level": "WARN",
-                        "component": "WS_MGR",
-                        "channel": channel,
-                        "raw": str(raw)[:200],
-                    }))
-            except Exception as exc:  # noqa: BP-ERR-001
-                self._logger.error(log_record({
-                    "event": "PUBLIC_RECV_ERROR",
-                    "level": "WARN",
-                    "component": "WS_MGR",
-                    "error": str(exc),
-                }))
+                async for raw in self._ws_public:
+                    try:
+                        msg = orjson.loads(raw)
+                        channel = msg.get("channel") or msg.get("method", "")
+                        handler = self._channel_dispatch.get(channel)
+                        if handler:
+                            await handler(msg, is_public=True)
+                        else:
+                            self._logger.warning(log_record({
+                                "event": "UNKNOWN_MESSAGE_TYPE",
+                                "level": "WARN",
+                                "component": "WS_MGR",
+                                "channel": channel,
+                                "raw": str(raw)[:200],
+                            }))
+                    except Exception as exc:  # noqa: BP-ERR-001
+                        self._logger.error(log_record({
+                            "event": "PUBLIC_RECV_ERROR",
+                            "level": "WARN",
+                            "component": "WS_MGR",
+                            "error": str(exc),
+                        }))
+            except _TRANSIENT_WS_ERRORS as exc:
+                await self._handle_recv_loop_disconnect(
+                    "_recv_loop_public", exc
+                )
+                continue
+            # async-for exited cleanly — also treat as disconnect
+            await self._handle_recv_loop_disconnect(
+                "_recv_loop_public", None
+            )
 
     async def _recv_loop_private(self) -> None:
-        """Receive loop for private WS. Dispatches all inbound messages."""
-        async for raw in self._ws_private:
+        """
+        Receive loop for private WS. Dispatches all inbound messages.
+
+        WM-RECONNECT-016: same transient-catch pattern as _recv_loop_public.
+        See that method for the full rationale.
+        """
+        while True:
+            if self._fatal_reconnect_failure:
+                return
             try:
-                msg = orjson.loads(raw)
-                channel = msg.get("channel") or msg.get("method", "")
-                handler = self._channel_dispatch.get(channel)
-                if handler:
-                    await handler(msg, is_public=False)
-                else:
-                    self._logger.warning(log_record({
-                        "event": "UNKNOWN_MESSAGE_TYPE",
-                        "level": "WARN",
-                        "component": "WS_MGR",
-                        "channel": channel,
-                        "raw": str(raw)[:200],
-                    }))
-            except Exception as exc:  # noqa: BP-ERR-001
-                self._logger.error(log_record({
-                    "event": "PRIVATE_RECV_ERROR",
-                    "level": "WARN",
-                    "component": "WS_MGR",
-                    "error": str(exc),
-                }))
+                async for raw in self._ws_private:
+                    try:
+                        msg = orjson.loads(raw)
+                        channel = msg.get("channel") or msg.get("method", "")
+                        handler = self._channel_dispatch.get(channel)
+                        if handler:
+                            await handler(msg, is_public=False)
+                        else:
+                            self._logger.warning(log_record({
+                                "event": "UNKNOWN_MESSAGE_TYPE",
+                                "level": "WARN",
+                                "component": "WS_MGR",
+                                "channel": channel,
+                                "raw": str(raw)[:200],
+                            }))
+                    except Exception as exc:  # noqa: BP-ERR-001
+                        self._logger.error(log_record({
+                            "event": "PRIVATE_RECV_ERROR",
+                            "level": "WARN",
+                            "component": "WS_MGR",
+                            "error": str(exc),
+                        }))
+            except _TRANSIENT_WS_ERRORS as exc:
+                await self._handle_recv_loop_disconnect(
+                    "_recv_loop_private", exc
+                )
+                continue
+            # async-for exited cleanly — also treat as disconnect
+            await self._handle_recv_loop_disconnect(
+                "_recv_loop_private", None
+            )
 
     # =================================================================
     # CHANNEL HANDLERS
@@ -3180,16 +3336,62 @@ class WSManager:
     # MID-SESSION RECONNECT — Section 15 (HR-WM-016, AR-056)
     # =================================================================
 
+    async def _handle_recv_loop_disconnect(
+        self, source: str, exc: BaseException | None
+    ) -> None:
+        """
+        WM-RECONNECT-016 / WM-RECONNECT-018: shared disconnect handler
+        for both receive loops. Logs RECONNECT_TRIGGERED and awaits the
+        orderly reconnect cycle managed by _initiate_reconnect.
+
+        If another task is already driving a reconnect, awaits the done
+        event and returns without starting a second cycle. If a prior
+        reconnect exhausted all attempts and set the terminal fatal
+        flag, returns immediately so TaskGroup teardown can proceed.
+        """
+        self._logger.warning(log_record({
+            "event": "RECONNECT_TRIGGERED",
+            "level": "HIGH",
+            "component": "WS_MGR",
+            "source": source,
+            "error_type": type(exc).__name__ if exc else "clean_exit",
+            "error": str(exc) if exc else "async-for exited without exception",
+        }))
+        if self._fatal_reconnect_failure:
+            return
+        if self._is_reconnecting:
+            await self._reconnect_done_event.wait()
+            return
+        await self._initiate_reconnect()
+
     async def _initiate_reconnect(self) -> None:
         """
         Initiate mid-session reconnect. SEPARATE code path from startup.
         NEVER reuses startup code (HR-WM-016).
         10 attempts over 120s → FATAL_RECONNECT_FAILURE (WM-RECONNECT-002).
+
+        WM-RECONNECT-017: retry schedule uses module-level constants
+        RECONNECT_BACKOFF_BASE_SEC / _CAP_SEC / _FACTOR — no magic
+        numbers (DC-4).
+
+        WM-RECONNECT-018: _reconnect_done_event is cleared on entry and
+        re-set in the finally block (on success, fatal, or re-entry).
+        Concurrent callers await the event and return without starting a
+        second retry cycle. _fatal_reconnect_failure is set before
+        raising the final RuntimeError so siblings awaken from the event
+        wait in a terminal state and do not start new cycles before
+        TaskGroup teardown completes.
         """
         if self._is_reconnecting:
-            return  # Already reconnecting
+            await self._reconnect_done_event.wait()
+            return
+        if self._fatal_reconnect_failure:
+            raise RuntimeError(
+                "Fatal reconnect already signaled — systemd restart required"
+            )
 
         self._is_reconnecting = True
+        self._reconnect_done_event.clear()
         self._disconnect_time = time.monotonic()
         self._reconnect_attempt = 0
 
@@ -3201,44 +3403,57 @@ class WSManager:
             "attempt_number": 1,
         }))
 
-        backoff_sec = 1.0
-        while self._reconnect_attempt < MAX_RECONNECT_ATTEMPTS:
-            self._reconnect_attempt += 1
-            try:
-                await self._execute_reconnect_sequence()
-                self._is_reconnecting = False
-                self._awaiting_pong_pub = False
-                self._awaiting_pong_priv = False
-                self._logger.info(log_record({
-                    "event": "RECONNECT_COMPLETE",
-                    "level": "INFO",
-                    "component": "WS_MGR",
-                    "connection_id": self.connection_id_public,
-                }))
-                return
-            except Exception as exc:  # noqa: BP-ERR-001
-                self._logger.warning(log_record({
-                    "event": "RECONNECT_ATTEMPT_FAILED",
-                    "level": "WARN",
-                    "component": "WS_MGR",
-                    "attempt": self._reconnect_attempt,
-                    "error": str(exc),
-                }))
-                await asyncio.sleep(backoff_sec)
-                backoff_sec = min(backoff_sec * 2, 30)
+        try:
+            backoff_sec = RECONNECT_BACKOFF_BASE_SEC
+            while self._reconnect_attempt < MAX_RECONNECT_ATTEMPTS:
+                self._reconnect_attempt += 1
+                try:
+                    await self._execute_reconnect_sequence()
+                    self._awaiting_pong_pub = False
+                    self._awaiting_pong_priv = False
+                    self._logger.info(log_record({
+                        "event": "RECONNECT_COMPLETE",
+                        "level": "INFO",
+                        "component": "WS_MGR",
+                        "connection_id": self.connection_id_public,
+                        "attempts": self._reconnect_attempt,
+                    }))
+                    return
+                except Exception as exc:  # noqa: BP-ERR-001
+                    self._logger.warning(log_record({
+                        "event": "RECONNECT_ATTEMPT_FAILED",
+                        "level": "WARN",
+                        "component": "WS_MGR",
+                        "attempt": self._reconnect_attempt,
+                        "error": str(exc),
+                    }))
+                    await asyncio.sleep(backoff_sec)
+                    backoff_sec = min(
+                        backoff_sec * RECONNECT_BACKOFF_FACTOR,
+                        RECONNECT_BACKOFF_CAP_SEC,
+                    )
 
-        # Fatal — systemd will restart (WM-RECONNECT-002)
-        self._logger.critical(log_record({
-            "event": "FATAL_RECONNECT_FAILURE",
-            "level": "CRITICAL",
-            "component": "WS_MGR",
-            "attempt_count": self._reconnect_attempt,
-        }))
-        _alert_operator_direct(
-            f"FATAL RECONNECT FAILURE after {self._reconnect_attempt} attempts. "
-            f"systemd will restart TothBot."
-        )
-        raise RuntimeError("Fatal reconnect failure — systemd restart required")
+            # Fatal — systemd will restart (WM-RECONNECT-002 / WM-RECONNECT-017)
+            self._fatal_reconnect_failure = True
+            self._logger.critical(log_record({
+                "event": "FATAL_RECONNECT_FAILURE",
+                "level": "CRITICAL",
+                "component": "WS_MGR",
+                "attempt_count": self._reconnect_attempt,
+            }))
+            _alert_operator_direct(
+                f"FATAL RECONNECT FAILURE after {self._reconnect_attempt} attempts. "
+                f"systemd will restart TothBot."
+            )
+            raise RuntimeError(
+                "Fatal reconnect failure — systemd restart required"
+            )
+        finally:
+            # WM-RECONNECT-018: always release the event gate, whether
+            # the reconnect succeeded, exhausted all attempts, or raised
+            # unexpectedly. Siblings waiting on the event will resume.
+            self._is_reconnecting = False
+            self._reconnect_done_event.set()
 
     async def _execute_reconnect_sequence(self) -> None:
         """
