@@ -1,15 +1,25 @@
 """
 DocDCN:     1011013
 DocTitle:   VPS_Deployment
-DocVersion: dv1_4
+DocVersion: dv1_5
 DocOwner:   Bill
 DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/vps_deployment.py
-DocDate:    04-12-2026
-DocTime:    23:59:59 UTC
+DocDate:    04-20-2026
+DocTime:    23:00:00 UTC
 
 ============================================================
 REVISION HISTORY
 ============================================================
+
+  dv1_5   04-20-2026  OI-019 DEFECT-ALERT-ROUTING-001 fix.
+                      send_alert() ALERT_EMAIL_TO default changed
+                      from singular "alert@tothbot.com" to plural
+                      "alerts@tothbot.com". Matches the real Proton
+                      Mail mailbox; the singular mailbox does not
+                      exist (Proton catch-all reserves the namespace,
+                      returns "Address is already taken" on create
+                      attempt). No other code logic changes.
+                      Governed by 1011013 dv1_5 VD-ALT-001/002.
 
   dv1_4   04-12-2026  DC header added per 0311001 v1_1, 0311004 v1_1,
                       1011001 dv1_7. No code logic changes.
@@ -126,7 +136,7 @@ async def send_alert(
     smtp_user = os.environ.get("SMTP_USER", "")
     smtp_pass = os.environ.get("SMTP_PASS", "")
     from_addr = os.environ.get("ALERT_EMAIL_FROM", "alerts@tothbot.com")
-    to_addr   = os.environ.get("ALERT_EMAIL_TO",   "alert@tothbot.com")
+    to_addr   = os.environ.get("ALERT_EMAIL_TO",   "alerts@tothbot.com")  # OI-019
 
     if not smtp_host or not smtp_user:
         logger.warning(log_record({

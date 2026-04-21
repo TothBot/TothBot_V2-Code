@@ -1,15 +1,26 @@
 """
 DocDCN:     1011007
 DocTitle:   Logger
-DocVersion: dv1_2
+DocVersion: dv1_3
 DocOwner:   Bill
 DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/logger.py
-DocDate:    04-12-2026
-DocTime:    23:59:59 UTC
+DocDate:    04-20-2026
+DocTime:    23:00:00 UTC
 
 ============================================================
 REVISION HISTORY
 ============================================================
+
+  dv1_3   04-20-2026  OI-019 DEFECT-ALERT-ROUTING-001 fix. ALERT_EMAIL
+                      changed from singular "alert@tothbot.com" to
+                      plural "alerts@tothbot.com". Proton Mail mailbox
+                      exists only at the plural address; the singular
+                      mailbox cannot be created (Proton catch-all
+                      reserves the namespace and returns "Address is
+                      already taken"). 100% of post-deploy critical
+                      alerts bounced until this fix (TB00105 Query 9).
+                      No other code logic changes. Governed by
+                      1011007 dv1_3 Section 8 LG-ALERT-001/002/004.
 
   dv1_2   04-12-2026  DC header added per 0311001 v1_1, 0311004 v1_1,
                       1011001 dv1_7. No code logic changes.
@@ -71,8 +82,8 @@ LOG_QUEUE_WARN_PCT: float = 0.80
 LOG_ROTATE_BYTES: int = 50 * 1024 * 1024
 LOG_ROTATE_COUNT: int = 90
 
-# Alert routing — LG-ALERT-001/002
-ALERT_EMAIL: str = "alert@tothbot.com"
+# Alert routing — LG-ALERT-001/002 (OI-019: plural — Proton mailbox)
+ALERT_EMAIL: str = "alerts@tothbot.com"
 ALERT_SMTP_TIMEOUT_SEC: int = 5     # fire-and-forget
 ALERT_LEVELS: frozenset[str] = frozenset({"HIGH", "CRITICAL"})
 

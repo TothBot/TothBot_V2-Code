@@ -1,15 +1,24 @@
 """
 DocDCN:     1011014
 DocTitle:   Startup_Sequence
-DocVersion: dv1_7
+DocVersion: dv1_8
 DocOwner:   Bill
 DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/startup_sequence.py
-DocDate:    04-14-2026
-DocTime:    23:59:59 UTC
+DocDate:    04-20-2026
+DocTime:    23:00:00 UTC
 
 ============================================================
 REVISION HISTORY
 ============================================================
+
+  dv1_8   04-20-2026  OI-019 DEFECT-ALERT-ROUTING-001 fix.
+                      _load_config() ALERT_EMAIL_TO default changed
+                      from singular "alert@tothbot.com" to plural
+                      "alerts@tothbot.com". Matches the real Proton
+                      Mail mailbox; the singular mailbox does not
+                      exist (Proton catch-all reserves the namespace).
+                      No other code logic changes. Governed by
+                      1011014 dv1_6 SS-STARTUP-002 / SS-RECON-015.
 
   dv1_7   04-14-2026  DEFECT-SS-009 fix: _regime_wrapper passed
                       no universe to rge.run_daily_computation().
@@ -242,7 +251,7 @@ def _load_config() -> dict:
         "smtp_user":    os.environ.get("SMTP_USER",          ""),
         "smtp_pass":    os.environ.get("SMTP_PASS",          ""),
         "alert_from":   os.environ.get("ALERT_EMAIL_FROM",  "alerts@tothbot.com"),
-        "alert_to":     os.environ.get("ALERT_EMAIL_TO",    "alert@tothbot.com"),
+        "alert_to":     os.environ.get("ALERT_EMAIL_TO",    "alerts@tothbot.com"),  # OI-019
         # Log file path — used by CIATS for tail (1011010 dv1_6)
         "log_file_path": os.environ.get("TOTHBOT_LOG_FILE", LOG_FILE),
         # Paper trading mode — PT-MODE-001 (0211005 dv1_0)

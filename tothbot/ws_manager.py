@@ -1,15 +1,36 @@
 """
 DocDCN:     1011002
 DocTitle:   WS_Manager
-DocVersion: dv1_20
+DocVersion: dv1_21
 DocOwner:   Bill
 DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/ws_manager.py
-DocDate:    04-18-2026
-DocTime:    22:00:00 UTC
+DocDate:    04-20-2026
+DocTime:    23:00:00 UTC
 
 ============================================================
 REVISION HISTORY
 ============================================================
+
+  dv1_21  04-20-2026  OI-020 DEFECT-KRAKEN-TRANSIENT-API-001 fix:
+                      extend Kraken WS reconnect retry window.
+                      MAX_RECONNECT_ATTEMPTS changed 10 → 20. Base
+                      (1s), cap (30s), factor (2x) unchanged — same
+                      proven exponential curve, no behavior regression.
+                      Worst-case wall time: 1+2+4+8+16+30×15 = 481s
+                      (~8 minutes). Covers observed Kraken transient
+                      `EAPI:Invalid key` outages of ~2m 32s and
+                      ~2m 33s (TB00105 Section 2.2) with generous
+                      safety margin. Prior N=10 window (~181s) was
+                      insufficient: every observed transient outage
+                      led to WS_MGR_FATAL + systemd restart rather
+                      than RECONNECT_COMPLETE. Backoff-schedule
+                      docstring comment updated to reflect N=20 math.
+                      DEFECT-WM-RECONNECT-001 observation period
+                      (42.5h, TB00105) confirmed the dv1_20 fix works
+                      as designed; this change addresses the
+                      downstream external-cause crashes only.
+                      Governed by 1011002 dv1_20 WM-RECONNECT-017
+                      (N=20) harmonized with WM-RECONNECT-002.
 
   dv1_20  04-18-2026  DEFECT-WM-RECONNECT-001 fix.
                       Transient WS disconnect errors (ConnectionClosedError,
@@ -244,13 +265,17 @@ PING_TIMEOUT_SEC: int = 10             # A-7: no pong in 10s = reconnect
 ZOMBIE_THRESHOLD_SEC: int = 90          # A-8 (WM-ZOM-003)
 
 # Reconnect
-MAX_RECONNECT_ATTEMPTS: int = 10        # WM-RECONNECT-002 / WM-RECONNECT-017
-RECONNECT_WINDOW_SEC: int = 120         # WM-RECONNECT-002
+MAX_RECONNECT_ATTEMPTS: int = 20        # WM-RECONNECT-002 / WM-RECONNECT-017 (OI-020)
+RECONNECT_WINDOW_SEC: int = 481         # WM-RECONNECT-002 worst-case wall time (N=20)
 RECONNECT_STALE_CACHE_SEC: int = 900    # WM-RECONNECT-014: 15 minutes
 
 # WM-RECONNECT-017: exponential backoff schedule for _initiate_reconnect.
-# Schedule with factor=2, base=1.0, cap=30.0, N=10:
-#   1s, 2s, 4s, 8s, 16s, 30s, 30s, 30s, 30s, 30s (total worst case ~155s).
+# Schedule with factor=2, base=1.0, cap=30.0, N=20 (OI-020):
+#   1s, 2s, 4s, 8s, 16s, then 30s × 15 = 481s total worst-case wall time
+#   (~8 minutes). Covers observed Kraken transient EAPI:Invalid key
+#   outages of ~2m 32s and ~2m 33s (TB00105 Section 2.2) with safety
+#   margin. Prior N=10 window (~181s) was insufficient — every such
+#   outage crashed to WS_MGR_FATAL + systemd restart.
 RECONNECT_BACKOFF_BASE_SEC: float = 1.0
 RECONNECT_BACKOFF_CAP_SEC: float = 30.0
 RECONNECT_BACKOFF_FACTOR: float = 2.0
@@ -3368,7 +3393,8 @@ class WSManager:
         """
         Initiate mid-session reconnect. SEPARATE code path from startup.
         NEVER reuses startup code (HR-WM-016).
-        10 attempts over 120s → FATAL_RECONNECT_FAILURE (WM-RECONNECT-002).
+        20 attempts over ~481s (~8 min) → FATAL_RECONNECT_FAILURE
+        (WM-RECONNECT-002, OI-020).
 
         WM-RECONNECT-017: retry schedule uses module-level constants
         RECONNECT_BACKOFF_BASE_SEC / _CAP_SEC / _FACTOR — no magic
