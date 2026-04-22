@@ -1,15 +1,45 @@
 """
 DocDCN:     1011014
 DocTitle:   Startup_Sequence
-DocVersion: dv1_8
+DocVersion: dv1_9
 DocOwner:   Bill
 DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/startup_sequence.py
-DocDate:    04-20-2026
-DocTime:    23:00:00 UTC
+DocDate:    04-21-2026
+DocTime:    23:59:00 UTC
 
 ============================================================
 REVISION HISTORY
 ============================================================
+
+  dv1_9   04-21-2026  TB00108 AI-3 — OI-014 startup_sequence
+                      stale xrefs (LOW). Docstring-only change.
+                      No behavior change, no import change,
+                      no function signature change.
+
+                      Four xref updates:
+                        (a) "WSManager per 1011014 dv1_3
+                            Sections 6-9" -> "per 1011014
+                            dv1_7 Section 6" (covers startup
+                            steps 2-10; reconnect lives in
+                            Section 9 and is documented
+                            separately below).
+                        (b) "Startup Sequence (1011014 dv1_3
+                            Section 6):" -> "(1011014 dv1_7
+                            Section 6):".
+                        (c) "Reconnect sequence (1011014
+                            dv1_3 Section 9):" -> "(1011014
+                            dv1_7 Section 9):".
+                        (d) Deployment block "Logs:
+                            /root/TothBot_V2-Code/logs/
+                            tothbot.log" -> "/home/tothbot/
+                            logs/tothbot.log" to match the
+                            canonical path in logger.py
+                            LOG_FILE (and 1011007 dv1_4
+                            LG-FILE-001/002). The prior
+                            value referenced a path that
+                            logger.py has never written to.
+
+                      Governed by 1011014 dv1_7.
 
   dv1_8   04-20-2026  OI-019 DEFECT-ALERT-ROUTING-001 fix.
                       _load_config() ALERT_EMAIL_TO default changed
@@ -79,15 +109,15 @@ Responsibilities:
        ExecutionEngine, ExitController, SignalPipeline,
        LongModule, SelectionController, CIATS, WSManager.
   6. Launch CIATS as a background asyncio.Task.
-  7. Run WSManager.run() — drives startup Steps 2–10
+  7. Run WSManager.run() — drives startup Steps 2-10
      and continuous operation thereafter.
 
-Steps 2–10 (WS connect, subscribe, reconcile, warm-up,
+Steps 2-10 (WS connect, subscribe, reconcile, warm-up,
 regime seed, READY detection, pipeline, watchdog) are
-owned and executed by WSManager per 1011014 dv1_3 Sections
-6–9. startup_sequence.py does NOT duplicate WS logic.
+owned and executed by WSManager per 1011014 dv1_7 Section 6.
+startup_sequence.py does NOT duplicate WS logic.
 
-Startup Sequence (1011014 dv1_3 Section 6):
+Startup Sequence (1011014 dv1_7 Section 6):
   Step 1   Kraken Status API check         — THIS MODULE
   Step 2   Acquire WS token                — WSManager
   Step 3   Connect public WS + subscribe   — WSManager
@@ -102,8 +132,8 @@ Startup Sequence (1011014 dv1_3 Section 6):
 sd_notify READY=1: sent by WSManager.run() after Step 9
 (SS-STARTUP-026). This module does NOT send sd_notify.
 
-Reconnect sequence (1011014 dv1_3 Section 9):
-  Steps R1–R11 owned entirely by WSManager.
+Reconnect sequence (1011014 dv1_7 Section 9):
+  Steps R1-R11 owned entirely by WSManager.
   portfolio_baseline_USD NEVER reset on reconnect.
   system_state PRESERVED across reconnect.
 
@@ -123,7 +153,7 @@ Deployment:
   Python: /root/tothbot_env/bin/python3 (3.12.3)
   Keys:   /root/.tothbot.env (chmod 600, sourced by systemd EnvironmentFile)
   Entry:  python -m tothbot.startup_sequence  (or via tothbot.service)
-  Logs:   /root/TothBot_V2-Code/logs/tothbot.log
+  Logs:   /home/tothbot/logs/tothbot.log
 ============================================================
 """
 from __future__ import annotations
@@ -465,9 +495,9 @@ async def _async_main() -> None:
     Async entry point. Executes the startup sequence and
     drives continuous operation.
 
-    Startup sequence per 1011014 dv1_3:
+    Startup sequence per 1011014 dv1_7:
       Step 1   — THIS FUNCTION (Kraken Status API check)
-      Steps 2–10 — WSManager.run()
+      Steps 2-10 — WSManager.run()
 
     CIATS runs as an asyncio.Task in the same event loop.
     Fatal exceptions propagate up to run() which exits(1).
@@ -521,7 +551,7 @@ async def _async_main() -> None:
         name="ciats",
     )
 
-    # ── Run WSManager — Steps 2–10 and continuous operation ────
+    # ── Run WSManager — Steps 2-10 and continuous operation ────
     # WSManager.run() blocks until fatal failure or shutdown.
     # systemd WatchdogSec=120 restarts TothBot on fatal exit.
     # Open positions protected by resting emergSL orders (AR-046).

@@ -1,15 +1,78 @@
 """
 DocDCN:     1011007
 DocTitle:   Logger
-DocVersion: dv1_3
+DocVersion: dv1_4
 DocOwner:   Bill
 DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/logger.py
-DocDate:    04-20-2026
-DocTime:    23:00:00 UTC
+DocDate:    04-21-2026
+DocTime:    23:59:00 UTC
 
 ============================================================
 REVISION HISTORY
 ============================================================
+
+  dv1_4   04-21-2026  TB00108 bundled: OI-023 (CRITICAL) +
+                      OI-022 (LOW).
+
+                      OI-023 DEFECT-TRADE-RECORD-001 fix
+                      (AI-1). TRADE_CLOSE records are now
+                      written to BOTH tothbot.log (existing,
+                      rotating, diagnostic) AND an append-only
+                      permanent file at
+                      /home/tothbot/records/trades_<YYYY>.jsonl
+                      (annual-segmented, no rotation, no size
+                      cap). New module constant
+                      TRADES_RECORD_DIR. New handler class
+                      TothBotTradeRecordHandler attached to
+                      the existing QueueListener alongside
+                      file_handler and alert_handler. Hot
+                      path unchanged (HR-LG-001 preserved by
+                      the existing queue architecture — the
+                      new handler runs in the QueueListener
+                      background thread, not on the trading
+                      hot path). File permissions hard-pinned
+                      to 0o644 via os.open O_CREAT mode
+                      argument. fsync after each write for
+                      compliance-grade durability against
+                      VPS power loss / kernel panic. Write
+                      failure path emits structured
+                      TRADE_RECORD_WRITE_FAILED (HIGH) event
+                      back through the Logger queue (lands
+                      in tothbot.log via file_handler,
+                      triggers operator email via
+                      alert_handler) plus stderr as ultimate
+                      fallback. Never raises. Never blocks
+                      tothbot.log write (QueueListener
+                      dispatches each handler independently;
+                      handler exceptions are isolated by
+                      logging.Handler.handleError). Records
+                      directory created at startup via
+                      os.makedirs(TRADES_RECORD_DIR,
+                      exist_ok=True). Governed by 1011007
+                      dv1_4 Section 11 and 0511006 dv1_1.
+
+                      OI-022 DEFECT-OBSERVABILITY-ALERT-SENT-001
+                      fix (AI-2). _alert_operator_direct now
+                      emits a structured ALERT_SENT (INFO)
+                      event on SMTP success and a structured
+                      ALERT_SMTP_FAILED (HIGH) event on SMTP
+                      failure, via the standard Logger path
+                      (lands in tothbot.log). Prior behavior
+                      emitted nothing on success and stderr
+                      only on failure. Signature extended
+                      with keyword-only parameters subject,
+                      triggering_event, and emit_structured
+                      (defaults preserve callable shape).
+                      emit_structured=False used from the
+                      queue-full path to avoid recursive
+                      enqueue when the queue is already full.
+                      TothBotAlertHandler.emit skips
+                      event=="ALERT_SMTP_FAILED" to break
+                      the potential alert-failure feedback
+                      loop (persistent SMTP outage would
+                      otherwise self-trigger indefinitely).
+                      Governed by 1011007 dv1_4 Section 6.9
+                      and Section 8 LG-ALERT-005.
 
   dv1_3   04-20-2026  OI-019 DEFECT-ALERT-ROUTING-001 fix. ALERT_EMAIL
                       changed from singular "alert@tothbot.com" to
@@ -34,6 +97,17 @@ The Logger is the sole data interface between TothBot and CIATS.
 It NEVER blocks the trading hot path under any condition.
 All callers fire-and-forget via QueueHandler.put_nowait().
 CIATS reads log files directly — Logger does not push to CIATS.
+
+Two output streams on disk (two-stream record architecture per
+0511006 dv1_1):
+  (1) /home/tothbot/logs/tothbot.log
+        RotatingFileHandler, 50 MB / 90 files, NDJSON.
+        Diagnostic stream. ALL events land here. CIATS reads.
+  (2) /home/tothbot/records/trades_<YYYY>.jsonl
+        TothBotTradeRecordHandler, append-only, no rotation,
+        one JSON per line, permanent. TRADE_CLOSE events only.
+        Authoritative permanent trade record (tax / CIATS
+        200-trade floor / audit trail).
 
 Hard Rules (HR-LG-001 through HR-LG-011):
   HR-LG-001: NEVER block hot path under any condition.
@@ -72,6 +146,11 @@ import orjson
 LOG_DIR: str = "/home/tothbot/logs"
 LOG_FILE: str = "/home/tothbot/logs/tothbot.log"
 
+# OI-023 / AI-1: Permanent trade record directory.
+# Annual-segmented JSONL files written here. No rotation.
+# See 1011007 dv1_4 Section 11 and 0511006 dv1_1.
+TRADES_RECORD_DIR: str = "/home/tothbot/records"
+
 # LG-QUEUE-002: 20 positions x 10 events/candle x 50-candle buffer
 LOG_QUEUE_MAXSIZE: int = 10_000
 
@@ -95,6 +174,11 @@ LOG_COMPONENTS: frozenset[str] = frozenset({
     "WS_MGR", "SIGNAL_PIPELINE", "EXEC_ENG",
     "EXIT_CTRL", "POS_MIRROR", "REGIME_ENG", "LOGGER", "CIATS",
 })
+
+# OI-023 / AI-1: hard-pinned permanent trade record file mode.
+# VD-KEY / Deming 6.1 — explicit permission contract in source,
+# independent of runtime umask.
+TRADES_RECORD_FILE_MODE: int = 0o644
 
 
 # =============================================================
@@ -136,13 +220,25 @@ def log_record(event_dict: dict[str, Any]) -> str:
 
 
 # =============================================================
-# ALERT — LG-ALERT-004
+# ALERT — LG-ALERT-004 / LG-ALERT-005
 # Bypasses Logger queue entirely — no circularity risk.
 # Used for: CRITICAL/HIGH events, queue-full conditions.
 # Credentials from environment variables — never hardcoded.
+#
+# dv1_4 (AI-2, OI-022): On SMTP success emits ALERT_SENT (INFO)
+# via the standard Logger path. On SMTP failure emits
+# ALERT_SMTP_FAILED (HIGH) via the standard Logger path PLUS
+# stderr. Prior behavior: no event on success; stderr only on
+# failure.
 # =============================================================
 
-def _alert_operator_direct(message: str) -> None:
+def _alert_operator_direct(
+    message: str,
+    *,
+    subject: str | None = None,
+    triggering_event: str = "",
+    emit_structured: bool = True,
+) -> None:
     """
     Send alert email directly via SMTP, bypassing the Logger queue.
 
@@ -153,15 +249,37 @@ def _alert_operator_direct(message: str) -> None:
         TOTHBOT_SMTP_PASS  SMTP password
 
     Timeout: 5 seconds (fire-and-forget).
-    On SMTP failure: write to stderr only. Never raises.
+    On SMTP failure: write to stderr AND (if emit_structured)
+    emit an ALERT_SMTP_FAILED (HIGH) event via the Logger queue.
+    Never raises.
+
+    Parameters:
+        message:          Human-readable alert message body.
+        subject:          Optional explicit subject line. If None,
+                          derived from the first 80 chars of message.
+        triggering_event: Event code that caused the alert (e.g.,
+                          "PING_TIMEOUT", "LOG_QUEUE_FULL"). Included
+                          in the ALERT_SENT / ALERT_SMTP_FAILED payload.
+        emit_structured:  If True (default), emit ALERT_SENT or
+                          ALERT_SMTP_FAILED via the Logger queue.
+                          Set False when calling from contexts where
+                          the Logger queue is known unreliable (e.g.,
+                          the queue-full handler itself).
     """
     smtp_host = os.environ.get("TOTHBOT_SMTP_HOST", "")
     smtp_port = int(os.environ.get("TOTHBOT_SMTP_PORT", "587"))
     smtp_user = os.environ.get("TOTHBOT_SMTP_USER", "")
     smtp_pass = os.environ.get("TOTHBOT_SMTP_PASS", "")
 
+    effective_subject: str = (
+        subject if subject is not None
+        else f"[TothBot ALERT] {message[:80]}"
+    )
+
     if not smtp_host or not smtp_user:
-        # SMTP not configured — stderr fallback only
+        # SMTP not configured — stderr fallback only.
+        # Do NOT emit ALERT_SMTP_FAILED: SMTP not being configured
+        # is an environmental condition, not an operational failure.
         print(
             f"[TOTHBOT ALERT — NO SMTP CONFIG]: {message}",
             file=sys.stderr,
@@ -171,7 +289,7 @@ def _alert_operator_direct(message: str) -> None:
 
     try:
         msg = MIMEText(message)
-        msg["Subject"] = f"[TothBot ALERT] {message[:80]}"
+        msg["Subject"] = effective_subject
         msg["From"] = smtp_user
         msg["To"] = ALERT_EMAIL
 
@@ -182,13 +300,44 @@ def _alert_operator_direct(message: str) -> None:
             server.login(smtp_user, smtp_pass)
             server.sendmail(smtp_user, [ALERT_EMAIL], msg.as_string())
 
+        # OI-022 / AI-2: structured success event via Logger path.
+        if emit_structured:
+            try:
+                logging.getLogger("tothbot").info(log_record({
+                    "event":             "ALERT_SENT",
+                    "level":             "INFO",
+                    "component":         "LOGGER",
+                    "to":                ALERT_EMAIL,
+                    "subject":           effective_subject,
+                    "triggering_event":  triggering_event,
+                }))
+            except Exception:  # noqa: broad — alert path must not raise
+                pass
+
     except Exception as exc:  # noqa: broad — SMTP is fire-and-forget
-        # Cannot log via Logger (circularity). Stderr only.
+        # Cannot log via Logger as primary channel (circularity on
+        # persistent SMTP outage). Stderr is the primary failure sink.
         print(
             f"[TOTHBOT ALERT — SMTP FAILED ({exc})]: {message}",
             file=sys.stderr,
             flush=True,
         )
+        # OI-022 / AI-2: structured failure event via Logger path.
+        # TothBotAlertHandler.emit skips event=="ALERT_SMTP_FAILED"
+        # to prevent recursive alerting on persistent SMTP failure.
+        if emit_structured:
+            try:
+                logging.getLogger("tothbot").info(log_record({
+                    "event":             "ALERT_SMTP_FAILED",
+                    "level":             "HIGH",
+                    "component":         "LOGGER",
+                    "to":                ALERT_EMAIL,
+                    "subject":           effective_subject,
+                    "triggering_event":  triggering_event,
+                    "error":             str(exc),
+                }))
+            except Exception:  # noqa: broad — ultimate fallback is stderr
+                pass
 
 
 # =============================================================
@@ -216,10 +365,15 @@ class TothBotQueueHandler(logging.handlers.QueueHandler):
                 file=sys.stderr,
                 flush=True,
             )
-            # Direct alert bypasses the Logger queue (LG-ALERT-004)
+            # Direct alert bypasses the Logger queue (LG-ALERT-004).
+            # emit_structured=False: queue is full, structured emit
+            # would re-enter the same put_nowait path and fail again.
             _alert_operator_direct(
                 "CRITICAL: Logger queue full. Log records are being dropped. "
-                "Investigate immediately. TothBot may be data-blind."
+                "Investigate immediately. TothBot may be data-blind.",
+                subject="[TothBot ALERT] LOG_QUEUE_FULL",
+                triggering_event="LOG_QUEUE_FULL",
+                emit_structured=False,
             )
 
 
@@ -240,6 +394,9 @@ class TothBotAlertHandler(logging.Handler):
     "level" field, because all TothBot log records are JSON strings
     passed to logger.info()/logger.debug()/etc. The Python logging
     level does not carry our semantic HIGH/CRITICAL distinction.
+
+    dv1_4 (AI-2): events with event=="ALERT_SMTP_FAILED" are skipped
+    so that a persistent SMTP outage cannot self-trigger recursively.
     """
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -247,17 +404,133 @@ class TothBotAlertHandler(logging.Handler):
             message_str = record.getMessage()
             parsed: dict[str, Any] = orjson.loads(message_str)
             level_field: str = parsed.get("level", "")
+            event_field: str = parsed.get("event", "UNKNOWN_EVENT")
 
-            if level_field in ALERT_LEVELS:
-                event = parsed.get("event", "UNKNOWN_EVENT")
-                component = parsed.get("component", "UNKNOWN")
-                _alert_operator_direct(
-                    f"[{level_field}] {event} | {component} | "
-                    f"{message_str[:500]}"
-                )
+            if level_field not in ALERT_LEVELS:
+                return
+
+            # Anti-recursion guard — ALERT_SMTP_FAILED exists precisely
+            # because alerting itself has broken; do not attempt to
+            # alert on the alert-failure record.
+            if event_field == "ALERT_SMTP_FAILED":
+                return
+
+            component = parsed.get("component", "UNKNOWN")
+            subject = f"[{level_field}] {event_field} | {component}"
+            _alert_operator_direct(
+                f"[{level_field}] {event_field} | {component} | "
+                f"{message_str[:500]}",
+                subject=subject,
+                triggering_event=event_field,
+                emit_structured=True,
+            )
         except Exception as exc:  # noqa: broad — alert handler must not crash
             print(
                 f"[TothBotAlertHandler.emit ERROR ({exc})]: "
+                f"{record.getMessage()[:200]}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
+# =============================================================
+# TothBotTradeRecordHandler — Background Thread (in QueueListener)
+# OI-023 / AI-1 — LG-TREC-001 through LG-TREC-005 (1011007 dv1_4 S11)
+# NOT on the hot path. Runs in QueueListener's background thread.
+# =============================================================
+
+class TothBotTradeRecordHandler(logging.Handler):
+    """
+    Append TRADE_CLOSE records to /home/tothbot/records/trades_<YYYY>.jsonl.
+
+    Attached to QueueListener alongside file_handler and alert_handler.
+    Runs in the QueueListener background thread — NEVER on the hot
+    path. HR-LG-001 is preserved by the existing queue architecture:
+    the hot path does put_nowait() only; this handler executes after
+    the record has been dequeued by the QueueListener thread.
+
+    Contract:
+      (a) Filter: event == "TRADE_CLOSE" only. All other events skipped.
+      (b) Target: /home/tothbot/records/trades_<YYYY>.jsonl where
+          <YYYY> is the current UTC calendar year at time of write
+          (per 1011007 dv1_4 LG-TREC-002 and TB00107 Section 3.6).
+      (c) Format: JSONL — append the exact pre-serialized NDJSON line
+          already formed by log_record(), plus "\\n". Identical to
+          tothbot.log payload (TB00107 §3.6 FP/DP lock).
+      (d) Permanence: mode "a" only, no rotation, no size cap.
+          File created on first TRADE_CLOSE of the year with
+          permissions 0o644 (hard-pinned via os.open, independent
+          of runtime umask).
+      (e) Durability: os.fsync after each write. Compliance-grade
+          records must survive VPS power loss / kernel panic.
+          fsync cost is negligible because TRADE_CLOSE frequency
+          is low (few per day in paper-trade throughput) and
+          fsync executes in the QueueListener thread, not the
+          hot path.
+      (f) Independence: Exceptions here are isolated by
+          logging.Handler.handleError and do not prevent
+          file_handler (tothbot.log) from writing the same record.
+          tothbot.log remains an operational fallback if this
+          file write fails.
+      (g) Failure reporting: On write failure, emit a structured
+          TRADE_RECORD_WRITE_FAILED (HIGH) event via the standard
+          Logger path. That event lands in tothbot.log
+          (diagnostic forensics) AND triggers operator email
+          (via alert_handler), per LG-ALERT-002. Stderr used as
+          ultimate fallback. Never raises.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        path: str = ""
+        try:
+            message_str = record.getMessage()
+            parsed: dict[str, Any] = orjson.loads(message_str)
+
+            # LG-TREC-001 — filter: TRADE_CLOSE only.
+            if parsed.get("event") != "TRADE_CLOSE":
+                return
+
+            # LG-TREC-002 — annual segmentation at time of write
+            # (TB00107 §3.6 FP/DP lock: "current UTC calendar year
+            # at time of write").
+            year = datetime.now(timezone.utc).strftime("%Y")
+            path = f"{TRADES_RECORD_DIR}/trades_{year}.jsonl"
+
+            # LG-TREC-003 — hard-pinned 0o644 permissions on create,
+            # independent of runtime umask (Deming 6.1).
+            fd = os.open(
+                path,
+                os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+                TRADES_RECORD_FILE_MODE,
+            )
+            try:
+                # LG-TREC-004 — single write of JSONL line + newline.
+                # Python single write() is atomic for sizes < PIPE_BUF
+                # (4096). TRADE_CLOSE records are ~500-800 bytes.
+                # Single writer (QueueListener thread) — no lock needed.
+                os.write(fd, (message_str + "\n").encode("utf-8"))
+                # LG-TREC-005 — fsync for compliance-grade durability
+                # against VPS power loss / kernel panic (TB00108
+                # decision locked by Bill).
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
+        except Exception as exc:  # noqa: broad — handler must not raise
+            # OI-023 failure contract: emit structured HIGH event and
+            # also write to stderr. Do not block tothbot.log write.
+            try:
+                logging.getLogger("tothbot").info(log_record({
+                    "event":     "TRADE_RECORD_WRITE_FAILED",
+                    "level":     "HIGH",
+                    "component": "LOGGER",
+                    "path":      path,
+                    "error":     str(exc),
+                }))
+            except Exception:
+                pass
+            print(
+                f"[TRADE_RECORD_WRITE_FAILED ({exc}) path={path}]: "
                 f"{record.getMessage()[:200]}",
                 file=sys.stderr,
                 flush=True,
@@ -283,7 +556,10 @@ async def monitor_log_queue(log_queue: "queue.Queue[Any]") -> None:
         if fill_pct >= LOG_QUEUE_WARN_PCT:
             _alert_operator_direct(
                 f"Logger queue at {fill_pct:.0%} ({qsize}/{LOG_QUEUE_MAXSIZE}). "
-                f"Risk of overflow. Investigate log write throughput."
+                f"Risk of overflow. Investigate log write throughput.",
+                subject="[TothBot ALERT] LOG_QUEUE_WARN",
+                triggering_event="LOG_QUEUE_WARN",
+                emit_structured=True,
             )
 
 
@@ -316,7 +592,7 @@ def initialize_logger() -> tuple[
         3. file_handler.close()    <- caller must retain reference
         4. Shutdown asyncio event loop
 
-    Architecture:
+    Architecture (two-stream record — 0511006 dv1_1):
         Hot path:    Module -> logger.info(log_record(d))
                               -> TothBotQueueHandler.enqueue()
                               -> queue.put_nowait()  [returns immediately]
@@ -324,9 +600,17 @@ def initialize_logger() -> tuple[
         Background:  QueueListener thread:
                          -> RotatingFileHandler -> tothbot.log (NDJSON)
                          -> TothBotAlertHandler -> SMTP on HIGH/CRITICAL
+                         -> TothBotTradeRecordHandler ->
+                            trades_<YYYY>.jsonl (TRADE_CLOSE only,
+                            append-only, fsync, permanent)
     """
     # LG-FILE-001: Create log directory at startup
     os.makedirs(LOG_DIR, exist_ok=True)
+
+    # OI-023 / AI-1 / LG-TREC-001: Create permanent trade records
+    # directory at startup. exist_ok=True so subsequent restarts
+    # are idempotent.
+    os.makedirs(TRADES_RECORD_DIR, exist_ok=True)
 
     # LG-QUEUE-001: queue.Queue (stdlib) NOT asyncio.Queue
     # HR-LG-002: stdlib queue required — QueueListener is non-asyncio thread
@@ -347,13 +631,20 @@ def initialize_logger() -> tuple[
     # LG-ALERT-001/002: Alert handler — background thread, not hot path
     alert_handler = TothBotAlertHandler()
 
-    # LG-QUEUE-004: QueueListener — background thread
-    # Reads from log_queue, dispatches to file_handler + alert_handler.
+    # OI-023 / AI-1: Permanent trade record handler — background thread,
+    # not hot path. Filters for event=="TRADE_CLOSE" only.
+    trade_record_handler = TothBotTradeRecordHandler()
+
+    # LG-QUEUE-004: QueueListener — background thread.
+    # Dispatches each record to ALL handlers. logging.Handler.handleError
+    # isolates per-handler exceptions, so a failing trade_record_handler
+    # cannot prevent file_handler from writing to tothbot.log.
     # respect_handler_level=True: honours per-handler level filters.
     log_listener = logging.handlers.QueueListener(
         log_queue,
         file_handler,
         alert_handler,
+        trade_record_handler,
         respect_handler_level=True,
     )
     log_listener.start()
@@ -393,6 +684,22 @@ def initialize_logger() -> tuple[
 #       "symbol":    "BTC/USD",
 #       "close":     Decimal("65432.1"),
 #       "atr_14":    Decimal("312.5"),
+#   }))
+#
+# --- Logging a TRADE_CLOSE (Exit Controller) ---
+#
+#   Exact shape per 1011007 dv1_4 Section 7 (mandatory fields).
+#   The record lands in BOTH tothbot.log (diagnostic, rotating)
+#   AND /home/tothbot/records/trades_<YYYY>.jsonl (permanent).
+#
+#   logger.info(log_record({
+#       "event":              "TRADE_CLOSE",
+#       "level":              "INFO",
+#       "component":          "EXIT_CTRL",
+#       "symbol":             "BTC/USD",
+#       "entry_fill_price":   Decimal("42350.1"),
+#       "exit_price":         Decimal("42720.5"),
+#       # ... remaining mandatory fields per 1011007 S7 ...
 #   }))
 #
 # --- Shutdown (in exit_controller / startup_sequence.py) ---
