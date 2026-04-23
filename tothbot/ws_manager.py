@@ -1,15 +1,52 @@
 """
 DocDCN:     1011002
 DocTitle:   WS_Manager
-DocVersion: dv1_21
+DocVersion: dv1_22
 DocOwner:   Bill
 DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/ws_manager.py
-DocDate:    04-20-2026
-DocTime:    23:00:00 UTC
+DocDate:    04-23-2026
+DocTime:    04:30:00 UTC
 
 ============================================================
 REVISION HISTORY
 ============================================================
+
+  dv1_22  04-23-2026  OI-028 FIX-WM-RECONNECT-019.
+                      _execute_reconnect_sequence now honors
+                      self.paper_mode with an early-return
+                      branch, restoring parity with
+                      _startup_connect_and_subscribe (FIX-WM-
+                      PT-001, dv1_14). Prior behavior: reconnect
+                      called _rest_get_ws_token() + connected
+                      private WS + subscribed private channels
+                      unconditionally on every reconnect, even
+                      in paper mode. In paper mode the Kraken
+                      private API key is not exercised elsewhere,
+                      and the key on the VPS is being rejected
+                      with EAPI:Invalid key (tracked separately
+                      as OI-041) — so every reconnect Step 1
+                      raised, consumed an attempt, and after 20
+                      consecutive identical failures the loop
+                      exhausted and emitted FATAL_RECONNECT_
+                      FAILURE → WS_MGR_FATAL → systemd restart.
+                      TB00117 VPS forensic sweep confirmed:
+                      240 RECONNECT_ATTEMPT_FAILED / 15 FATAL_
+                      RECONNECT_FAILURE / 0 RECONNECT_COMPLETE
+                      across the rolling log; all 20 sampled
+                      errors identical: GetWebSocketsToken
+                      error: ['EAPI:Invalid key']. Fix: in
+                      paper mode, _execute_reconnect_sequence
+                      performs only Step 2a (public WS
+                      connect), Step 3a (public subscribe),
+                      Step 8 (ticker resume), and Step 10
+                      (gap-conditional indicator re-seed) —
+                      identical scope to the paper-mode branch
+                      of _startup_connect_and_subscribe. Steps
+                      1, 2b, 3b, 4, 5, 6, 7 skipped (private-
+                      side only). Live mode unchanged. Closes
+                      OI-018 / OI-020 / OI-028 on 48-hour
+                      observation. Governed by 1011002 dv1_21
+                      WM-RECONNECT-019.
 
   dv1_21  04-20-2026  OI-020 DEFECT-KRAKEN-TRANSIENT-API-001 fix:
                       extend Kraken WS reconnect retry window.
@@ -3485,7 +3522,46 @@ class WSManager:
         """
         Mid-session reconnect steps 1-10 (WM-RECONNECT-001 through -015).
         Separate from startup — no startup code reused (HR-WM-016).
+
+        Paper mode: skip all private-side steps (REST token, private WS
+        connect, private subscribe, REST open-orders snapshot, pending-
+        order reconcile, private-sequence-counter resets). Retains
+        Step 2a (public connect), Step 3a (public subscribe), Step 8
+        (ticker resume), and Step 10 (gap-conditional indicator re-seed).
+        FIX-WM-RECONNECT-019 / OI-028: restores parity with
+        _startup_connect_and_subscribe paper-mode early-return
+        (FIX-WM-PT-001, dv1_14).
         """
+        if self.paper_mode:
+            # Step 2a: Public WS only (WM-RECONNECT-004, public-side)
+            self._ws_public = await self._ws_connect(PUBLIC_WS_URI)
+
+            # Step 3a: Subscribe public channels only (WM-RECONNECT-005,
+            # public-side)
+            await self._subscribe_public()
+
+            # Step 8: Resume ticker subscriptions (WM-RECONNECT-010)
+            for symbol in self.monitored_universe:
+                has_position = symbol in self.position_mirror
+                trigger = "bbo" if has_position else "trades"
+                await self._subscribe_ticker_pair(symbol, trigger)
+
+            # Step 10: Re-seed indicators if gap > 15 minutes
+            # (WM-RECONNECT-014)
+            gap_sec = time.monotonic() - (
+                self._disconnect_time or time.monotonic()
+            )
+            if gap_sec > RECONNECT_STALE_CACHE_SEC:
+                for symbol in self.monitored_universe:
+                    await self.seed_indicators_from_rest(symbol)
+
+            # HR-WM-013: portfolio_baseline_USD NEVER reset on reconnect
+            # HR-WM-011: system_state PRESERVED
+            # WM-SC-003: exit_cooldown_log and consecutive_loss_count
+            # PRESERVED
+            return
+
+        # Live mode: full steps 1-10.
         # Step 1: Acquire new WS token (WM-RECONNECT-003)
         self._ws_token = await self._rest_get_ws_token()
 

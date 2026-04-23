@@ -1,15 +1,60 @@
 """
 DocDCN:     1011007
 DocTitle:   Logger
-DocVersion: dv1_4
+DocVersion: dv1_5
 DocOwner:   Bill
 DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/logger.py
-DocDate:    04-21-2026
-DocTime:    23:59:00 UTC
+DocDate:    04-23-2026
+DocTime:    04:30:00 UTC
 
 ============================================================
 REVISION HISTORY
 ============================================================
+
+  dv1_5   04-23-2026  OI-029 DEFECT-ALERT-SMTP-TIMEOUT-001 fix.
+                      _alert_operator_direct SMTP conversation
+                      now wrapped in a bounded retry loop to
+                      absorb transient Proton SMTP read-timeouts
+                      observed in the TB00105 / TB00111 / TB00117
+                      windows. Three related changes:
+
+                      (1) ALERT_SMTP_TIMEOUT_SEC raised from 5
+                      to 20 seconds. The 5s ceiling applied to
+                      each of four sequential network round-
+                      trips (connect, starttls, login, sendmail);
+                      any single stage blocking beyond 5s
+                      produced "The read operation timed out"
+                      and lost the alert. 20s absorbs realistic
+                      transient server-load / slow-TLS-handshake
+                      without blocking excessively.
+
+                      (2) New constants ALERT_SMTP_MAX_ATTEMPTS
+                      (2) and ALERT_SMTP_RETRY_BACKOFF_SEC (1).
+                      SMTP conversation runs in a for-attempt
+                      loop; on exception, sleeps
+                      ALERT_SMTP_RETRY_BACKOFF_SEC and retries.
+                      ALERT_SMTP_FAILED emits only if every
+                      attempt fails — preserving the existing
+                      event surface and the anti-recursion
+                      semantics downstream
+                      (TothBotAlertHandler.emit still skips
+                      event=="ALERT_SMTP_FAILED").
+
+                      (3) Worst-case wall time bounded at
+                      20 + 1 + 20 = 41s. This function runs
+                      off the trading hot path (HR-LG-001
+                      preserved via QueueHandler; this path is
+                      QueueListener background only) so the
+                      raised ceiling has no impact on signal
+                      evaluation or execution latency.
+
+                      Added `import time` for the blocking
+                      sleep between attempts (synchronous is
+                      correct here — we are already in the
+                      QueueListener thread, not the asyncio
+                      event loop; asyncio.sleep would be a
+                      category error). Governed by 1011007
+                      dv1_5 Section 6.9 and Section 11.
 
   dv1_4   04-21-2026  TB00108 bundled: OI-023 (CRITICAL) +
                       OI-022 (LOW).
@@ -132,6 +177,7 @@ import os
 import queue
 import smtplib
 import sys
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from email.mime.text import MIMEText
@@ -163,7 +209,12 @@ LOG_ROTATE_COUNT: int = 90
 
 # Alert routing — LG-ALERT-001/002 (OI-019: plural — Proton mailbox)
 ALERT_EMAIL: str = "alerts@tothbot.com"
-ALERT_SMTP_TIMEOUT_SEC: int = 5     # fire-and-forget
+ALERT_SMTP_TIMEOUT_SEC: int = 20          # OI-029: raised 5 → 20 to
+                                          # absorb transient Proton
+                                          # SMTP read-timeouts
+ALERT_SMTP_MAX_ATTEMPTS: int = 2          # OI-029: bounded retry loop
+ALERT_SMTP_RETRY_BACKOFF_SEC: int = 1     # OI-029: sleep between
+                                          # attempts on exception
 ALERT_LEVELS: frozenset[str] = frozenset({"HIGH", "CRITICAL"})
 
 # Valid log level values (LG-FMT-002)
@@ -293,12 +344,42 @@ def _alert_operator_direct(
         msg["From"] = smtp_user
         msg["To"] = ALERT_EMAIL
 
-        with smtplib.SMTP(
-            smtp_host, smtp_port, timeout=ALERT_SMTP_TIMEOUT_SEC
-        ) as server:
-            server.starttls()
-            server.login(smtp_user, smtp_pass)
-            server.sendmail(smtp_user, [ALERT_EMAIL], msg.as_string())
+        # OI-029: bounded retry loop. ALERT_SMTP_MAX_ATTEMPTS=2,
+        # ALERT_SMTP_RETRY_BACKOFF_SEC=1. Worst-case wall time
+        # 20 + 1 + 20 = 41s — off the hot path, acceptable.
+        last_exc: Exception | None = None
+        sent: bool = False
+        for attempt in range(1, ALERT_SMTP_MAX_ATTEMPTS + 1):
+            try:
+                with smtplib.SMTP(
+                    smtp_host, smtp_port,
+                    timeout=ALERT_SMTP_TIMEOUT_SEC,
+                ) as server:
+                    server.starttls()
+                    server.login(smtp_user, smtp_pass)
+                    server.sendmail(
+                        smtp_user, [ALERT_EMAIL], msg.as_string()
+                    )
+                sent = True
+                break
+            except Exception as attempt_exc:  # noqa: broad
+                last_exc = attempt_exc
+                if attempt < ALERT_SMTP_MAX_ATTEMPTS:
+                    # Synchronous sleep is correct here — this
+                    # function runs on the QueueListener background
+                    # thread, NOT the asyncio event loop.
+                    time.sleep(ALERT_SMTP_RETRY_BACKOFF_SEC)
+
+        if not sent:
+            # All attempts failed — re-raise to the outer handler
+            # below, which writes stderr and emits
+            # ALERT_SMTP_FAILED. Preserves the existing event
+            # surface: one event per alert, not one per attempt.
+            if last_exc is not None:
+                raise last_exc
+            raise RuntimeError(
+                "SMTP retry loop exited without success or exception"
+            )
 
         # OI-022 / AI-2: structured success event via Logger path.
         if emit_structured:
