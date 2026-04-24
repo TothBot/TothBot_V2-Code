@@ -1,15 +1,89 @@
 """
 DocDCN:     1011002
 DocTitle:   WS_Manager
-DocVersion: dv1_22
+DocVersion: dv1_23
 DocOwner:   Bill
 DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/ws_manager.py
-DocDate:    04-23-2026
-DocTime:    04:30:00 UTC
+DocDate:    04-24-2026
+DocTime:    02:00:00 UTC
 
 ============================================================
 REVISION HISTORY
 ============================================================
+
+  dv1_23  04-24-2026  OI-041 DEFECT-WM-REST-SIGN-001 fix.
+                      Three private REST call sites in
+                      ws_manager.py were shipping only the
+                      API-Key header and the nonce; no
+                      API-Sign HMAC-SHA512 signature was
+                      attached. Per 0411002 dv1_1
+                      REST-AUTH-001 / REST-AUTH-003 every
+                      private Kraken REST call MUST carry
+                      both API-Key and API-Sign headers.
+                      The three unsigned sites were:
+                        (a) _rest_get_ws_token
+                            endpoint: /0/private/GetWebSocketsToken
+                            prior dv1_22 line range: 639-666.
+                            trade_secret was retrieved but
+                            orphaned - no code path used it.
+                        (b) _rest_get_open_orders
+                            endpoint: /0/private/OpenOrders
+                            prior dv1_22 line range: 693-703.
+                            trade_secret not retrieved at all.
+                        (c) _rest_get_account_balance
+                            endpoint: /0/private/Balance
+                            prior dv1_22 line range: 705-715.
+                            trade_secret not retrieved at all.
+                      Kraken correctly rejected every such
+                      request with EAPI:Invalid key. In paper
+                      mode (PAPER_TRADING_MODE=true) impact
+                      was zero because dv1_22 added paper-
+                      mode skip branches ahead of these call
+                      sites. At live-mode transition every
+                      entry, balance check, and order query
+                      would have failed.
+                      Fix: new private helper
+                      _sign_rest_request(url_path, data,
+                      api_secret) computes the mandated
+                      HMAC-SHA512 signature per
+                      REST-AUTH-001:
+                        message   = URI_path +
+                                    SHA256(nonce +
+                                           POST_data_string)
+                        signature = HMAC-SHA512(
+                                      message,
+                                      base64_decode(secret))
+                        API-Sign  = base64_encode(signature)
+                      Returns the exact urlencoded POST-data
+                      string it signed so that the body
+                      transmitted to Kraken is byte-identical
+                      to the body that was signed (any drift
+                      between signed and transmitted body is
+                      an EAPI:Invalid key).
+                      All three call sites rewritten to:
+                        (1) retrieve both trade_key AND
+                            trade_secret from config,
+                        (2) build the POST data dict
+                            including nonce,
+                        (3) call _sign_rest_request to get
+                            (post_data_string, signature_b64),
+                        (4) POST with headers {API-Key,
+                            API-Sign, Content-Type} and
+                            body = post_data_string.
+                      Imports added: base64, hashlib, hmac,
+                      and urllib.parse.urlencode. No other
+                      behavior changed. Paper-mode skip
+                      branches in _startup_connect_and_
+                      subscribe (FIX-WM-PT-001) and
+                      _execute_reconnect_sequence
+                      (FIX-WM-RECONNECT-019) are untouched
+                      and continue to gate all three call
+                      sites to zero in paper mode.
+                      Governed by 1011002 dv1_22
+                      WM-REST-SIGN-001 / WM-REST-SIGN-002 /
+                      WM-REST-SIGN-003.
+                      Closes OI-041 on 48-hour observation
+                      window following deploy.
 
   dv1_22  04-23-2026  OI-028 FIX-WM-RECONNECT-019.
                       _execute_reconnect_sequence now honors
@@ -264,12 +338,16 @@ Hard Rules (consolidated — Section 17 of spec):
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from typing import Any, Callable
+from urllib.parse import urlencode
 
 import aiohttp
 import orjson
@@ -636,28 +714,106 @@ class WSManager:
     # REST CALLS
     # =================================================================
 
+    def _sign_rest_request(
+        self,
+        url_path: str,
+        data: dict,
+        api_secret: str,
+    ) -> tuple[str, str]:
+        """
+        Compute Kraken REST private-call HMAC-SHA512 signature.
+
+        Per 0411002 Kraken_REST_API_Specification dv1_1
+        REST-AUTH-001 and 1011002 WM-REST-SIGN-001 /
+        WM-REST-SIGN-002 / WM-REST-SIGN-003:
+
+            message   = URI_path +
+                        SHA256(nonce + POST_data_string)
+            signature = HMAC-SHA512(
+                          message,
+                          base64_decode(api_secret),
+                        )
+            API-Sign  = base64_encode(signature)
+
+        The returned `post_data_string` MUST be used
+        verbatim as the POST request body so the body
+        Kraken receives is byte-identical to the body the
+        signature was computed over. Any drift between the
+        signed data and the transmitted data produces
+        EAPI:Invalid key.
+
+        Args:
+            url_path:    REST URI path, e.g.
+                         "/0/private/GetWebSocketsToken".
+                         Must include leading slash and
+                         match the path segment of the
+                         final URL.
+            data:        POST data dict. Must contain
+                         "nonce" (millisecond epoch string).
+                         May contain other fields per the
+                         called endpoint's contract.
+            api_secret:  Base64-encoded Kraken API secret
+                         string from config.
+
+        Returns:
+            (post_data_string, signature_b64). The first
+            element is the urlencoded body that was signed
+            and MUST be used as the POST body. The second
+            element is the base64-encoded HMAC-SHA512
+            signature for the API-Sign header.
+
+        Raises:
+            KeyError: if `data` does not contain "nonce".
+            binascii.Error: if `api_secret` is not valid
+                base64.
+        """
+        nonce = data["nonce"]
+        post_data_string = urlencode(data)
+        encoded = (str(nonce) + post_data_string).encode("utf-8")
+        sha256_hash = hashlib.sha256(encoded).digest()
+        message = url_path.encode("utf-8") + sha256_hash
+        signature = hmac.new(
+            base64.b64decode(api_secret),
+            message,
+            hashlib.sha512,
+        )
+        signature_b64 = base64.b64encode(signature.digest()).decode("utf-8")
+        return post_data_string, signature_b64
+
     async def _rest_get_ws_token(self) -> str:
         """
         Acquire WS auth token via REST (WM-TOKEN-001/002).
         Uses TRADE API key. Valid 900 seconds.
         Called at startup AND on every reconnect.
+
+        Signed per WM-REST-SIGN-001 / WM-REST-SIGN-002 /
+        WM-REST-SIGN-003 using _sign_rest_request().
         """
         trade_key = self._config["kraken_trade_api_key"]
         trade_secret = self._config["kraken_trade_api_secret"]
+        url_path = "/0/private/GetWebSocketsToken"
+        data = {"nonce": str(int(time.time() * 1000))}
+        post_data, signature = self._sign_rest_request(
+            url_path, data, trade_secret,
+        )
 
         async with self._make_http_session() as session:
             # Kraken REST GetWebSocketsToken (signed request)
             resp = await session.post(
-                f"{REST_BASE_URL}/0/private/GetWebSocketsToken",
-                headers={"API-Key": trade_key},
-                data={"nonce": str(int(time.time() * 1000))},
+                f"{REST_BASE_URL}{url_path}",
+                headers={
+                    "API-Key": trade_key,
+                    "API-Sign": signature,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                data=post_data,
             )
-            data = orjson.loads(await resp.read())
-            if data.get("error"):
+            data_resp = orjson.loads(await resp.read())
+            if data_resp.get("error"):
                 raise RuntimeError(
-                    f"GetWebSocketsToken error: {data['error']}"
+                    f"GetWebSocketsToken error: {data_resp['error']}"
                 )
-            token = data["result"]["token"]
+            token = data_resp["result"]["token"]
         self._logger.info(log_record({
             "event": "WS_TOKEN_ACQUIRED",
             "level": "INFO",
@@ -691,28 +847,58 @@ class WSManager:
         return candles[:-1]  # HR-WM-013: ALWAYS exclude response[-1]
 
     async def _rest_get_open_orders(self) -> dict:
-        """REST GetOpenOrders — executions gap fallback (AR-035)."""
+        """
+        REST GetOpenOrders - executions gap fallback (AR-035).
+
+        Signed per WM-REST-SIGN-001 / WM-REST-SIGN-002 /
+        WM-REST-SIGN-003 using _sign_rest_request().
+        """
         trade_key = self._config["kraken_trade_api_key"]
+        trade_secret = self._config["kraken_trade_api_secret"]
+        url_path = "/0/private/OpenOrders"
+        data = {"nonce": str(int(time.time() * 1000))}
+        post_data, signature = self._sign_rest_request(
+            url_path, data, trade_secret,
+        )
         async with self._make_http_session() as session:
             resp = await session.post(
-                f"{REST_BASE_URL}/0/private/OpenOrders",
-                headers={"API-Key": trade_key},
-                data={"nonce": str(int(time.time() * 1000))},
+                f"{REST_BASE_URL}{url_path}",
+                headers={
+                    "API-Key": trade_key,
+                    "API-Sign": signature,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                data=post_data,
             )
-            data = orjson.loads(await resp.read())
-        return data.get("result", {}).get("open", {})
+            data_resp = orjson.loads(await resp.read())
+        return data_resp.get("result", {}).get("open", {})
 
     async def _rest_get_account_balance(self) -> dict:
-        """REST GetAccountBalance — balances gap fallback (AR-035)."""
+        """
+        REST GetAccountBalance - balances gap fallback (AR-035).
+
+        Signed per WM-REST-SIGN-001 / WM-REST-SIGN-002 /
+        WM-REST-SIGN-003 using _sign_rest_request().
+        """
         trade_key = self._config["kraken_trade_api_key"]
+        trade_secret = self._config["kraken_trade_api_secret"]
+        url_path = "/0/private/Balance"
+        data = {"nonce": str(int(time.time() * 1000))}
+        post_data, signature = self._sign_rest_request(
+            url_path, data, trade_secret,
+        )
         async with self._make_http_session() as session:
             resp = await session.post(
-                f"{REST_BASE_URL}/0/private/Balance",
-                headers={"API-Key": trade_key},
-                data={"nonce": str(int(time.time() * 1000))},
+                f"{REST_BASE_URL}{url_path}",
+                headers={
+                    "API-Key": trade_key,
+                    "API-Sign": signature,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                data=post_data,
             )
-            data = orjson.loads(await resp.read())
-        return data.get("result", {})
+            data_resp = orjson.loads(await resp.read())
+        return data_resp.get("result", {})
 
     async def _rest_get_ticker(
         self, candidates: list[str]
