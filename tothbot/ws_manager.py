@@ -1,15 +1,78 @@
 """
 DocDCN:     1011002
 DocTitle:   WS_Manager
-DocVersion: dv1_23
+DocVersion: dv1_24
 DocOwner:   Bill
 DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/ws_manager.py
-DocDate:    04-24-2026
-DocTime:    02:00:00 UTC
+DocDate:    04-25-2026
+DocTime:    22:13:03 UTC
 
 ============================================================
 REVISION HISTORY
 ============================================================
+
+  dv1_24  04-25-2026  D-03 USDT inclusion + D-08 Top-N cap
+                      full retirement. Closes OI-045
+                      (USDT exclusion), OI-046 (Top-N cap
+                      retired), and FINDING-TB00135-001
+                      (D-03 + D-08 AA=10 cascade) at code
+                      deploy. Governed by 1011002 dv1_23
+                      WM-PS-002 / WM-PS-003.
+                      Six-site fix per RR-SCOPE-007
+                      self-catch at TB00140 STREAM 1 open
+                      (NSI three-edit list under-enumerated
+                      L3098, L3165, L3168; carried forward
+                      TB00136 -> TB00137 -> TB00138 ->
+                      TB00139 unvalidated; Bill authorized
+                      Option A six-site fix at TB00140
+                      open).
+                      Function _build_monitored_universe():
+                        (a) Top-N cap constant (formerly
+                            int = 50 at module scope)
+                            deleted.
+                        (b) docstring updated: "Filter:
+                            USD/USDC/USDT, online, volume
+                            >= $500k. NO Top-N cap (D-08
+                            retired). BTC/USD always in."
+                        (c) quote filter ("USD","USDC")
+                            -> ("USD","USDC","USDT").
+                        (d) Top-N cap slice removed; full
+                            candidates list passed as
+                            monitored_universe; BTC/USD
+                            always-include carve-out
+                            preserved (membership-add
+                            only — no slot-eviction since
+                            no cap).
+                      Function seed_indicators_from_rest():
+                        (e) Step 0 liquidity-fetch quote
+                            filter ("USD","USDC") ->
+                            ("USD","USDC","USDT") so USDT
+                            pairs receive 24h volume
+                            ranking.
+                        (f) Step 0b re-rank Top-N cap
+                            slice removed; full ranked
+                            list assigned to top_symbols
+                            (variable name retained for
+                            diff minimality, semantic now
+                            "ranked symbols, no cap").
+                        (g) BTC/USD slot-management
+                            branch removed (the at-cap
+                            evict-last / under-cap append
+                            two-branch was pure slot
+                            management); collapsed to
+                            single top_symbols.append(
+                            "BTC/USD") preserving BTC/USD
+                            always-include with
+                            deterministic appended
+                            position.
+                      Net effect: zero Top-N cap symbol
+                      references in code; both quote
+                      filters admit USDT; full universe
+                      sized to qualifying-pair count;
+                      BTC/USD always-include semantics
+                      preserved in both functions; D-03
+                      + D-08 enforced uniformly across
+                      both code paths.
 
   dv1_23  04-24-2026  OI-041 DEFECT-WM-REST-SIGN-001 fix.
                       Three private REST call sites in
@@ -443,7 +506,6 @@ EMERGENCY_SL_MULT: Decimal = Decimal("3.0")
 ENTRY_GTD_SEC: int = 30               # GTD expiry for entry orders
 
 # Monitored universe config — CIATS-owned starting value
-UNIVERSE_TOP_N: int = 50
 UNIVERSE_MIN_VOLUME_USD: Decimal = Decimal("500000")
 
 # Liquidity refresh interval — CIATS-owned starting value (WM-LIQ-007)
@@ -1692,14 +1754,14 @@ class WSManager:
     def _build_monitored_universe(self) -> None:
         """
         Build monitored_universe from pair_cache.
-        Filter: USD/USDC, online, volume >= $500k. Top N=50. BTC/USD always in.
+        Filter: USD/USDC/USDT, online, volume >= $500k. NO Top-N cap (D-08 retired). BTC/USD always in.
         WM-PS-002/003.
         """
         candidates = []
         for sym, spec in self.pair_cache.items():
             quote = spec.get("quote_currency", "")
             status = spec.get("status", "")
-            if quote not in ("USD", "USDC"):
+            if quote not in ("USD", "USDC", "USDT"):
                 continue
             if status != "online":
                 continue
@@ -1708,11 +1770,10 @@ class WSManager:
         # Sort by volume (not available in instrument snapshot — use alphabetical
         # as placeholder; actual volume filter applied via 24h volume from REST)
         # BTC/USD always included (AR-074, WM-PS-003)
-        top_n = candidates[:UNIVERSE_TOP_N]
-        if "BTC/USD" not in top_n and "BTC/USD" in self.pair_cache:
-            top_n.append("BTC/USD")
+        if "BTC/USD" not in candidates and "BTC/USD" in self.pair_cache:
+            candidates.append("BTC/USD")
 
-        self.monitored_universe = top_n
+        self.monitored_universe = candidates
 
     async def _handle_status(self, msg: dict, is_public: bool = True) -> None:
         """
@@ -3091,11 +3152,11 @@ class WSManager:
             "pairs": len(self.monitored_universe),
         }))
 
-        # ── Step 0: Fetch 24h liquidity for ALL online USD/USDC candidates ──
+        # ── Step 0: Fetch 24h liquidity for ALL online USD/USDC/USDT candidates ──
         # Must fetch ALL (not just monitored_universe) to rank by volume (WM-LIQ-004)
         candidates = [
             sym for sym, spec in self.pair_cache.items()
-            if spec.get("quote_currency") in ("USD", "USDC")
+            if spec.get("quote_currency") in ("USD", "USDC", "USDT")
             and spec.get("status") == "online"
         ]
 
@@ -3161,14 +3222,10 @@ class WSManager:
             ]
             # Sort by volume descending
             ranked.sort(key=lambda x: x[1], reverse=True)
-            # Take top N
-            top_symbols = [sym for sym, _ in ranked[:UNIVERSE_TOP_N]]
+            top_symbols = [sym for sym, _ in ranked]
             # BTC/USD always included (AR-074, WM-PS-003)
             if "BTC/USD" not in top_symbols and "BTC/USD" in self.pair_cache:
-                if len(top_symbols) >= UNIVERSE_TOP_N:
-                    top_symbols[-1] = "BTC/USD"  # replace last entry
-                else:
-                    top_symbols.append("BTC/USD")
+                top_symbols.append("BTC/USD")
             self.monitored_universe = top_symbols
             self._logger.info(log_record({
                 "event": "UNIVERSE_RANKED_BY_VOLUME",
