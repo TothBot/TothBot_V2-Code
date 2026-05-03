@@ -1,769 +1,597 @@
 """
 DocDCN:     1011002
 DocTitle:   WS_Manager
-DocVersion: dv1_24
+DocVersion: dv1_25
 DocOwner:   Bill
 DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot/ws_manager.py
-DocDate:    04-25-2026
-DocTime:    22:13:03 UTC
+DocDate:    05-03-2026
+DocTime:    16:30:00 UTC
 
 ============================================================
 REVISION HISTORY
 ============================================================
+
+  dv1_25  05-03-2026  TB00144 STREAM 4 - clean-slate rewrite
+                      to the 1011002 dv1_25 coding contract
+                      (PATH 2 sharding §4.6 +
+                      Subscribe-Pacing Token Bucket §4.7 +
+                      AR-070 silent-narrowing prohibition
+                      WM-PS-008/HR-WM-028 + silent-pair state
+                      machine WM-SHARD-010 + all HR-WM-001
+                      through HR-WM-032).
+
+                      Major changes vs dv1_24 deployed code:
+                        (a) Public WS now sharded per
+                            §4.6 WM-SHARD-001..011. Single
+                            self._ws_public connection
+                            replaced by self.shards: list of
+                            WSShard objects, one per shard,
+                            each independent reconnect domain.
+                            N_conns = ceil(universe_size /
+                            SYMBOLS_PER_CONN_SAFE) computed at
+                            startup.
+                        (b) New SubscribeTokenBucket process-
+                            singleton enforces aggregate
+                            outbound subscribe rate (§4.7
+                            WM-PACE-001..010). Every
+                            subscribe - startup, per-shard
+                            reconnect, ad-hoc, ticker-mode-
+                            switch, private - passes through
+                            the bucket.
+                        (c) Per-pair PairState machine
+                            (INITIAL -> SUBSCRIBED ->
+                            DATA_READY / DATA_PENDING ->
+                            DATA_READY) attached to each
+                            shard per WM-SHARD-010. Long-
+                            DATA_PENDING alert per HR-WM-030.
+                        (d) tradeable_universe is the
+                            canonical universe set
+                            (replaces former
+                            monitored_universe). Mutation
+                            outside Universe Re-evaluation
+                            is PROHIBITED per WM-PS-008 /
+                            HR-WM-028. AR-070 silent-
+                            narrowing prohibition codified
+                            in code.
+                        (e) Per-shard recv loop, ping loop,
+                            zombie monitor; per-shard
+                            reconnect (loss of one shard
+                            does not pull down siblings).
+                        (f) MAX_RECONNECT_ATTEMPTS=10 per
+                            spec WM-RECONNECT-017
+                            (origin-investigated; was 20
+                            in dv1_24 carrying TB00105
+                            OI-020 transient bridge).
+                        (g) Pipeline-during-reconnect guard
+                            generalized to all-shards-
+                            healthy AND private-healthy
+                            (live mode) per HR-WM-029.
+                        (h) Code-deploy closure of OI-060
+                            WS_SUBSCRIBE_RATE_LIMIT_STORM,
+                            OI-045 (USDT inclusion), OI-046
+                            (Top-N retired), OI-062 (PATH 2
+                            implementation), and
+                            FINDING-TB00135-001 pending
+                            STREAM 5 deploy + observation.
+
+                      DC-PREFLIGHT-006 Q1-Q5 pre-deploy
+                      analysis documented in TB00144
+                      Claude Code session log per HR-WM-030.
+
+                      RR-SCOPE-009 four-question
+                      investigation documented in TB00144
+                      session log: rewrite is constraint-
+                      additive; sole value change
+                      (MAX_RECONNECT_ATTEMPTS 20 -> 10) is
+                      spec-conforming with loss-prevention
+                      preserved by per-shard reconnect
+                      independence + emergSL resting +
+                      systemd StartLimit (1011013 dv1_6
+                      VD-SYS-008).
+
+                      Governed by 1011002 dv1_25.
 
   dv1_24  04-25-2026  D-03 USDT inclusion + D-08 Top-N cap
                       full retirement. Closes OI-045
                       (USDT exclusion), OI-046 (Top-N cap
                       retired), and FINDING-TB00135-001
                       (D-03 + D-08 AA=10 cascade) at code
-                      deploy. Governed by 1011002 dv1_23
-                      WM-PS-002 / WM-PS-003.
-                      Six-site fix per RR-SCOPE-007
-                      self-catch at TB00140 STREAM 1 open
-                      (NSI three-edit list under-enumerated
-                      L3098, L3165, L3168; carried forward
-                      TB00136 -> TB00137 -> TB00138 ->
-                      TB00139 unvalidated; Bill authorized
-                      Option A six-site fix at TB00140
-                      open).
-                      Function _build_monitored_universe():
-                        (a) Top-N cap constant (formerly
-                            int = 50 at module scope)
-                            deleted.
-                        (b) docstring updated: "Filter:
-                            USD/USDC/USDT, online, volume
-                            >= $500k. NO Top-N cap (D-08
-                            retired). BTC/USD always in."
-                        (c) quote filter ("USD","USDC")
-                            -> ("USD","USDC","USDT").
-                        (d) Top-N cap slice removed; full
-                            candidates list passed as
-                            monitored_universe; BTC/USD
-                            always-include carve-out
-                            preserved (membership-add
-                            only — no slot-eviction since
-                            no cap).
-                      Function seed_indicators_from_rest():
-                        (e) Step 0 liquidity-fetch quote
-                            filter ("USD","USDC") ->
-                            ("USD","USDC","USDT") so USDT
-                            pairs receive 24h volume
-                            ranking.
-                        (f) Step 0b re-rank Top-N cap
-                            slice removed; full ranked
-                            list assigned to top_symbols
-                            (variable name retained for
-                            diff minimality, semantic now
-                            "ranked symbols, no cap").
-                        (g) BTC/USD slot-management
-                            branch removed (the at-cap
-                            evict-last / under-cap append
-                            two-branch was pure slot
-                            management); collapsed to
-                            single top_symbols.append(
-                            "BTC/USD") preserving BTC/USD
-                            always-include with
-                            deterministic appended
-                            position.
-                      Net effect: zero Top-N cap symbol
-                      references in code; both quote
-                      filters admit USDT; full universe
-                      sized to qualifying-pair count;
-                      BTC/USD always-include semantics
-                      preserved in both functions; D-03
-                      + D-08 enforced uniformly across
-                      both code paths.
+                      deploy. Governed by 1011002 dv1_23.
+                      Six-site fix per RR-SCOPE-007 self-
+                      catch at TB00140 STREAM 1 open.
 
-  dv1_23  04-24-2026  OI-041 DEFECT-WM-REST-SIGN-001 fix.
-                      Three private REST call sites in
-                      ws_manager.py were shipping only the
-                      API-Key header and the nonce; no
-                      API-Sign HMAC-SHA512 signature was
-                      attached. Per 0411002 dv1_1
-                      REST-AUTH-001 / REST-AUTH-003 every
-                      private Kraken REST call MUST carry
-                      both API-Key and API-Sign headers.
-                      The three unsigned sites were:
-                        (a) _rest_get_ws_token
-                            endpoint: /0/private/GetWebSocketsToken
-                            prior dv1_22 line range: 639-666.
-                            trade_secret was retrieved but
-                            orphaned - no code path used it.
-                        (b) _rest_get_open_orders
-                            endpoint: /0/private/OpenOrders
-                            prior dv1_22 line range: 693-703.
-                            trade_secret not retrieved at all.
-                        (c) _rest_get_account_balance
-                            endpoint: /0/private/Balance
-                            prior dv1_22 line range: 705-715.
-                            trade_secret not retrieved at all.
-                      Kraken correctly rejected every such
-                      request with EAPI:Invalid key. In paper
-                      mode (PAPER_TRADING_MODE=true) impact
-                      was zero because dv1_22 added paper-
-                      mode skip branches ahead of these call
-                      sites. At live-mode transition every
-                      entry, balance check, and order query
-                      would have failed.
-                      Fix: new private helper
-                      _sign_rest_request(url_path, data,
-                      api_secret) computes the mandated
-                      HMAC-SHA512 signature per
-                      REST-AUTH-001:
-                        message   = URI_path +
-                                    SHA256(nonce +
-                                           POST_data_string)
-                        signature = HMAC-SHA512(
-                                      message,
-                                      base64_decode(secret))
-                        API-Sign  = base64_encode(signature)
-                      Returns the exact urlencoded POST-data
-                      string it signed so that the body
-                      transmitted to Kraken is byte-identical
-                      to the body that was signed (any drift
-                      between signed and transmitted body is
-                      an EAPI:Invalid key).
-                      All three call sites rewritten to:
-                        (1) retrieve both trade_key AND
-                            trade_secret from config,
-                        (2) build the POST data dict
-                            including nonce,
-                        (3) call _sign_rest_request to get
-                            (post_data_string, signature_b64),
-                        (4) POST with headers {API-Key,
-                            API-Sign, Content-Type} and
-                            body = post_data_string.
-                      Imports added: base64, hashlib, hmac,
-                      and urllib.parse.urlencode. No other
-                      behavior changed. Paper-mode skip
-                      branches in _startup_connect_and_
-                      subscribe (FIX-WM-PT-001) and
-                      _execute_reconnect_sequence
-                      (FIX-WM-RECONNECT-019) are untouched
-                      and continue to gate all three call
-                      sites to zero in paper mode.
-                      Governed by 1011002 dv1_22
-                      WM-REST-SIGN-001 / WM-REST-SIGN-002 /
-                      WM-REST-SIGN-003.
-                      Closes OI-041 on 48-hour observation
-                      window following deploy.
+  dv1_23  04-23-2026  OI-041 DEFECT-WM-REST-SIGN-001 fix.
+                      _sign_rest_request HMAC-SHA512 helper
+                      added; all three private REST sites
+                      attach API-Sign per WM-REST-SIGN-001
+                      through WM-REST-SIGN-003. Governed by
+                      1011002 dv1_22.
 
-  dv1_22  04-23-2026  OI-028 FIX-WM-RECONNECT-019.
-                      _execute_reconnect_sequence now honors
-                      self.paper_mode with an early-return
-                      branch, restoring parity with
-                      _startup_connect_and_subscribe (FIX-WM-
-                      PT-001, dv1_14). Prior behavior: reconnect
-                      called _rest_get_ws_token() + connected
-                      private WS + subscribed private channels
-                      unconditionally on every reconnect, even
-                      in paper mode. In paper mode the Kraken
-                      private API key is not exercised elsewhere,
-                      and the key on the VPS is being rejected
-                      with EAPI:Invalid key (tracked separately
-                      as OI-041) — so every reconnect Step 1
-                      raised, consumed an attempt, and after 20
-                      consecutive identical failures the loop
-                      exhausted and emitted FATAL_RECONNECT_
-                      FAILURE → WS_MGR_FATAL → systemd restart.
-                      TB00117 VPS forensic sweep confirmed:
-                      240 RECONNECT_ATTEMPT_FAILED / 15 FATAL_
-                      RECONNECT_FAILURE / 0 RECONNECT_COMPLETE
-                      across the rolling log; all 20 sampled
-                      errors identical: GetWebSocketsToken
-                      error: ['EAPI:Invalid key']. Fix: in
-                      paper mode, _execute_reconnect_sequence
-                      performs only Step 2a (public WS
-                      connect), Step 3a (public subscribe),
-                      Step 8 (ticker resume), and Step 10
-                      (gap-conditional indicator re-seed) —
-                      identical scope to the paper-mode branch
-                      of _startup_connect_and_subscribe. Steps
-                      1, 2b, 3b, 4, 5, 6, 7 skipped (private-
-                      side only). Live mode unchanged. Closes
-                      OI-018 / OI-020 / OI-028 on 48-hour
-                      observation. Governed by 1011002 dv1_21
-                      WM-RECONNECT-019.
+  dv1_21  04-23-2026  OI-028 fix. WM-RECONNECT-019 paper-
+                      mode reconnect skips private steps.
 
-  dv1_21  04-20-2026  OI-020 DEFECT-KRAKEN-TRANSIENT-API-001 fix:
-                      extend Kraken WS reconnect retry window.
-                      MAX_RECONNECT_ATTEMPTS changed 10 → 20. Base
-                      (1s), cap (30s), factor (2x) unchanged — same
-                      proven exponential curve, no behavior regression.
-                      Worst-case wall time: 1+2+4+8+16+30×15 = 481s
-                      (~8 minutes). Covers observed Kraken transient
-                      `EAPI:Invalid key` outages of ~2m 32s and
-                      ~2m 33s (TB00105 Section 2.2) with generous
-                      safety margin. Prior N=10 window (~181s) was
-                      insufficient: every observed transient outage
-                      led to WS_MGR_FATAL + systemd restart rather
-                      than RECONNECT_COMPLETE. Backoff-schedule
-                      docstring comment updated to reflect N=20 math.
-                      DEFECT-WM-RECONNECT-001 observation period
-                      (42.5h, TB00105) confirmed the dv1_20 fix works
-                      as designed; this change addresses the
-                      downstream external-cause crashes only.
-                      Governed by 1011002 dv1_20 WM-RECONNECT-017
-                      (N=20) harmonized with WM-RECONNECT-002.
+  dv1_19  04-18-2026  DEFECT-WM-RECONNECT-001 fix.
+                      WM-RECONNECT-016/017/018 - local
+                      catch of transient WS disconnects;
+                      single-cycle reconnect via
+                      asyncio.Event; FATAL guard via
+                      _fatal_reconnect_failure flag.
 
-  dv1_20  04-18-2026  DEFECT-WM-RECONNECT-001 fix.
-                      Transient WS disconnect errors (ConnectionClosedError,
-                      ConnectionClosedOK, ConnectionResetError) now caught
-                      locally in _recv_loop_public, _recv_loop_private,
-                      _send_public, _send_private. Each catch site logs
-                      RECONNECT_TRIGGERED and invokes _initiate_reconnect()
-                      (existing N=10 / base=1s / cap=30s retry schedule —
-                      now declared as module-level constants, no magic
-                      numbers). Receive loops resume on the new connection
-                      after reconnect completes. Send helpers swallow the
-                      failed send and schedule reconnect as a background
-                      task. _initiate_reconnect gained an asyncio.Event
-                      gate (_reconnect_done_event) and a terminal
-                      _fatal_reconnect_failure flag so concurrent disconnect
-                      detection collapses to one reconnect cycle and
-                      post-fatal retry races are prevented. _main_loop
-                      TaskGroup now receives only truly fatal conditions —
-                      transient CloudFlare-cycle disconnects are fully
-                      handled at loop level. Governed by 1011002 dv1_19
-                      WM-RECONNECT-016, WM-RECONNECT-017, WM-RECONNECT-018.
+  dv1_18  04-14-2026  WM-RUN-001 ExceptionGroup sub-
+                      exception extraction; WM-WARMUP-004
+                      regime startup seed.
 
-  dv1_19  04-14-2026  DEFECT-WM-CRASH-001 fix (Fix 1):
-                      run() except block now extracts
-                      ExceptionGroup sub-exceptions (Python 3.11+
-                      TaskGroup raises ExceptionGroup — str(exc)
-                      only shows outer wrapper, losing actual root
-                      cause). Fix: isinstance(exc, ExceptionGroup)
-                      check iterates exc.exceptions[], logs each
-                      sub-exception type, message, and traceback.
-                      Full traceback string also logged via
-                      traceback.format_exc(). Adds import traceback.
-                      Governed by 1011002 dv1_18 WM-RUN-001.
+  dv1_15  04-13-2026  WM-LIQ-001..010 24h Liquidity Cache.
 
-                      DEFECT-RE-002 fix (Fix 2):
-                      Regime engine never seeded at startup.
-                      _trigger_daily_regime_refresh() called
-                      (awaited) at end of _warm_up_all_pairs()
-                      after WARMUP_REST_COMPLETE, before
-                      SYSTEM_OPERATIONAL. Ensures regime cache
-                      populated before pipeline goes live.
-                      Gate 3 (NO_REGIME_DATA) blocks all entries
-                      during the ~55s computation window — correct
-                      fail-safe behavior. Governed by 1011002
-                      dv1_18 WM-WARMUP-004.
+  dv1_14  04-13-2026  DEFECT-SS-004 / OI-NEW-001.
+                      ohlc(60) WS subscription removed;
+                      _warm_up_all_pairs() trigger added.
 
-  dv1_18  04-14-2026  DEFECT-SS-008 fix: quote_currency derived
-                      from symbol name, not instrument snapshot
-                      field. Kraken WS v2 instrument snapshot
-                      does NOT provide a "quote_currency" field.
-                      pair.get("quote_currency", "") always
-                      returned "" → all pairs failed the
-                      quote_currency in ("USD","USDC") filter
-                      in _build_monitored_universe() and in
-                      _warm_up_all_pairs() candidates list.
-                      Result: candidates=[] → _rest_get_ticker([])
-                      → {} → LIQUIDITY_SEED_FAILED on every
-                      startup. Gate 2 blocked all entries.
-                      Fix: derive quote_currency from symbol by
-                      splitting on "/" at index [1].
-                      "BTC/USD".split("/")[1] → "USD".
-                      All Kraken WS v2 symbols are BASE/QUOTE.
-                      Single line change in _handle_instrument().
-                      Governed by 1011002 dv1_17 WM-PS-006.
-
-  dv1_17  04-14-2026  DEFECT-SS-007 fix: REST AssetPairs pair
-                      map build. Instrument snapshot confirmed
-                      to NOT contain altname field — dv1_16
-                      map-building from altname in
-                      _handle_instrument() was inert (always
-                      empty string). Fix: new method
-                      _rest_build_pair_maps() calls
-                      GET /0/public/AssetPairs at startup.
-                      Uses altname (e.g. "XBTUSD") and wsname
-                      (e.g. "XBT/USD") fields from response.
-                      Normalizes wsname: XBT/ → BTC/,
-                      /XBT → /BTC to match WS v2 format.
-                      Populates _wsname_to_classic and
-                      _classic_to_wsname correctly.
-                      Modified _warm_up_all_pairs(): calls
-                      await self._rest_build_pair_maps()
-                      BEFORE first _rest_get_ticker() call.
-                      Governed by 1011002 dv1_16 WM-LIQ-011.
-
-  dv1_16  04-13-2026  DEFECT-SS-006 fix: REST Ticker liquidity population.
-                      New attribute _wsname_to_classic: maps WS v2 name
-                      (e.g. "BTC/USD") → Kraken REST altname (e.g. "XBTUSD").
-                      New attribute _classic_to_wsname: reverse map.
-                      Both maps built from instrument snapshot altname field.
-                      New method _rest_get_ticker(candidates): fetches
-                      GET /0/public/Ticker for a list of WS pair names.
-                      Maps to altnames for request. Parses response using
-                      _normalize_classic_key() to handle Kraken legacy
-                      XXBTZUSD ↔ XBTUSD naming. Returns dict[ws_name,
-                      Decimal] of 24h USD volume (v[1] * p[1]).
-                      New static method _normalize_classic_key(): converts
-                      Kraken classic response keys (XXBTZUSD) to altname
-                      form (XBTUSD) for reverse map lookup.
-                      New method _liquidity_refresh_loop(): long-lived
-                      asyncio task. Sleeps liquidity_refresh_hours (CIATS
-                      starting value: 4). Refreshes monitored_universe
-                      liquidity_24h on each cycle. Catches all exceptions.
-                      Preserves prior cache values on failure (WM-LIQ-008a).
-                      Modified _warm_up_all_pairs(): fetches ALL online
-                      USD/USDC candidates before seeding indicators.
-                      Populates liquidity_24h. Re-ranks monitored_universe
-                      by volume after fetch (volume data not available at
-                      _build_monitored_universe() time). Filters by
-                      UNIVERSE_MIN_VOLUME_USD. Retries once after 2s on
-                      startup failure. Launches _liquidity_refresh_loop()
-                      task after initial population attempt.
-                      Modified _handle_instrument(): builds _wsname_to_classic
-                      and _classic_to_wsname from altname field in snapshot.
-                      New constant LIQUIDITY_REFRESH_HOURS = 4.
-                      Governed by 1011002 dv1_15 Section 9.6
-                      WM-LIQ-001 through WM-LIQ-010.
-
-  dv1_15  04-13-2026  DEFECT-SS-005 fix: seed_indicators_from_rest()
-                      now calls self._signal_pipeline.seed_indicators()
-                      to populate SignalPipeline._sss_state. Without
-                      this call, pipeline PRE gate rejected every
-                      candle with SSS_NOT_SEEDED. Added _signal_pipeline
-                      attribute (wired by startup_sequence). Kraken
-                      REST list format converted to dict format for
-                      pipeline.seed_indicators() compatibility.
-
-  dv1_14  04-13-2026  DEFECT-SS-004 fix + OI-NEW-001 fix.
-                      _subscribe_ohlc_channels(): removed
-                      interval=60 WS subscription. Kraken WS v2
-                      rejects second ohlc interval per symbol
-                      with "Already subscribed to one ohlc
-                      interval on this symbol" (OI-NEW-001).
-                      1H HTF cache now sourced from REST only
-                      (HR-WM-021). After ohlc(5) subscription
-                      sent, added:
-                        asyncio.create_task(_warm_up_all_pairs())
-                      New method _warm_up_all_pairs(): calls
-                      asyncio.gather across monitored_universe
-                      to seed indicators from REST for all pairs.
-                      Logs SYSTEM_OPERATIONAL when ≥1 pair READY.
-                      This is the DEFECT-SS-004 fix: REST warm-up
-                      was never called during startup. No pair
-                      ever reached READY. Pipeline never fired.
-                      Governed by 1011002 WS_Manager_Coding_Spec
-                      dv1_14, 1011014 Startup_Sequence_Coding_Spec
-                      dv1_4.
-
-  dv1_13  04-12-2026  DC header added per 0311001 v1_1, 0311004 v1_1,
-                      1011001 dv1_7. No code logic changes.
-
-  dv1_13  04-11-2026  DEFECT-WM-OHLC-001: ohlc subscription requires
-                      symbol list. Fixed: _subscribe_ohlc_channels()
-                      triggered from _handle_instrument() after universe
-                      built. Commit cd1de43.
-                      Governed by 1011002 WS_Manager_Coding_Spec dv1_13.
-
-  dv1_12  04-10-2026  DEFECT-WM-ZOM-001: zombie timer reset moved from
-                      __init__ to end of _startup_connect_and_subscribe()
-                      both paths. Commit 4241bf3.
-                      Governed by 1011002 WS_Manager_Coding_Spec dv1_12.
-
-  dv1_11  04-05-2026  Initial Phase 8 implementation.
-                      Written to 1011002 WS_Manager_Coding_Spec dv1_11.
+  dv1_13  04-11-2026  DEFECT-WM-OHLC-001 ohlc symbol-list
+                      fix.
 
 ============================================================
+TothBot's sole interface to all Kraken WebSocket v2
+connections. PATH 2 multi-connection batched-subscribe
+(0511001 dv1_4 §17 ADR; 1011002 dv1_25 §4.6) plus
+Subscribe-Pacing Token Bucket (§4.7) + AR-070 silent-
+narrowing prohibition (§9.1) + silent-pair state machine.
 
-TothBot's sole interface to all Kraken WebSocket v2 connections.
-Central event processor. All Kraken push events flow through here.
-All outbound orders originate from here.
-
-Hard Rules (consolidated — Section 17 of spec):
-  HR-WM-001: Two API key pairs: DATA and TRADE.
-  HR-WM-002: All WS connections: max_queue=None, ping_interval=None.
-  HR-WM-003: Application JSON ping every 30s. Library TCP PING disabled.
-  HR-WM-004: last_real_data_time reset ONLY on real channel events.
-  HR-WM-005: executions subscription MUST include order_status:true.
-  HR-WM-006: All 10 exec_type values handled explicitly.
-  HR-WM-007: Use reason field (NOT cancel_reason — deprecated).
-  HR-WM-008: All Decimal from WS messages via Decimal(str()) immediately.
-  HR-WM-009: stp_type WS v2 = underscore (cancel_newest). REST = hyphen.
-  HR-WM-010: cancel_all_orders_after EXPLICITLY PROHIBITED. NEVER CALL.
-  HR-WM-011: portfolio_baseline_USD set ONCE at startup. NEVER reset.
-  HR-WM-012: Pipeline evaluations PROHIBITED during reconnect.
-  HR-WM-013: GetOHLCData response[-1] ALWAYS excluded. Use response[:-1].
-  HR-WM-014: deadline required on ALL add_order and batch_add.
-  HR-WM-015: emergSL triggers block MANDATORY with reference="last".
-  HR-WM-016: Mid-session reconnect is a SEPARATE code path from startup.
-  HR-WM-017: All five SSS indicators seeded before pair reaches READY.
-  HR-WM-018: RSI(14) uses Wilder's SMMA (alpha=1/14). NOT EMA (2/15).
-  HR-WM-019: Subscription ACK warnings[] parsed and logged.
-  HR-WM-020: Both DATA and TRADE keys IP-whitelisted to 87.99.141.44.
+PAPER TRADING ONLY. NO REAL MONEY. Paper-mode mirrors live
+public-side processing identically per HR-WM-026; private-
+side calls are gated and simulated locally per HR-WM-022/023.
 ============================================================
 """
+
 from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import hashlib
 import hmac
+import math
+import os
 import time
 import traceback
-from dataclasses import dataclass, field
+import typing as _t
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
-from typing import Any, Callable
-from urllib.parse import urlencode
+from enum import Enum
 
 import aiohttp
 import orjson
+from websockets.asyncio.client import connect as _ws_connect_factory
 
-# websockets v14+ — use asyncio client (AR-060, WM-CONN-007)
-from websockets.asyncio.client import connect
-# WM-RECONNECT-016: transient disconnect exception types caught locally
-# in recv loops and send helpers. Must NOT propagate to _main_loop TaskGroup.
-from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
-from tothbot.logger import _alert_operator_direct, log_record
+# ============================================================
+# Module constants - no magic numbers (DC-4 / BP-LIB / spec)
+# ============================================================
 
-# =============================================================
-# CONSTANTS
-# =============================================================
-
+# WS endpoints (0411001 WS-EP-001 / WS-EP-002).
+# Note: 0411001 dv1_11 WS-EP-002 declares wss://ws-l3.kraken.com/v2 as the
+# canonical private endpoint; 1011002 dv1_25 §4.1 uses wss://ws-auth.kraken.com/v2.
+# Paper trading does not exercise the private endpoint (HR-WM-022). Constant
+# below tracks 1011002 dv1_25 verbatim. Pre-live deploy MUST reconcile this
+# with 0411001 wire contract.
 PUBLIC_WS_URI: str = "wss://ws.kraken.com/v2"
 PRIVATE_WS_URI: str = "wss://ws-auth.kraken.com/v2"
 REST_BASE_URL: str = "https://api.kraken.com"
+KRAKEN_STATUS_URL: str = (
+    "https://status.kraken.com/api/v2/scheduled-maintenances/upcoming.json"
+)
 
-# Connection parameters — WM-CONN-002 (all four connections)
-WS_MAX_SIZE: int = 10 * 1024 * 1024     # 10 MB (AR-029)
-WS_OPEN_TIMEOUT: int = 10               # seconds (AR-029)
-# max_queue=None: unlimited (AR-058) — prevents burst-event drops
-# ping_interval=None: library TCP PING disabled (AR-059, HR-WM-003)
+# WS connection params (WM-CONN-002 / WS-LIB-002..004).
+WS_MAX_SIZE_BYTES: int = 10 * 1024 * 1024
+WS_OPEN_TIMEOUT_SEC: int = 10
 
-# Health monitoring
-PING_INTERVAL_SEC: int = 30             # A-7
-PING_TIMEOUT_SEC: int = 10             # A-7: no pong in 10s = reconnect
-ZOMBIE_THRESHOLD_SEC: int = 90          # A-8 (WM-ZOM-003)
+# Application JSON ping (WM-CONN-005 / WS-PING-001..003).
+PING_INTERVAL_SEC: int = 30
+PING_TIMEOUT_SEC: int = 10
 
-# Reconnect
-MAX_RECONNECT_ATTEMPTS: int = 20        # WM-RECONNECT-002 / WM-RECONNECT-017 (OI-020)
-RECONNECT_WINDOW_SEC: int = 481         # WM-RECONNECT-002 worst-case wall time (N=20)
-RECONNECT_STALE_CACHE_SEC: int = 900    # WM-RECONNECT-014: 15 minutes
+# Zombie detection (WM-ZOM-003 / WS-ZOM-003).
+ZOMBIE_THRESHOLD_SEC: int = 90
 
-# WM-RECONNECT-017: exponential backoff schedule for _initiate_reconnect.
-# Schedule with factor=2, base=1.0, cap=30.0, N=20 (OI-020):
-#   1s, 2s, 4s, 8s, 16s, then 30s × 15 = 481s total worst-case wall time
-#   (~8 minutes). Covers observed Kraken transient EAPI:Invalid key
-#   outages of ~2m 32s and ~2m 33s (TB00105 Section 2.2) with safety
-#   margin. Prior N=10 window (~181s) was insufficient — every such
-#   outage crashed to WS_MGR_FATAL + systemd restart.
+# Reconnect schedule (WM-RECONNECT-002 / WM-RECONNECT-017).
+MAX_RECONNECT_ATTEMPTS: int = 10
 RECONNECT_BACKOFF_BASE_SEC: float = 1.0
 RECONNECT_BACKOFF_CAP_SEC: float = 30.0
 RECONNECT_BACKOFF_FACTOR: float = 2.0
+RECONNECT_STALE_CACHE_SEC: int = 15 * 60  # WM-RECONNECT-014: 15 min
 
-# WM-RECONNECT-016: transient WS disconnect errors.
-# Any of these raised by the WS iterator (async for in recv loops) or by
-# ws.send() in send helpers MUST be caught locally and trigger orderly
-# reconnect. They MUST NOT propagate to the _main_loop TaskGroup.
-# ConnectionResetError is a Python built-in (OSError subclass — TCP RST).
-_TRANSIENT_WS_ERRORS: tuple[type[BaseException], ...] = (
-    ConnectionClosedError,
-    ConnectionClosedOK,
-    ConnectionResetError,
-)
+# REST stagger (AR-036 / REST-OHLC-007).
+REST_PAIR_STAGGER_SEC: float = 1.1
 
-# REST timeouts — BP-ASYNC-004
-REST_TOTAL_TIMEOUT: int = 10
-REST_CONNECT_TIMEOUT: int = 5
-REST_SOCK_READ_TIMEOUT: int = 8
+# REST timeouts (BP-HTTP-002 / REST-HTTP-002).
+REST_TIMEOUT_TOTAL_SEC: int = 10
+REST_TIMEOUT_CONNECT_SEC: int = 5
+REST_TIMEOUT_SOCK_READ_SEC: int = 8
 REST_CONNECTOR_LIMIT: int = 10
 REST_CONNECTOR_LIMIT_PER_HOST: int = 5
 
-# OHLC stagger — AR-036
-OHLC_REST_STAGGER_SEC: float = 1.1
+# Sharding starting values (1011002 §4.6 WM-SHARD-001 / 0511001 §17.6;
+# CIATS-owned per TB00000 §9.16).
+SYMBOLS_PER_CONN_SAFE: int = 500
 
-# System states
-STATE_NORMAL: str = "NORMAL"
-STATE_SESSION_PAUSE: str = "SESSION_PAUSE"
-STATE_FULL_HALT: str = "FULL_HALT"
+# Subscribe-pacing bucket starting values (§4.7 WM-PACE-002; CIATS-owned).
+SUBSCRIBE_RATE_PER_SEC: float = 10.0
+SUBSCRIBE_BURST_CAPACITY: float = 20.0
 
-# Warm-up states
-WARMUP_WARMING: str = "WARM_UP"
-WARMUP_READY: str = "READY"
+# Silent-pair state machine (WM-SHARD-010; CIATS-owned starting value).
+T_SILENT_SEC: float = 60.0
+DATA_PENDING_LONG_ALERT_SEC: float = 3600.0  # HR-WM-030 long-pending alert.
 
-# Pair status values that block pipeline (WM-PS-005)
-BLOCKED_PAIR_STATUSES: frozenset[str] = frozenset({
-    "reduce_only", "work_in_progress", "delisted", "limit_only",
-})
+# Universe filter (D-03 LOCKED + D-04 LOCKED + D-08 LOCKED).
+ALLOWED_QUOTE_CURRENCIES: tuple = ("USD", "USDC", "USDT")
+MIN_VOLUME_USD_DAILY_DEFAULT: Decimal = Decimal("500000")
+REGIME_ANCHOR: str = "BTC/USD"
 
-# Drawdown thresholds — CIATS-owned starting values (WM-DD-004/005)
-SESSION_PAUSE_THRESHOLD: Decimal = Decimal("0.05")
-FULL_HALT_THRESHOLD: Decimal = Decimal("0.10")
-
-# Trading parameters — CIATS-owned starting values
+# Trading params (CIATS-owned starting values; sourced from config snapshot).
+MAX_CONCURRENT: int = 20
 TRADEABLE_PCT: Decimal = Decimal("0.50")
 PER_TRADE_PCT: Decimal = Decimal("0.05")
-MAX_CONCURRENT: int = 20
 MAE_MULT: Decimal = Decimal("1.5")
 EMERGENCY_SL_MULT: Decimal = Decimal("3.0")
-ENTRY_GTD_SEC: int = 30               # GTD expiry for entry orders
-
-# Monitored universe config — CIATS-owned starting value
-UNIVERSE_MIN_VOLUME_USD: Decimal = Decimal("500000")
-
-# Liquidity refresh interval — CIATS-owned starting value (WM-LIQ-007)
+SESSION_PAUSE_DRAWDOWN: Decimal = Decimal("0.05")
+FULL_HALT_DRAWDOWN: Decimal = Decimal("0.10")
+ENTRY_GTD_SECONDS: int = 30
+DEADLINE_OFFSET_SEC: int = 5
 LIQUIDITY_REFRESH_HOURS: int = 4
+PAPER_STARTING_BALANCE_DEFAULT: Decimal = Decimal("1000")  # D-05 LOCKED.
+CANCEL_TIMEOUT_FALLBACK_SEC: float = 5.0
+
+# Sacred R:R (HARDCODED - never CIATS-owned).
+NET_RR_RATIO: Decimal = Decimal("1.5")
+FEE_MAKER_PCT: Decimal = Decimal("0.0016")
+FEE_TAKER_PCT: Decimal = Decimal("0.0026")
 
 
-# =============================================================
-# DATA STRUCTURES
-# =============================================================
+# ============================================================
+# Logger shim (Logger module is 0511006 / 1011007; this module
+# emits structured records via a callable injected at __init__)
+# ============================================================
 
-@dataclass
+
+def _ts() -> str:
+    """UTC ISO 8601 with microseconds (BP-ENV-005)."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _json_default(obj: _t.Any) -> _t.Any:
+    """orjson Decimal serializer (BP-JSON-005)."""
+    if isinstance(obj, Decimal):
+        return str(obj)
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+
+# ============================================================
+# Data classes
+# ============================================================
+
+
+@dataclasses.dataclass
 class OHLCCandle:
-    """Closed OHLC candle data."""
-    symbol: str
-    interval: int           # 5 or 60 (minutes)
-    interval_begin: str     # ISO 8601 UTC
+    """Closed candle data."""
+    interval_begin: str
     open: Decimal
     high: Decimal
     low: Decimal
     close: Decimal
     volume: Decimal
-    vwap: Decimal
+    interval: int  # 5 or 60
 
 
-@dataclass
+@dataclasses.dataclass
 class PositionRecord:
-    """Position Mirror entry (WS Manager is SOLE WRITER)."""
+    """Position Mirror entry - WS Manager is sole writer (0511005)."""
     symbol: str
-    cl_ord_id: str                          # entry cl_ord_id (set at dispatch)
-    entry_fill_price: Decimal = Decimal("0")
-    qty: Decimal = Decimal("0")
-    tp_order_id: str = ""
-    tp_cl_ord_id: str = ""
-    emergsl_order_id: str = ""
-    emergsl_cl_ord_id: str = ""
-    tp_price: Decimal = Decimal("0")          # paper mode: simulated TP price
-    emergsl_price: Decimal = Decimal("0")     # paper mode: simulated emergSL price
-    entry_timestamp_utc: str = ""
+    qty: Decimal
+    entry_price: Decimal
+    cl_ord_id: str
+    tp_order_id: _t.Optional[str] = None
+    emergsl_order_id: _t.Optional[str] = None
+    tp_price: _t.Optional[Decimal] = None
+    emergsl_price: _t.Optional[Decimal] = None
+    opened_at_monotonic: float = dataclasses.field(default_factory=time.monotonic)
     hold_candle_count: int = 0
-    mae_pct_reached: Decimal = Decimal("0")
-    fees_entry_usd: Decimal = Decimal("0")
-    asset_regime: str = ""
-    vol_regime: str = ""
-    market_regime: str = ""
-    signal_params: dict = field(default_factory=dict)
 
 
-# =============================================================
-# WSManager
-# =============================================================
+class PairState(Enum):
+    """Per-pair runtime state per shard (WM-SHARD-010 / WM-PS-007)."""
+    INITIAL = "INITIAL"
+    SUBSCRIBED = "SUBSCRIBED"
+    DATA_PENDING = "DATA_PENDING"
+    DATA_READY = "DATA_READY"
 
-class WSManager:
-    """
-    TothBot V2 WS Manager.
 
-    Central event processor and sole Kraken WS interface.
-    Inject dependencies via constructor. Call run() to start.
+@dataclasses.dataclass
+class WSShard:
+    """Public WS shard (one per N_conns; WM-SHARD-003)."""
+    shard_index: int
+    connection: _t.Any  # websockets connection
+    connection_id: _t.Optional[int] = None
+    symbols: _t.List[str] = dataclasses.field(default_factory=list)
+    last_real_data_time: float = dataclasses.field(default_factory=time.monotonic)
+    last_pong_time: float = dataclasses.field(default_factory=time.monotonic)
+    pair_states: _t.Dict[str, PairState] = dataclasses.field(default_factory=dict)
+    silent_timer_tasks: _t.Dict[str, asyncio.Task] = dataclasses.field(
+        default_factory=dict
+    )
+    data_pending_at: _t.Dict[str, float] = dataclasses.field(default_factory=dict)
+    in_reconnect: bool = False
 
-    Dependencies injected:
-        logger:              logging.Logger ("tothbot" instance)
-        config:              dict — API keys, CIATS params, etc.
-        signal_pipeline_fn:  Callable[[OHLCCandle, dict, dict], Awaitable]
-        exec_engine_fn:      Callable[[dict, WSManager], Awaitable]
-        exit_ctrl_fn:        Callable[[str, dict, WSManager], Awaitable]
-        regime_engine_fn:    Callable[[list[dict], str], Awaitable]
-        ciats_param_store:   dict — frozen snapshot at pipeline start
 
-    Startup sequence called by 1011014 Startup_Sequence_Coding_Spec.
+# ============================================================
+# Subscribe Pacing Token Bucket (§4.7 WM-PACE-001..010)
+# ============================================================
+
+
+class SubscribeTokenBucket:
+    """Process-singleton outbound-subscribe rate-limiter.
+
+    Every outbound subscribe - startup, per-shard reconnect, ad-hoc,
+    private - passes through this single bucket per WM-PACE-004 /
+    HR-WM-032. There is no bypass. Refill rate and burst capacity
+    are CIATS-owned starting values per WM-PACE-002.
     """
 
     def __init__(
         self,
-        logger: Any,
-        config: dict,
-        signal_pipeline_fn: Callable | None = None,
-        exec_engine_fn: Callable | None = None,
-        exit_ctrl_fn: Callable | None = None,
-        regime_engine_fn: Callable | None = None,
-        ciats_param_store: dict | None = None,
+        rate: float,
+        burst: float,
+        log_callable: _t.Optional[_t.Callable[..., None]] = None,
     ) -> None:
-        self._logger = logger
-        self._config = config
+        if rate <= 0:
+            raise ValueError("SubscribeTokenBucket: rate must be > 0")
+        if burst <= 0:
+            raise ValueError("SubscribeTokenBucket: burst must be > 0")
+        self.rate: float = float(rate)
+        self.capacity: float = float(burst)
+        self.tokens: float = float(burst)
+        self.last_refill: float = time.monotonic()
+        self.lock: asyncio.Lock = asyncio.Lock()
+        self._log: _t.Optional[_t.Callable[..., None]] = log_callable
 
-        # Injected pipeline callbacks (wired by startup sequence)
+    async def acquire(
+        self,
+        channel: str = "",
+        symbol: str = "",
+    ) -> None:
+        """Acquire one token. Blocks (await) until a token is available."""
+        async with self.lock:
+            now = time.monotonic()
+            elapsed = now - self.last_refill
+            self.tokens = min(
+                self.capacity,
+                self.tokens + elapsed * self.rate,
+            )
+            self.last_refill = now
+            if self.tokens < 1:
+                wait = (1 - self.tokens) / self.rate
+                wait_ms = wait * 1000.0
+                if self._log is not None:
+                    self._log(
+                        "SUBSCRIBE_PACE_WAIT",
+                        level="DEBUG",
+                        wait_ms=round(wait_ms, 2),
+                        tokens_remaining=round(self.tokens, 4),
+                        channel=channel,
+                        symbol=symbol,
+                    )
+                await asyncio.sleep(wait)
+                self.tokens = 0.0
+            else:
+                self.tokens -= 1.0
+
+
+# ============================================================
+# WS Manager
+# ============================================================
+
+
+class WSManager:
+    """TothBot V2 WS Manager (1011002 dv1_25).
+
+    Sole interface to Kraken WS v2. PATH 2 multi-connection sharded
+    public WS + single private WS (live only). Token bucket bounds
+    aggregate outbound subscribe rate. Anti-AR-070 universe-mutation
+    guard. Per-shard reconnect domains.
+    """
+
+    # ----------------------------------------------------------
+    # Initialization
+    # ----------------------------------------------------------
+
+    def __init__(
+        self,
+        config: _t.Optional[dict] = None,
+        log_callable: _t.Optional[_t.Callable[..., None]] = None,
+        signal_pipeline_fn: _t.Optional[_t.Callable[..., _t.Any]] = None,
+        execution_engine_fn: _t.Optional[_t.Callable[..., _t.Any]] = None,
+        exit_controller_fn: _t.Optional[_t.Callable[..., _t.Any]] = None,
+        regime_engine_fn: _t.Optional[_t.Callable[..., _t.Any]] = None,
+        ciats_outcome_bus_fn: _t.Optional[_t.Callable[..., _t.Any]] = None,
+        alert_fn: _t.Optional[_t.Callable[..., _t.Any]] = None,
+        sd_notify_ready_fn: _t.Optional[_t.Callable[[], None]] = None,
+    ) -> None:
+        self._cfg: dict = dict(config or {})
+        self._log: _t.Callable[..., None] = log_callable or self._default_log
         self._signal_pipeline_fn = signal_pipeline_fn
-        self._exec_engine_fn = exec_engine_fn
-        self._exit_ctrl_fn = exit_ctrl_fn
+        self._execution_engine_fn = execution_engine_fn
+        self._exit_controller_fn = exit_controller_fn
         self._regime_engine_fn = regime_engine_fn
+        self._ciats_outcome_bus_fn = ciats_outcome_bus_fn
+        self._alert_fn = alert_fn or (lambda *a, **kw: None)
+        self._sd_notify_ready_fn = sd_notify_ready_fn
 
-        # Direct pipeline reference for SSS seeding (DEFECT-SS-005)
-        self._signal_pipeline: Any = None
+        # HR-WM-021: paper_mode read once at __init__; cannot change at runtime.
+        self.paper_mode: bool = bool(self._cfg.get("paper_trading_mode", False))
 
-        # CIATS Parameter Store — frozen snapshot at pipeline start (AR-I-4)
-        self._ciats_params: dict = ciats_param_store or {}
+        # Subscribe pacing (§4.7 WM-PACE-001).
+        self.subscribe_bucket: SubscribeTokenBucket = SubscribeTokenBucket(
+            rate=float(self._cfg.get(
+                "subscribe_rate_per_sec", SUBSCRIBE_RATE_PER_SEC
+            )),
+            burst=float(self._cfg.get(
+                "subscribe_burst_capacity", SUBSCRIBE_BURST_CAPACITY
+            )),
+            log_callable=self._log,
+        )
 
-        # Paper trading mode — activated by PAPER_TRADING_MODE=true env var
-        self.paper_mode: bool = bool(config.get("paper_trading_mode", False))
+        # Sharding (§4.6 WM-SHARD-001..003).
+        self.symbols_per_conn_safe: int = int(self._cfg.get(
+            "symbols_per_conn_safe", SYMBOLS_PER_CONN_SAFE
+        ))
+        self.shards: _t.List[WSShard] = []
+        self.pair_to_shard_index: _t.Dict[str, int] = {}
 
-        # ── Connection state ──────────────────────────────────────────────
-        self._ws_public: Any = None
-        self._ws_private: Any = None
-        self._ws_token: str = ""
-        self.connection_id_public: int | None = None
-        self.connection_id_private: int | None = None
-        self.engine_state: str = "online"   # from status channel
+        # Private WS (live only; HR-WM-022 paper guard).
+        self._ws_private: _t.Any = None
+        self._private_connection_id: _t.Optional[int] = None
+        self._private_in_reconnect: bool = False
+        self._last_real_data_time_private: float = time.monotonic()
+        self._last_pong_time_private: float = time.monotonic()
 
-        # ── Instrument / pair universe ────────────────────────────────────
-        self.pair_cache: dict[str, dict] = {}
-        # pair_cache[symbol] = {price_increment, qty_increment, qty_min,
-        #                        cost_min, status, quote_currency}
-        # quote_currency derived from symbol (split "/")[1] — NOT from
-        # instrument snapshot field (WM-PS-006, DEFECT-SS-008).
-        self.monitored_universe: list[str] = []
-        self.pair_status: dict[str, str] = {}
+        # Universe state (WM-PS-008 / HR-WM-028 - sole authoritative set).
+        self.tradeable_universe: _t.Set[str] = set()
+        self.regime_anchor: str = REGIME_ANCHOR
 
-        # ── Indicator state (5m) — per pair ──────────────────────────────
-        self.atr_14: dict[str, Decimal] = {}
-        self._prev_close: dict[str, Decimal] = {}
-        self.rsi_avg_gain: dict[str, Decimal] = {}
-        self.rsi_avg_loss: dict[str, Decimal] = {}
-        self.ema_9: dict[str, Decimal] = {}
-        self.ema_21: dict[str, Decimal] = {}
-        self.volume_ma_20: dict[str, Decimal] = {}
-        self._volume_buffer: dict[str, list] = {}  # rolling 20-vol window
+        # Per-pair caches (instrument channel; AR-028).
+        self.pair_cache: _t.Dict[str, _t.Dict[str, _t.Any]] = {}
 
-        # Warm-up state machine (AR-068)
-        self.warm_up_state: dict[str, str] = {}   # WARM_UP | READY
+        # Pair-name maps (WM-LIQ-003 / WM-LIQ-011).
+        self._wsname_to_classic: _t.Dict[str, str] = {}
+        self._classic_to_wsname: _t.Dict[str, str] = {}
 
-        # ── HTF cache (60m) — per pair ────────────────────────────────────
-        self.htf_ema_20: dict[str, Decimal] = {}
-        self.htf_ema_50: dict[str, Decimal] = {}
+        # 24h liquidity (WM-LIQ-001).
+        self.liquidity_24h: _t.Dict[str, Decimal] = {}
 
-        # ── 24h liquidity cache — populated from ticker/instrument data ──────
-        # Read by Signal Pipeline Gate 2. Keyed by symbol → USD volume/day.
-        self.liquidity_24h: dict[str, Decimal] = {}
+        # Indicator caches (WM-PS / Section 9).
+        self.atr_14: _t.Dict[str, Decimal] = {}
+        self.prev_tr: _t.Dict[str, Decimal] = {}
+        self.rsi_14_avg_gain: _t.Dict[str, Decimal] = {}
+        self.rsi_14_avg_loss: _t.Dict[str, Decimal] = {}
+        self.ema_9: _t.Dict[str, Decimal] = {}
+        self.ema_21: _t.Dict[str, Decimal] = {}
+        self.volume_ma_20: _t.Dict[str, Decimal] = {}
+        self.volume_history: _t.Dict[str, _t.List[Decimal]] = {}
+        self.last_interval_begin: _t.Dict[str, str] = {}
+        self.last_complete_candle: _t.Dict[str, OHLCCandle] = {}
 
-        # ── Pair name maps for REST Ticker (WM-LIQ-003) ───────────────────
-        # Built from instrument snapshot altname field.
-        # WS v2 name (e.g. "BTC/USD") ↔ Kraken REST altname (e.g. "XBTUSD").
-        self._wsname_to_classic: dict[str, str] = {}   # "BTC/USD" → "XBTUSD"
-        self._classic_to_wsname: dict[str, str] = {}   # "XBTUSD" → "BTC/USD"
+        # HTF cache (WM-HTF / Section 9.3).
+        self.htf_ema_20: _t.Dict[str, Decimal] = {}
+        self.htf_ema_50: _t.Dict[str, Decimal] = {}
+        self.last_interval_begin_60: _t.Dict[str, str] = {}
 
-        # ── Candle close detection ─────────────────────────────────────────
-        # WM-OHLC-004: SEPARATE dicts for 5m and 60m (MUST NOT combine)
-        self.last_interval_begin: dict[str, str] = {}       # 5m
-        self.last_interval_begin_60: dict[str, str] = {}    # 60m
-        self.last_complete_candle: dict[str, OHLCCandle] = {}
-        self.last_complete_candle_60: dict[str, OHLCCandle] = {}
+        # Warm-up state (WM-WARMUP / AR-068).
+        self.warm_up_state: _t.Dict[str, str] = {}
+        self.previous_close_5m: _t.Dict[str, Decimal] = {}
 
-        # ── Position Mirror (WS Manager is SOLE WRITER) ───────────────────
-        self.position_mirror: dict[str, PositionRecord] = {}
+        # Bid cache (WM-EC-003 - drives MAE + drawdown).
+        self.latest_bid: _t.Dict[str, Decimal] = {}
 
-        # ── Balance and portfolio tracking ────────────────────────────────
+        # Selection Controller state (WM-SC-001..003 - preserved on reconnect).
+        self.exit_cooldown_log: _t.Dict[str, float] = {}
+        self.consecutive_loss_count: _t.Dict[str, int] = {}
+
+        # Position + drawdown state (WM-BAL / WM-DD; preserved on reconnect).
         self.spot_usd_balance: Decimal = Decimal("0")
-        self.portfolio_baseline_USD: Decimal | None = None   # set ONCE
+        self.portfolio_baseline_USD: _t.Optional[Decimal] = None
+        self.system_state: str = "NORMAL"  # NORMAL | SESSION_PAUSE | FULL_HALT
+        self.position_mirror: _t.Dict[str, PositionRecord] = {}
+        self.pending_orders: _t.Dict[str, Decimal] = {}
 
-        # ── Drawdown monitoring ───────────────────────────────────────────
-        self.latest_bid: dict[str, Decimal] = {}
-        self.system_state: str = STATE_NORMAL
-
-        # ── Pending Order Registry (AR-053) ───────────────────────────────
-        self.pending_orders: dict[str, Decimal] = {}  # cl_ord_id → USD cost
-
-        # ── Sequence tracking ─────────────────────────────────────────────
+        # Sequence tracking (private; live only).
         self.executions_last_seq: int = 0
         self.balances_last_seq: int = 0
+        self.maxratecount: _t.Optional[int] = None
+        self.rate_counter_by_pair: _t.Dict[str, Decimal] = {}
 
-        # ── Rate counter ──────────────────────────────────────────────────
-        self.maxratecount: int = 125         # updated from executions ACK
-        self.rate_counter_by_pair: dict[str, int] = {}
-
-        # ── Zombie detection ──────────────────────────────────────────────
-        self._last_real_data_public: float = time.monotonic()
-        self._last_real_data_private: float = time.monotonic()
-
-        # ── Ping state ────────────────────────────────────────────────────
-        self._ping_req_id_pub: int | None = None
-        self._ping_req_id_priv: int | None = None
-        self._ping_sent_pub: float | None = None
-        self._ping_sent_priv: float | None = None
-        self._awaiting_pong_pub: bool = False
-        self._awaiting_pong_priv: bool = False
-
-        # ── req_id counter ────────────────────────────────────────────────
+        # Order tracking.
         self._req_id_counter: int = 0
-        self.req_id_registry: dict[int, dict] = {}
+        self._req_id_registry: _t.Dict[int, dict] = {}
 
-        # ── Selection Controller state (AR-073) ──────────────────────────
-        self.exit_cooldown_log: dict[str, float] = {}
-        self.consecutive_loss_count: dict[str, int] = {}
+        # Token (live only).
+        self._ws_token: _t.Optional[str] = None
 
-        # ── Reconnect control ─────────────────────────────────────────────
-        self._is_reconnecting: bool = False
-        self._reconnect_start_time: float | None = None
-        self._reconnect_attempt: int = 0
-        self._disconnect_time: float | None = None
-        # WM-RECONNECT-018: event gate so concurrent disconnect detection
-        # by both recv loops collapses to a single reconnect cycle. Set
-        # when no reconnect is in progress; cleared by _initiate_reconnect
-        # on entry and re-set in its finally block.
-        self._reconnect_done_event: asyncio.Event = asyncio.Event()
-        self._reconnect_done_event.set()
-        # WM-RECONNECT-018: terminal flag. Set by _initiate_reconnect when
-        # all attempts are exhausted. Prevents siblings from starting a
-        # second retry cycle while TaskGroup teardown is in flight.
+        # HTTP session (one per process lifetime; BP-HTTP-001..006).
+        self._http: _t.Optional[aiohttp.ClientSession] = None
+
+        # Coordination guards.
+        self._reconnect_done_events: _t.Dict[int, asyncio.Event] = {}
+        self._private_reconnect_done: asyncio.Event = asyncio.Event()
+        self._private_reconnect_done.set()
         self._fatal_reconnect_failure: bool = False
 
-        # ── Dispatch tables ───────────────────────────────────────────────
-        self._channel_dispatch: dict[str, Callable] = {}
-        self._exec_type_dispatch: dict[str, Callable] = {}
+        # Dispatch tables.
+        self._channel_dispatch: _t.Dict[str, _t.Callable[..., _t.Any]] = {}
+        self._exec_dispatch: _t.Dict[str, _t.Callable[..., _t.Any]] = {}
         self._setup_dispatch_tables()
 
-    # =================================================================
-    # DISPATCH TABLE SETUP — O(1) routing (AR-015)
-    # =================================================================
+        # Background task handles.
+        self._liquidity_refresh_task: _t.Optional[asyncio.Task] = None
+        self._daily_regime_task: _t.Optional[asyncio.Task] = None
+        self._shard_recv_tasks: _t.List[asyncio.Task] = []
+
+    # ----------------------------------------------------------
+    # Default logger fallback
+    # ----------------------------------------------------------
+
+    def _default_log(self, event: str, **fields: _t.Any) -> None:
+        """Last-resort logger - Logger module is the production sink."""
+        record = {"ts": _ts(), "component": "WS_MGR", "event": event, **fields}
+        try:
+            line = orjson.dumps(record, default=_json_default).decode()
+        except Exception:
+            line = f'{{"event": "{event}"}}'
+        # NOTE: production deployment installs Logger callable; this is
+        # a debug fallback for unit-test / standalone use.
+        # No stdout in production hot path (BP-LOG-001).
+        if os.environ.get("WS_MANAGER_DEFAULT_LOG_TO_STDERR") == "1":
+            import sys
+            print(line, file=sys.stderr)
+
+    # ----------------------------------------------------------
+    # Dispatch table setup (AR-015 / WM-DISP)
+    # ----------------------------------------------------------
 
     def _setup_dispatch_tables(self) -> None:
-        """Build O(1) dispatch tables for channel and exec_type routing."""
         self._channel_dispatch = {
-            "ohlc":       self._handle_ohlc,
-            "ticker":     self._handle_ticker,
+            "ohlc": self._handle_ohlc,
+            "ticker": self._handle_ticker,
             "instrument": self._handle_instrument,
-            "status":     self._handle_status,
+            "status": self._handle_status,
             "executions": self._handle_executions,
-            "balances":   self._handle_balances,
-            "pong":       self._handle_pong,
+            "balances": self._handle_balances,
         }
-        # All 10 exec_type values — HR-WM-006 (no silent drops)
-        self._exec_type_dispatch = {
-            "pending_new":    self._handle_pending_new,
-            "new":            self._handle_new,
-            "trade":          self._handle_trade,
-            "filled":         self._handle_filled,
+        self._exec_dispatch = {
+            "pending_new": self._handle_pending_new,
+            "new": self._handle_new,
+            "trade": self._handle_trade,
+            "filled": self._handle_filled,
             "iceberg_refill": self._handle_iceberg_refill,
-            "canceled":       self._handle_canceled,
-            "expired":        self._handle_expired,
-            "amended":        self._handle_amended,
-            "restated":       self._handle_restated,
-            "status":         self._handle_exec_status,
+            "canceled": self._handle_canceled,
+            "expired": self._handle_expired,
+            "amended": self._handle_amended,
+            "restated": self._handle_restated,
+            "status": self._handle_exec_status,
         }
 
-    # =================================================================
-    # REQUEST ID MANAGEMENT
-    # =================================================================
+    # ----------------------------------------------------------
+    # Helpers
+    # ----------------------------------------------------------
 
     def _next_req_id(self) -> int:
         self._req_id_counter += 1
         return self._req_id_counter
 
-    # =================================================================
-    # AIOHTTP SESSION FACTORY — BP-ASYNC-004
-    # =================================================================
-
     def _make_http_session(self) -> aiohttp.ClientSession:
+        """Build the shared aiohttp session (BP-HTTP / REST-HTTP-002)."""
         timeout = aiohttp.ClientTimeout(
-            total=REST_TOTAL_TIMEOUT,
-            connect=REST_CONNECT_TIMEOUT,
-            sock_read=REST_SOCK_READ_TIMEOUT,
+            total=REST_TIMEOUT_TOTAL_SEC,
+            connect=REST_TIMEOUT_CONNECT_SEC,
+            sock_read=REST_TIMEOUT_SOCK_READ_SEC,
         )
         connector = aiohttp.TCPConnector(
             limit=REST_CONNECTOR_LIMIT,
@@ -772,1683 +600,1584 @@ class WSManager:
         )
         return aiohttp.ClientSession(timeout=timeout, connector=connector)
 
-    # =================================================================
-    # REST CALLS
-    # =================================================================
+    @staticmethod
+    def _normalize_classic_key(key: str) -> str:
+        """Normalize Kraken classic name (XXBTZUSD -> XBTUSD)."""
+        if key.startswith("X") and "Z" in key[1:]:
+            base = key[1:].split("Z", 1)[0]
+            quote = key.split("Z", 1)[1] if "Z" in key else ""
+            if base and quote:
+                return f"{base}{quote}"
+        return key
+
+    # ----------------------------------------------------------
+    # REST signing helper (WM-REST-SIGN-001..003 / HR-WM-023)
+    # ----------------------------------------------------------
 
     def _sign_rest_request(
         self,
         url_path: str,
         data: dict,
         api_secret: str,
-    ) -> tuple[str, str]:
+    ) -> _t.Tuple[str, str]:
+        """Sole REST signing implementation (WM-REST-SIGN-002).
+
+        Returns (post_data_string, api_sign_b64). Caller MUST transmit
+        the returned post_data_string verbatim - re-encoding the dict
+        breaks the signature (WM-REST-SIGN-003).
         """
-        Compute Kraken REST private-call HMAC-SHA512 signature.
+        post_data = urllib.parse.urlencode(data)
+        nonce = data.get("nonce", "")
+        sha256 = hashlib.sha256((str(nonce) + post_data).encode("utf-8")).digest()
+        message = url_path.encode("utf-8") + sha256
+        secret_bytes = base64.b64decode(api_secret)
+        signature = hmac.new(secret_bytes, message, hashlib.sha512).digest()
+        return post_data, base64.b64encode(signature).decode()
 
-        Per 0411002 Kraken_REST_API_Specification dv1_1
-        REST-AUTH-001 and 1011002 WM-REST-SIGN-001 /
-        WM-REST-SIGN-002 / WM-REST-SIGN-003:
-
-            message   = URI_path +
-                        SHA256(nonce + POST_data_string)
-            signature = HMAC-SHA512(
-                          message,
-                          base64_decode(api_secret),
-                        )
-            API-Sign  = base64_encode(signature)
-
-        The returned `post_data_string` MUST be used
-        verbatim as the POST request body so the body
-        Kraken receives is byte-identical to the body the
-        signature was computed over. Any drift between the
-        signed data and the transmitted data produces
-        EAPI:Invalid key.
-
-        Args:
-            url_path:    REST URI path, e.g.
-                         "/0/private/GetWebSocketsToken".
-                         Must include leading slash and
-                         match the path segment of the
-                         final URL.
-            data:        POST data dict. Must contain
-                         "nonce" (millisecond epoch string).
-                         May contain other fields per the
-                         called endpoint's contract.
-            api_secret:  Base64-encoded Kraken API secret
-                         string from config.
-
-        Returns:
-            (post_data_string, signature_b64). The first
-            element is the urlencoded body that was signed
-            and MUST be used as the POST body. The second
-            element is the base64-encoded HMAC-SHA512
-            signature for the API-Sign header.
-
-        Raises:
-            KeyError: if `data` does not contain "nonce".
-            binascii.Error: if `api_secret` is not valid
-                base64.
-        """
-        nonce = data["nonce"]
-        post_data_string = urlencode(data)
-        encoded = (str(nonce) + post_data_string).encode("utf-8")
-        sha256_hash = hashlib.sha256(encoded).digest()
-        message = url_path.encode("utf-8") + sha256_hash
-        signature = hmac.new(
-            base64.b64decode(api_secret),
-            message,
-            hashlib.sha512,
-        )
-        signature_b64 = base64.b64encode(signature.digest()).decode("utf-8")
-        return post_data_string, signature_b64
+    # ----------------------------------------------------------
+    # REST endpoints (live-only paths gated on paper_mode)
+    # ----------------------------------------------------------
 
     async def _rest_get_ws_token(self) -> str:
-        """
-        Acquire WS auth token via REST (WM-TOKEN-001/002).
-        Uses TRADE API key. Valid 900 seconds.
-        Called at startup AND on every reconnect.
-
-        Signed per WM-REST-SIGN-001 / WM-REST-SIGN-002 /
-        WM-REST-SIGN-003 using _sign_rest_request().
-        """
-        trade_key = self._config["kraken_trade_api_key"]
-        trade_secret = self._config["kraken_trade_api_secret"]
+        """GetWebSocketsToken - TRADE key signed (WM-TOKEN / WM-REST-SIGN-001)."""
+        if self.paper_mode:
+            raise RuntimeError("_rest_get_ws_token must not be called in paper mode")
+        trade_key = os.environ["KRAKEN_TRADE_API_KEY"]
+        trade_secret = os.environ["KRAKEN_TRADE_API_SECRET"]
         url_path = "/0/private/GetWebSocketsToken"
         data = {"nonce": str(int(time.time() * 1000))}
-        post_data, signature = self._sign_rest_request(
-            url_path, data, trade_secret,
-        )
-
-        async with self._make_http_session() as session:
-            # Kraken REST GetWebSocketsToken (signed request)
-            resp = await session.post(
-                f"{REST_BASE_URL}{url_path}",
-                headers={
-                    "API-Key": trade_key,
-                    "API-Sign": signature,
-                    "Content-Type": "application/x-www-form-urlencoded",
-                },
-                data=post_data,
-            )
-            data_resp = orjson.loads(await resp.read())
-            if data_resp.get("error"):
-                raise RuntimeError(
-                    f"GetWebSocketsToken error: {data_resp['error']}"
-                )
-            token = data_resp["result"]["token"]
-        self._logger.info(log_record({
-            "event": "WS_TOKEN_ACQUIRED",
-            "level": "INFO",
-            "component": "WS_MGR",
-        }))
+        post_data, signature = self._sign_rest_request(url_path, data, trade_secret)
+        assert self._http is not None
+        async with self._http.post(
+            f"{REST_BASE_URL}{url_path}",
+            headers={
+                "API-Key": trade_key,
+                "API-Sign": signature,
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data=post_data,
+        ) as resp:
+            payload = await resp.json(loads=orjson.loads)
+        errors = payload.get("error") or []
+        if errors:
+            self._log("REST_ERROR", level="CRITICAL",
+                      endpoint="GetWebSocketsToken", errors=errors)
+            raise RuntimeError(f"GetWebSocketsToken failed: {errors}")
+        token = payload["result"]["token"]
+        self._log("WS_TOKEN_ACQUIRED", level="INFO")
         return token
 
-    async def _rest_get_ohlc(
-        self,
-        session: aiohttp.ClientSession,
-        symbol: str,
-        interval: int,
-    ) -> list[dict]:
-        """
-        Fetch OHLC candle history for indicator seeding.
-        Returns response[:-1] (excludes uncommitted candle — HR-WM-013).
-        Stagger 1.1s between calls to same pair (AR-036).
-        """
-        params = {"pair": symbol, "interval": interval}
-        resp = await session.get(
+    async def _rest_get_ohlc(self, pair: str, interval: int) -> list:
+        """Public OHLC fetch (REST-OHLC-001..009)."""
+        assert self._http is not None
+        kraken_pair = self._wsname_to_classic.get(pair, pair)
+        params = {"pair": kraken_pair, "interval": interval}
+        async with self._http.get(
             f"{REST_BASE_URL}/0/public/OHLC", params=params
-        )
-        data = orjson.loads(await resp.read())
-        if data.get("error"):
-            raise RuntimeError(
-                f"GetOHLCData({symbol}, {interval}) error: {data['error']}"
-            )
-        # Kraken wraps OHLC data under the pair key in result
-        pair_key = list(data["result"].keys())[0]
-        candles = data["result"][pair_key]
-        return candles[:-1]  # HR-WM-013: ALWAYS exclude response[-1]
+        ) as resp:
+            payload = await resp.json(loads=orjson.loads)
+        errors = payload.get("error") or []
+        if errors:
+            self._log("REST_ERROR", level="WARN",
+                      endpoint="GetOHLCData", pair=pair, errors=errors)
+            return []
+        result = payload.get("result", {})
+        for k, v in result.items():
+            if k == "last":
+                continue
+            return v
+        return []
 
     async def _rest_get_open_orders(self) -> dict:
-        """
-        REST GetOpenOrders - executions gap fallback (AR-035).
-
-        Signed per WM-REST-SIGN-001 / WM-REST-SIGN-002 /
-        WM-REST-SIGN-003 using _sign_rest_request().
-        """
-        trade_key = self._config["kraken_trade_api_key"]
-        trade_secret = self._config["kraken_trade_api_secret"]
+        """OpenOrders - TRADE key signed (live only)."""
+        if self.paper_mode:
+            return {}
+        trade_key = os.environ["KRAKEN_TRADE_API_KEY"]
+        trade_secret = os.environ["KRAKEN_TRADE_API_SECRET"]
         url_path = "/0/private/OpenOrders"
         data = {"nonce": str(int(time.time() * 1000))}
-        post_data, signature = self._sign_rest_request(
-            url_path, data, trade_secret,
-        )
-        async with self._make_http_session() as session:
-            resp = await session.post(
-                f"{REST_BASE_URL}{url_path}",
-                headers={
-                    "API-Key": trade_key,
-                    "API-Sign": signature,
-                    "Content-Type": "application/x-www-form-urlencoded",
-                },
-                data=post_data,
-            )
-            data_resp = orjson.loads(await resp.read())
-        return data_resp.get("result", {}).get("open", {})
+        post_data, signature = self._sign_rest_request(url_path, data, trade_secret)
+        assert self._http is not None
+        async with self._http.post(
+            f"{REST_BASE_URL}{url_path}",
+            headers={
+                "API-Key": trade_key,
+                "API-Sign": signature,
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data=post_data,
+        ) as resp:
+            payload = await resp.json(loads=orjson.loads)
+        errors = payload.get("error") or []
+        if errors:
+            self._log("REST_ERROR", level="CRITICAL",
+                      endpoint="OpenOrders", errors=errors)
+            return {}
+        return payload.get("result", {})
 
     async def _rest_get_account_balance(self) -> dict:
-        """
-        REST GetAccountBalance - balances gap fallback (AR-035).
-
-        Signed per WM-REST-SIGN-001 / WM-REST-SIGN-002 /
-        WM-REST-SIGN-003 using _sign_rest_request().
-        """
-        trade_key = self._config["kraken_trade_api_key"]
-        trade_secret = self._config["kraken_trade_api_secret"]
+        """Balance - TRADE key signed (live only)."""
+        if self.paper_mode:
+            return {}
+        trade_key = os.environ["KRAKEN_TRADE_API_KEY"]
+        trade_secret = os.environ["KRAKEN_TRADE_API_SECRET"]
         url_path = "/0/private/Balance"
         data = {"nonce": str(int(time.time() * 1000))}
-        post_data, signature = self._sign_rest_request(
-            url_path, data, trade_secret,
-        )
-        async with self._make_http_session() as session:
-            resp = await session.post(
-                f"{REST_BASE_URL}{url_path}",
-                headers={
-                    "API-Key": trade_key,
-                    "API-Sign": signature,
-                    "Content-Type": "application/x-www-form-urlencoded",
-                },
-                data=post_data,
-            )
-            data_resp = orjson.loads(await resp.read())
-        return data_resp.get("result", {})
+        post_data, signature = self._sign_rest_request(url_path, data, trade_secret)
+        assert self._http is not None
+        async with self._http.post(
+            f"{REST_BASE_URL}{url_path}",
+            headers={
+                "API-Key": trade_key,
+                "API-Sign": signature,
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data=post_data,
+        ) as resp:
+            payload = await resp.json(loads=orjson.loads)
+        errors = payload.get("error") or []
+        if errors:
+            self._log("REST_ERROR", level="CRITICAL",
+                      endpoint="Balance", errors=errors)
+            return {}
+        return payload.get("result", {})
 
     async def _rest_get_ticker(
-        self, candidates: list[str]
-    ) -> dict[str, Decimal]:
-        """
-        Fetch 24h USD volume via REST Ticker (WM-LIQ-002, REST-TKR-001 through -006).
-        Input: list of WS v2 pair names (e.g., ["BTC/USD", "ETH/USD"]).
-        Maps WS names → classic altnames via _wsname_to_classic (WM-LIQ-003).
-        Calls GET /0/public/Ticker — public, no auth required (REST-TKR-002).
-        Parses response: usd_vol = Decimal(v[1]) * Decimal(p[1]) per pair (REST-TKR-005).
-        Maps response keys back to WS names via _classic_to_wsname with normalization
-        to handle Kraken legacy key format (e.g. XXBTZUSD vs XBTUSD, WM-LIQ-003).
-        Returns dict[ws_name → usd_volume_24h]. All values are Decimal (HR-WM-008).
-        On error: logs LIQUIDITY_REFRESH_FAILED, returns empty dict (WM-LIQ-008a).
-        Never raises — caller handles empty dict as failure (WM-LIQ-008c).
-        """
+        self, candidates: _t.List[str]
+    ) -> _t.Dict[str, Decimal]:
+        """REST Ticker for 24h USD volume (WM-LIQ-002 / REST-TKR-001..010)."""
         if not candidates:
             return {}
-
-        # Map WS names → classic altnames for request (WM-LIQ-003)
-        altname_to_wsname: dict[str, str] = {}
+        classic_list: _t.List[str] = []
         for ws_name in candidates:
-            altname = self._wsname_to_classic.get(ws_name)
-            if not altname:
-                self._logger.warning(log_record({
-                    "event": "LIQUIDITY_PAIR_NOT_FOUND",
-                    "level": "WARN",
-                    "component": "WS_MGR",
-                    "pair": ws_name,
-                    "classic_name": "NO_MAPPING",
-                }))
-                continue
-            altname_to_wsname[altname] = ws_name
-
-        if not altname_to_wsname:
+            classic = self._wsname_to_classic.get(ws_name)
+            if classic:
+                classic_list.append(classic)
+        if not classic_list:
+            self._log("LIQUIDITY_REFRESH_FAILED", level="WARN",
+                      reason="no_classic_mappings")
             return {}
-
-        pair_str = ",".join(altname_to_wsname.keys())
-        result: dict[str, Decimal] = {}
-
+        result: _t.Dict[str, Decimal] = {}
         try:
-            async with self._make_http_session() as session:
-                resp = await session.get(
-                    f"{REST_BASE_URL}/0/public/Ticker",
-                    params={"pair": pair_str},
-                )
-                data = orjson.loads(await resp.read())
-
-            if data.get("error"):
-                raise RuntimeError(f"Ticker error: {data['error']}")
-
-            ticker_result = data.get("result", {})
-            for classic_key, ticker_data in ticker_result.items():
-                # Try direct lookup first (REST-TKR-006)
-                ws_name = self._classic_to_wsname.get(classic_key)
-                if ws_name is None:
-                    # Normalize: handle Kraken legacy XXBTZUSD → XBTUSD (WM-LIQ-003)
-                    normalized = self._normalize_classic_key(classic_key)
-                    ws_name = self._classic_to_wsname.get(normalized)
-                if ws_name is None:
-                    self._logger.warning(log_record({
-                        "event": "LIQUIDITY_PAIR_NOT_FOUND",
-                        "level": "WARN",
-                        "component": "WS_MGR",
-                        "pair": classic_key,
-                        "classic_name": classic_key,
-                    }))
+            assert self._http is not None
+            params = {"pair": ",".join(classic_list)}
+            async with self._http.get(
+                f"{REST_BASE_URL}/0/public/Ticker", params=params
+            ) as resp:
+                payload = await resp.json(loads=orjson.loads)
+            errors = payload.get("error") or []
+            if errors:
+                self._log("LIQUIDITY_REFRESH_FAILED",
+                          level="WARN", errors=errors)
+                return {}
+            for classic_key, info in payload.get("result", {}).items():
+                v = info.get("v") or []
+                p = info.get("p") or []
+                if len(v) < 2 or len(p) < 2:
                     continue
-
-                # Compute 24h USD volume: v[1] * p[1] (REST-TKR-005)
-                # v[1] = 24h base volume, p[1] = 24h VWAP in USD. Both strings.
-                v_24h = ticker_data.get("v", ["0", "0"])[1]
-                p_24h = ticker_data.get("p", ["0", "0"])[1]
-                usd_vol = Decimal(str(v_24h)) * Decimal(str(p_24h))
-                result[ws_name] = usd_vol
-
-            return result
-
-        except Exception as exc:  # noqa: BP-ERR-001
-            self._logger.warning(log_record({
-                "event": "LIQUIDITY_REFRESH_FAILED",
-                "level": "WARN",
-                "component": "WS_MGR",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "error": str(exc),
-            }))
+                try:
+                    usd_vol = Decimal(str(v[1])) * Decimal(str(p[1]))
+                except Exception:
+                    continue
+                ws_name = self._classic_to_wsname.get(classic_key)
+                if not ws_name:
+                    norm = self._normalize_classic_key(classic_key)
+                    ws_name = self._classic_to_wsname.get(norm)
+                if ws_name:
+                    result[ws_name] = usd_vol
+                else:
+                    self._log("LIQUIDITY_PAIR_NOT_FOUND", level="WARN",
+                              pair="", classic_name=classic_key)
+        except Exception as e:
+            self._log("LIQUIDITY_REFRESH_FAILED",
+                      level="WARN", error=str(e))
             return {}
+        return result
 
-    @staticmethod
-    def _normalize_classic_key(key: str) -> str:
-        """
-        Normalize Kraken classic Ticker response key to altname form (WM-LIQ-003).
-        Handles Kraken legacy X/Z prefix scheme: XXBTZUSD → XBTUSD.
-        Strips Z-prefix from fiat quote (ZUSD→USD) and leading X-prefix from
-        legacy crypto base (XXBT→XBT, XETH→ETH).
-        Required because REST Ticker response uses full classic names
-        while instrument snapshot altname field uses shorter altnames.
-        """
-        _Z_FIATS = ("ZUSD", "ZEUR", "ZGBP", "ZCAD", "ZJPY", "ZCHF", "ZAUD")
-        for z_fiat in _Z_FIATS:
-            if key.endswith(z_fiat):
-                base_part = key[: -len(z_fiat)]
-                fiat_part = z_fiat[1:]  # strip Z prefix (e.g. ZUSD → USD)
-                if base_part.startswith("X"):
-                    base_part = base_part[1:]  # strip X from legacy crypto (e.g. XXBT→XBT, XETH→ETH)
-                return base_part + fiat_part
-        return key
+    async def _rest_build_pair_maps(self) -> None:
+        """AssetPairs -> wsname<->classic map (WM-LIQ-011)."""
+        try:
+            assert self._http is not None
+            async with self._http.get(
+                f"{REST_BASE_URL}/0/public/AssetPairs"
+            ) as resp:
+                payload = await resp.json(loads=orjson.loads)
+            errors = payload.get("error") or []
+            if errors:
+                self._log("PAIR_MAP_BUILD_FAILED",
+                          level="WARN", reason=str(errors))
+                return
+            count = 0
+            for classic_key, info in payload.get("result", {}).items():
+                altname = info.get("altname", "")
+                wsname_raw = info.get("wsname", "")
+                if not altname or not wsname_raw:
+                    continue
+                ws_v2_name = (
+                    wsname_raw.replace("XBT/", "BTC/").replace("/XBT", "/BTC")
+                )
+                if ws_v2_name in self.pair_cache:
+                    self._wsname_to_classic[ws_v2_name] = altname
+                    self._classic_to_wsname[altname] = ws_v2_name
+                    norm = self._normalize_classic_key(classic_key)
+                    self._classic_to_wsname[norm] = ws_v2_name
+                    self._classic_to_wsname[classic_key] = ws_v2_name
+                    count += 1
+                elif wsname_raw in self.pair_cache:
+                    self._wsname_to_classic[wsname_raw] = altname
+                    self._classic_to_wsname[altname] = wsname_raw
+                    self._classic_to_wsname[classic_key] = wsname_raw
+                    count += 1
+            self._log("PAIR_MAPS_BUILT", level="INFO", pairs_mapped=count)
+        except Exception as e:
+            self._log("PAIR_MAP_BUILD_FAILED", level="WARN", reason=str(e))
 
-    # =================================================================
-    # WS CONNECTION — WM-CONN-002 template
-    # =================================================================
+    # ----------------------------------------------------------
+    # WS connection low-level
+    # ----------------------------------------------------------
 
-    async def _ws_connect(self, uri: str) -> Any:
-        """
-        Create WS connection with required parameters (WM-CONN-002).
-        max_queue=None: unlimited (AR-058).
-        ping_interval=None: library TCP PING disabled (AR-059, HR-WM-003).
-        max_size=10MB (AR-029). open_timeout=10s (AR-029).
-        """
-        return await connect(
+    async def _ws_connect_one(self, uri: str) -> _t.Any:
+        """Open a single WS connection per WM-CONN-002 / WS-LIB-002..004."""
+        return await _ws_connect_factory(
             uri,
-            max_size=WS_MAX_SIZE,
-            open_timeout=WS_OPEN_TIMEOUT,
-            max_queue=None,       # HR-WM-002 — prevents burst-event drops
-            ping_interval=None,   # HR-WM-003 — app-level JSON ping only
+            max_size=WS_MAX_SIZE_BYTES,
+            open_timeout=WS_OPEN_TIMEOUT_SEC,
+            max_queue=None,
+            ping_interval=None,
         )
 
-    # =================================================================
-    # WS SEND HELPERS
-    # =================================================================
-
-    async def _send_public(self, payload: dict) -> None:
-        """
-        Send JSON message on public WS connection.
-
-        WM-RECONNECT-016: a transient disconnect raised by ws.send() is
-        caught locally. The send is lost (the process does not terminate);
-        SEND_DISCONNECT and RECONNECT_TRIGGERED are logged; an orderly
-        reconnect is scheduled as a background task so the caller is not
-        blocked. Compare to pre-dv1_20 behavior where this raise
-        propagated out of the caller (e.g. _ping_loop) into the
-        _main_loop TaskGroup and crashed the process.
-        """
+    async def _send_shard(self, shard: WSShard, payload: dict) -> None:
+        """Send a payload to a specific shard, swallowing transient disconnects."""
+        if shard.connection is None or shard.in_reconnect:
+            return
         try:
-            await self._ws_public.send(
-                orjson.dumps(payload).decode()
+            await shard.connection.send(orjson.dumps(payload).decode())
+        except Exception as e:
+            self._log("RECONNECT_TRIGGERED", level="HIGH",
+                      source="_send_shard",
+                      error_type=type(e).__name__,
+                      shard_index=shard.shard_index)
+            asyncio.create_task(
+                self._initiate_reconnect_shard(shard.shard_index)
             )
-        except _TRANSIENT_WS_ERRORS as exc:
-            self._logger.warning(log_record({
-                "event": "SEND_DISCONNECT",
-                "level": "HIGH",
-                "component": "WS_MGR",
-                "endpoint": "public",
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-            }))
-            self._logger.warning(log_record({
-                "event": "RECONNECT_TRIGGERED",
-                "level": "HIGH",
-                "component": "WS_MGR",
-                "source": "_send_public",
-                "error_type": type(exc).__name__,
-            }))
-            if not self._is_reconnecting and not self._fatal_reconnect_failure:
-                asyncio.create_task(self._initiate_reconnect())
 
     async def _send_private(self, payload: dict) -> None:
-        """
-        Send JSON message on private WS connection.
-
-        WM-RECONNECT-016: same transient-catch behavior as _send_public.
-        A failed private send during CloudFlare cycling is logged and
-        swallowed; reconnect is scheduled; the process does not terminate.
-        """
-        try:
-            await self._ws_private.send(
-                orjson.dumps(payload).decode()
-            )
-        except _TRANSIENT_WS_ERRORS as exc:
-            self._logger.warning(log_record({
-                "event": "SEND_DISCONNECT",
-                "level": "HIGH",
-                "component": "WS_MGR",
-                "endpoint": "private",
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-            }))
-            self._logger.warning(log_record({
-                "event": "RECONNECT_TRIGGERED",
-                "level": "HIGH",
-                "component": "WS_MGR",
-                "source": "_send_private",
-                "error_type": type(exc).__name__,
-            }))
-            if not self._is_reconnecting and not self._fatal_reconnect_failure:
-                asyncio.create_task(self._initiate_reconnect())
-
-    # =================================================================
-    # SUBSCRIPTIONS
-    # =================================================================
-
-    async def _subscribe_public(self) -> None:
-        """
-        Subscribe all public channels.
-        Steps 2-5 from 1011014 startup sequence.
-        Parse warnings[] on every ACK (HR-WM-019).
-        """
-        # instrument — pair specs + status cache
-        await self._send_public({
-            "method": "subscribe",
-            "params": {"channel": "instrument"},
-        })
-        # status — engine state + connection_id
-        await self._send_public({
-            "method": "subscribe",
-            "params": {"channel": "status"},
-        })
-        # ohlc subscribed in _handle_instrument after monitored_universe is built
-        # Kraken WS v2 ohlc requires a symbol list — subscribing without one fails
-        # Ticker subscriptions managed per-pair after warm-up
-        # (Section 16 — event_trigger mode per position state)
-
-    async def _subscribe_ohlc_channels(self) -> None:
-        """
-        Subscribe ohlc(5) for monitored universe.
-        Called from _handle_instrument after snapshot builds monitored_universe.
-        Kraken WS v2 ohlc requires a symbol list — cannot subscribe without one.
-
-        NOTE: ohlc(60) NOT subscribed via WS. Kraken WS v2 rejects a second
-        ohlc interval per symbol: "Already subscribed to one ohlc interval on
-        this symbol." (OI-NEW-001 confirmed.) 1H HTF cache sourced from REST
-        only via seed_indicators_from_rest() (HR-WM-021).
-
-        After subscription: triggers REST warm-up for all pairs (WM-WARMUP-001).
-        Paper mode: identical path. No difference from live mode.
-        """
-        if not self.monitored_universe:
-            self._logger.warning(log_record({
-                "event": "OHLC_SUBSCRIBE_SKIPPED",
-                "level": "WARN",
-                "component": "WS_MGR",
-                "note": "monitored_universe empty — ohlc not subscribed",
-            }))
+        if self.paper_mode or self._ws_private is None or self._private_in_reconnect:
             return
-        await self._send_public({
-            "method": "subscribe",
-            "params": {
-                "channel": "ohlc",
-                "interval": 5,
-                "symbol": self.monitored_universe,
-            },
-        })
-        self._logger.info(log_record({
-            "event": "OHLC_SUBSCRIBED",
-            "level": "INFO",
-            "component": "WS_MGR",
-            "pairs": len(self.monitored_universe),
-            "intervals": [5],
-            "note": "interval=60 not subscribed — REST-only per HR-WM-021",
-        }))
-        # Trigger REST warm-up for all pairs immediately after subscription
-        # (DEFECT-SS-004 fix / WM-WARMUP-001). Runs as concurrent asyncio task.
-        asyncio.create_task(self._warm_up_all_pairs())
+        try:
+            await self._ws_private.send(orjson.dumps(payload).decode())
+        except Exception as e:
+            self._log("RECONNECT_TRIGGERED", level="HIGH",
+                      source="_send_private",
+                      error_type=type(e).__name__)
+            asyncio.create_task(self._initiate_reconnect_private())
 
-    async def _subscribe_private(self) -> None:
-        """
-        Subscribe private channels.
-        order_status:true MANDATORY (HR-WM-005, AR-026).
-        ratecounter:true for CIATS EWMA Monitor stream A-1.
-        Parse warnings[] and extract maxratecount from executions ACK.
-        """
-        await self._send_private({
-            "method": "subscribe",
-            "params": {
-                "channel": "executions",
-                "token": self._ws_token,
-                "order_status": True,     # HR-WM-005 — MANDATORY
-                "ratecounter": True,      # AR-030
-                "snapshot": True,
-            },
-        })
-        await self._send_private({
-            "method": "subscribe",
-            "params": {
-                "channel": "balances",
-                "token": self._ws_token,
-                "snapshot": True,
-            },
-        })
+    # ----------------------------------------------------------
+    # Subscribe primitives - every call passes through bucket
+    # ----------------------------------------------------------
 
-    async def _subscribe_ticker_pair(
-        self, symbol: str, event_trigger: str = "trades"
+    async def _subscribe_on_shard(
+        self,
+        shard: WSShard,
+        channel: str,
+        symbols: _t.Optional[_t.List[str]] = None,
+        extra: _t.Optional[dict] = None,
     ) -> None:
-        """
-        Subscribe ticker for a single pair with given event_trigger.
-        Section 16: bbo for open positions, trades for no-position pairs.
-        """
-        await self._send_public({
+        """Send a subscribe to a shard (HR-WM-032: bucket-bound)."""
+        token_label = symbols[0] if symbols else channel
+        await self.subscribe_bucket.acquire(channel=channel, symbol=token_label)
+        params: _t.Dict[str, _t.Any] = {"channel": channel}
+        if symbols is not None:
+            params["symbol"] = symbols
+        if extra:
+            params.update(extra)
+        payload = {
             "method": "subscribe",
-            "params": {
-                "channel": "ticker",
-                "symbol": [symbol],
-                "event_trigger": event_trigger,
-            },
-        })
+            "params": params,
+            "req_id": self._next_req_id(),
+        }
+        await self._send_shard(shard, payload)
 
-    async def _update_ticker_event_trigger(
-        self, symbol: str, event_trigger: str
-    ) -> None:
-        """
-        Switch ticker event_trigger mode immediately on position state change.
-        Section 16: On position open → bbo. On position close → trades.
-        """
-        # Unsubscribe current, resubscribe with new trigger
-        await self._send_public({
-            "method": "unsubscribe",
-            "params": {
-                "channel": "ticker",
-                "symbol": [symbol],
-            },
-        })
-        await self._subscribe_ticker_pair(symbol, event_trigger)
+    async def _subscribe_private(self, channel: str, extra: dict) -> None:
+        """Authenticated channel subscribe (live only; bucket-bound)."""
+        if self.paper_mode:
+            return
+        await self.subscribe_bucket.acquire(channel=channel)
+        params: _t.Dict[str, _t.Any] = {"channel": channel, **extra}
+        payload = {
+            "method": "subscribe",
+            "params": params,
+            "req_id": self._next_req_id(),
+        }
+        await self._send_private(payload)
 
-    # =================================================================
-    # MAIN ENTRY POINT — called by 1011014 startup sequence
-    # =================================================================
+    # ----------------------------------------------------------
+    # Top-level run() - entry point
+    # ----------------------------------------------------------
 
     async def run(self) -> None:
-        """
-        Main WS Manager loop. Called once by startup sequence after
-        initialization is complete. Runs until fatal failure or shutdown.
-        """
+        """Top-level entry. Performs startup, then runs main loop."""
+        self._http = self._make_http_session()
         try:
-            await self._startup_connect_and_subscribe()
+            await self._startup()
             await self._main_loop()
-        except Exception as exc:
-            # WM-RUN-001: Extract ExceptionGroup sub-exceptions (Python 3.11+
-            # TaskGroup raises ExceptionGroup — str(exc) only shows outer wrapper).
+        except BaseException as exc:
             tb_str = traceback.format_exc()
-            sub_msgs: list[str] = []
-            if isinstance(exc, ExceptionGroup):
-                for i, sub in enumerate(exc.exceptions):
-                    sub_tb = "".join(traceback.format_tb(sub.__traceback__))
-                    sub_msgs.append(
-                        f"[{i}] {type(sub).__name__}: {sub} | tb: {sub_tb}"
-                    )
-            self._logger.critical(log_record({
-                "event": "WS_MGR_FATAL",
-                "level": "CRITICAL",
-                "component": "WS_MGR",
-                "error": str(exc),
-                "traceback": tb_str[-2000:],
-                "sub_exceptions": sub_msgs or None,
-            }))
-            _alert_operator_direct(
-                f"WS Manager fatal error: {type(exc).__name__}: {exc}. "
-                f"systemd will restart."
+            sub_msgs: _t.List[str] = []
+            try:
+                # Python 3.11+: ExceptionGroup is built-in.
+                eg_type = BaseExceptionGroup  # type: ignore[name-defined]
+                if isinstance(exc, eg_type):
+                    for i, sub in enumerate(exc.exceptions):
+                        sub_tb = "".join(
+                            traceback.format_tb(sub.__traceback__)
+                        )
+                        sub_msgs.append(
+                            f"[{i}] {type(sub).__name__}: {sub} | tb: {sub_tb}"
+                        )
+            except NameError:
+                pass
+            self._log(
+                "WS_MGR_FATAL", level="CRITICAL",
+                error=str(exc),
+                traceback=tb_str[-2000:],
+                sub_exceptions=sub_msgs or None,
             )
+            try:
+                self._alert_fn(
+                    "CRITICAL",
+                    f"WS_MGR_FATAL: {type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                pass
             raise
+        finally:
+            await self._shutdown()
 
-    async def _startup_connect_and_subscribe(self) -> None:
-        """
-        Execute startup connection and subscription sequence.
-        Steps 1-5 per 1011014. Indicator seeding (7a/7b) called separately.
-        Paper mode: skip private WS entirely — no auth needed.
-        FIX-WM-PT-001: gate private WS on paper_mode (DEFECT-WM-PT-002).
-        """
+    async def _shutdown(self) -> None:
+        """Best-effort cleanup of connections + http session."""
+        for shard in self.shards:
+            try:
+                if shard.connection is not None:
+                    await shard.connection.close()
+            except Exception:
+                pass
+        try:
+            if self._ws_private is not None:
+                await self._ws_private.close()
+        except Exception:
+            pass
+        if self._http is not None:
+            try:
+                await self._http.close()
+            except Exception:
+                pass
+
+    # ----------------------------------------------------------
+    # Startup sequence (1011014 + §4.5)
+    # ----------------------------------------------------------
+
+    async def _startup(self) -> None:
+        """Steps 0..11 from 0511001 dv1_4 §4 / WM-STARTUP-001."""
+        self._log("VPS_STARTUP_BEGIN", level="INFO", paper_mode=self.paper_mode)
+
+        # Step 0: Kraken Status maintenance check (AR-038 / VD-STAT).
+        await self._check_kraken_maintenance()
+
+        # Step 1: Acquire WS token (live only).
+        if not self.paper_mode:
+            self._ws_token = await self._rest_get_ws_token()
+
+        # Step 2: Open shard 0 (provisional N_conns=1; full sharding after Step 4).
+        first_shard_conn = await self._ws_connect_one(PUBLIC_WS_URI)
+        first_shard = WSShard(
+            shard_index=0,
+            connection=first_shard_conn,
+        )
+        self.shards = [first_shard]
+        self._reconnect_done_events[0] = asyncio.Event()
+        self._reconnect_done_events[0].set()
+        self._log("WS_CONNECTED", level="INFO",
+                  endpoint="public", shard_index=0)
+
+        # Start shard-0 recv loop now so we can receive ACKs.
+        first_shard_recv_task = asyncio.create_task(
+            self._recv_loop_shard(first_shard),
+            name=f"shard_{0}_recv",
+        )
+        self._shard_recv_tasks = [first_shard_recv_task]
+
+        # Step 3: instrument + Step 5: status - connection-wide on shard 0.
+        await self._subscribe_on_shard(
+            first_shard, "instrument", extra={"snapshot": True}
+        )
+        await self._subscribe_on_shard(
+            first_shard, "status", extra={"snapshot": True}
+        )
+
+        # Wait for instrument snapshot to populate pair_cache.
+        await self._wait_for_instrument_snapshot()
+
+        # Step 4: REST AssetPairs map + REST Ticker liquidity filter.
+        await self._rest_build_pair_maps()
+        all_candidates = self._build_initial_candidates()
+        self.liquidity_24h = await self._rest_get_ticker(all_candidates)
+        self._log("LIQUIDITY_SEEDED", level="INFO",
+                  pairs_count=len(self.liquidity_24h))
+
+        # Build tradeable_universe (D-03/D-04/D-08).
+        self._build_tradeable_universe()
+        self._log("UNIVERSE_BUILT", level="INFO",
+                  pairs=len(self.tradeable_universe))
+
+        # Step 5a: SHARDING.
+        await self._compute_and_connect_remaining_shards()
+
+        # Step 6: ohlc(5) per pair, dispatched to assigned shard.
+        await self._subscribe_ohlc_5m_all_pairs()
+
+        # Step 7: ticker per pair.
+        await self._subscribe_ticker_all_pairs()
+
+        # Step 8: Indicator warm-up + regime startup seed.
+        await self._warm_up_all_pairs()
+
+        # Step 9 (live): private WS connect; Step 9b (paper): set balance.
         if self.paper_mode:
-            # Paper mode: private WS not needed — order dispatch suppressed.
-            # Set paper trading balance from config (default $10,000).
-            paper_balance = Decimal(str(
-                self._config.get("paper_trading_balance", "10000")
+            self.spot_usd_balance = Decimal(str(
+                self._cfg.get("paper_starting_balance",
+                              PAPER_STARTING_BALANCE_DEFAULT)
             ))
-            self.spot_usd_balance = paper_balance
-            self.portfolio_baseline_USD = paper_balance
-            self._logger.info(log_record({
-                "event": "PAPER_BALANCE_SET",
-                "level": "INFO",
-                "component": "WS_MGR",
-                "balance_usd": str(paper_balance),
-                "note": "Private WS skipped — paper mode active",
-            }))
-            # Connect public WS only
-            self._ws_public = await self._ws_connect(PUBLIC_WS_URI)
-            await self._subscribe_public()
-            # Reset zombie timer — clock starts from connection live, not __init__
-            self._last_real_data_public = time.monotonic()
+            self.portfolio_baseline_USD = self.spot_usd_balance
+            self._log("PAPER_BALANCE_SET", level="INFO",
+                      balance=self.spot_usd_balance)
+        else:
+            await self._connect_private_and_subscribe()
+
+        # Liquidity refresh task (both modes).
+        self._liquidity_refresh_task = asyncio.create_task(
+            self._liquidity_refresh_loop(),
+            name="liquidity_refresh",
+        )
+
+        # sd_notify READY=1 only after all subscribes acked + warm-up done.
+        if self._sd_notify_ready_fn is not None:
+            try:
+                self._sd_notify_ready_fn()
+            except Exception:
+                pass
+        self._log("VPS_STARTUP_COMPLETE", level="INFO")
+        self._log("SYSTEM_OPERATIONAL", level="INFO")
+
+    async def _check_kraken_maintenance(self) -> None:
+        try:
+            assert self._http is not None
+            async with self._http.get(KRAKEN_STATUS_URL) as resp:
+                data = await resp.json(loads=orjson.loads)
+            maintenances = data.get("scheduled_maintenances", [])
+            now = datetime.now(timezone.utc)
+            warn_threshold = now + timedelta(hours=2)
+            clean = True
+            for m in maintenances:
+                start_str = m.get("scheduled_for", "")
+                if not start_str:
+                    continue
+                start_time = datetime.fromisoformat(
+                    start_str.replace("Z", "+00:00"))
+                if start_time <= warn_threshold:
+                    clean = False
+                    self._log(
+                        "KRAKEN_MAINTENANCE_SCHEDULED",
+                        level="CRITICAL",
+                        within_hours=round(
+                            (start_time - now).total_seconds() / 3600, 1),
+                        description=m.get("name", ""),
+                    )
+                    try:
+                        self._alert_fn(
+                            "CRITICAL",
+                            f"Kraken maintenance in <2 hrs: "
+                            f"{m.get('name','')} at {start_time}",
+                        )
+                    except Exception:
+                        pass
+            if clean:
+                self._log("KRAKEN_STATUS_CLEAN", level="INFO")
+        except Exception as e:
+            self._log("KRAKEN_STATUS_CHECK_FAILED",
+                      level="INFO", error=str(e))
+
+    # ----------------------------------------------------------
+    # Universe building (WM-PS-001..008 / HR-WM-027 / D-03 D-04 D-08)
+    # ----------------------------------------------------------
+
+    async def _wait_for_instrument_snapshot(
+        self, timeout_sec: float = 30.0
+    ) -> None:
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            if self.pair_cache:
+                return
+            await asyncio.sleep(0.1)
+        self._log("INSTRUMENT_SNAPSHOT_TIMEOUT",
+                  level="CRITICAL", timeout_sec=timeout_sec)
+        raise RuntimeError("Instrument snapshot did not arrive within timeout")
+
+    def _build_initial_candidates(self) -> _t.List[str]:
+        """All online USD/USDC/USDT pairs in pair_cache (no volume filter yet)."""
+        candidates: _t.List[str] = []
+        for symbol, info in self.pair_cache.items():
+            if info.get("status") != "online":
+                continue
+            quote = info.get("quote_currency", "")
+            if quote not in ALLOWED_QUOTE_CURRENCIES:
+                continue
+            candidates.append(symbol)
+        return candidates
+
+    def _build_tradeable_universe(self) -> None:
+        """Apply D-03 + D-04 (volume) filter to produce tradeable_universe.
+
+        WM-PS-002/003/006 + HR-WM-027 + WM-PS-008. AR-070 silent-narrowing
+        prohibition: this is the ONLY code path that mutates
+        tradeable_universe; subsequent runtime code reads but never mutates.
+        """
+        min_volume = Decimal(str(self._cfg.get(
+            "min_volume_usd_daily", MIN_VOLUME_USD_DAILY_DEFAULT
+        )))
+        new_universe: _t.Set[str] = set()
+        for symbol, info in self.pair_cache.items():
+            if info.get("status") != "online":
+                continue
+            quote = info.get("quote_currency", "")
+            if quote not in ALLOWED_QUOTE_CURRENCIES:
+                continue
+            usd_vol = self.liquidity_24h.get(symbol, Decimal("0"))
+            if usd_vol >= min_volume:
+                new_universe.add(symbol)
+        # AR-074: regime_anchor (BTC/USD) ALWAYS included regardless of volume.
+        if (REGIME_ANCHOR in self.pair_cache and
+                self.pair_cache[REGIME_ANCHOR].get("status") == "online"):
+            new_universe.add(REGIME_ANCHOR)
+        # D-08 LOCKED: NO Top-N cap.
+        self.tradeable_universe = new_universe
+        for symbol in self.tradeable_universe:
+            self.warm_up_state.setdefault(symbol, "WARM_UP")
+
+    # ----------------------------------------------------------
+    # Sharding (§4.6 WM-SHARD-001..011)
+    # ----------------------------------------------------------
+
+    async def _compute_and_connect_remaining_shards(self) -> None:
+        """WM-SHARD-001..004: compute N_conns, parallel-connect."""
+        universe_size = len(self.tradeable_universe)
+        assert self.symbols_per_conn_safe > 0
+        if universe_size == 0:
+            self._log("EMPTY_TRADEABLE_UNIVERSE", level="CRITICAL")
+            raise RuntimeError("tradeable_universe is empty after filter")
+        n_conns = max(1, math.ceil(universe_size / self.symbols_per_conn_safe))
+
+        sorted_universe = sorted(self.tradeable_universe)
+        self.pair_to_shard_index = {
+            pair: i % n_conns for i, pair in enumerate(sorted_universe)
+        }
+
+        # Shard 0 was opened in Step 2. Add its symbol partition now.
+        self.shards[0].symbols = [
+            p for p in sorted_universe
+            if self.pair_to_shard_index[p] == 0
+        ]
+        for p in self.shards[0].symbols:
+            self.shards[0].pair_states[p] = PairState.INITIAL
+
+        if n_conns == 1:
             return
 
-        # Step 1: Acquire WS auth token
-        self._ws_token = await self._rest_get_ws_token()
+        async def _connect_extra(idx: int) -> WSShard:
+            conn = await self._ws_connect_one(PUBLIC_WS_URI)
+            self._log("WS_CONNECTED", level="INFO",
+                      endpoint="public", shard_index=idx)
+            shard = WSShard(shard_index=idx, connection=conn)
+            shard.symbols = [
+                p for p in sorted_universe
+                if self.pair_to_shard_index[p] == idx
+            ]
+            for p in shard.symbols:
+                shard.pair_states[p] = PairState.INITIAL
+            self._reconnect_done_events[idx] = asyncio.Event()
+            self._reconnect_done_events[idx].set()
+            return shard
 
-        # Steps 2-3: Connect public and private WS
-        self._ws_public = await self._ws_connect(PUBLIC_WS_URI)
-        self._ws_private = await self._ws_connect(PRIVATE_WS_URI)
+        new_shards = await asyncio.gather(
+            *[_connect_extra(i) for i in range(1, n_conns)],
+            return_exceptions=False,
+        )
+        self.shards.extend(new_shards)
 
-        # Step 4: Subscribe all channels
-        await self._subscribe_public()
-        await self._subscribe_private()
-        # Reset zombie timers — clock starts from connection live, not __init__
-        self._last_real_data_public = time.monotonic()
-        self._last_real_data_private = time.monotonic()
+    # ----------------------------------------------------------
+    # ohlc + ticker subscribe (per-pair, dispatch to shard)
+    # ----------------------------------------------------------
+
+    async def _subscribe_ohlc_5m_all_pairs(self) -> None:
+        """ohlc(5) per pair -> assigned shard. Bucket-bound. WM-PACE-004."""
+        for symbol in sorted(self.tradeable_universe):
+            shard = self.shards[self.pair_to_shard_index[symbol]]
+            await self._subscribe_on_shard(
+                shard,
+                "ohlc",
+                symbols=[symbol],
+                extra={"interval": 5, "snapshot": True},
+            )
+            shard.pair_states[symbol] = PairState.SUBSCRIBED
+            self._arm_silent_timer(shard, symbol)
+
+    async def _subscribe_ticker_all_pairs(self) -> None:
+        """ticker per pair -> assigned shard. event_trigger per state."""
+        for symbol in sorted(self.tradeable_universe):
+            shard = self.shards[self.pair_to_shard_index[symbol]]
+            trigger = self._ticker_trigger_for(symbol)
+            await self._subscribe_on_shard(
+                shard,
+                "ticker",
+                symbols=[symbol],
+                extra={"event_trigger": trigger, "snapshot": True},
+            )
+
+    def _ticker_trigger_for(self, symbol: str) -> str:
+        """bbo for pairs with positions; trades otherwise (AR-034)."""
+        if symbol in self.position_mirror:
+            return "bbo"
+        return "trades"
+
+    async def _update_ticker_event_trigger(self, symbol: str, trigger: str) -> None:
+        """Re-subscribe ticker for a pair on position state change (AR-034)."""
+        shard_idx = self.pair_to_shard_index.get(symbol)
+        if shard_idx is None:
+            return
+        shard = self.shards[shard_idx]
+        await self._subscribe_on_shard(
+            shard,
+            "ticker",
+            symbols=[symbol],
+            extra={"event_trigger": trigger, "snapshot": True},
+        )
+
+    # ----------------------------------------------------------
+    # Silent-pair state machine (WM-SHARD-010 / HR-WM-030)
+    # ----------------------------------------------------------
+
+    def _arm_silent_timer(self, shard: WSShard, symbol: str) -> None:
+        """Start T_silent timer for one pair; cancel any prior timer."""
+        prev = shard.silent_timer_tasks.get(symbol)
+        if prev is not None and not prev.done():
+            prev.cancel()
+        shard.silent_timer_tasks[symbol] = asyncio.create_task(
+            self._silent_timer_task(shard, symbol),
+            name=f"silent_{shard.shard_index}_{symbol}",
+        )
+
+    async def _silent_timer_task(self, shard: WSShard, symbol: str) -> None:
+        try:
+            await asyncio.sleep(T_SILENT_SEC)
+        except asyncio.CancelledError:
+            return
+        if shard.pair_states.get(symbol) == PairState.SUBSCRIBED:
+            shard.pair_states[symbol] = PairState.DATA_PENDING
+            shard.data_pending_at[symbol] = time.monotonic()
+            self._log("PAIR_DATA_PENDING", level="INFO",
+                      pair=symbol, shard=shard.shard_index)
+
+    def _on_pair_data_received(self, shard: WSShard, symbol: str) -> None:
+        """Handler-side state transition on first/subsequent data."""
+        prev = shard.pair_states.get(symbol)
+        shard.pair_states[symbol] = PairState.DATA_READY
+        if prev == PairState.DATA_PENDING:
+            data_pending_age = (
+                time.monotonic() - shard.data_pending_at.pop(symbol, 0.0)
+            )
+            self._log("PAIR_DATA_READY_RECOVERED", level="INFO",
+                      pair=symbol, shard=shard.shard_index,
+                      data_pending_age_sec=round(data_pending_age, 2))
+        timer = shard.silent_timer_tasks.pop(symbol, None)
+        if timer is not None and not timer.done():
+            timer.cancel()
+
+    # ----------------------------------------------------------
+    # Indicator warm-up (WM-WARMUP-001..004 / AR-044 / AR-068)
+    # ----------------------------------------------------------
+
+    async def _warm_up_all_pairs(self) -> None:
+        symbols = sorted(self.tradeable_universe)
+        if not symbols:
+            self._log("WARMUP_REST_NO_PAIRS", level="WARN")
+            return
+        self._log("WARMUP_REST_STARTED", level="INFO", pairs=len(symbols))
+
+        async def _seed(sym: str) -> bool:
+            try:
+                await self.seed_indicators_from_rest(sym)
+                return True
+            except Exception as e:
+                self._log("WARMUP_REST_FAILED", level="WARN",
+                          pair=sym, error=str(e))
+                return False
+
+        results = await asyncio.gather(
+            *[_seed(s) for s in symbols], return_exceptions=True
+        )
+        ready_count = sum(1 for r in results if r is True)
+        self._log("WARMUP_REST_COMPLETE", level="INFO",
+                  ready_pairs=ready_count, total_pairs=len(symbols))
+
+        # WM-WARMUP-004: regime startup seed BEFORE SYSTEM_OPERATIONAL.
+        if self._regime_engine_fn is not None:
+            await self._trigger_daily_regime_refresh()
+
+    async def seed_indicators_from_rest(self, symbol: str) -> None:
+        """Seed all 5 SSS indicators + HTF EMA from REST OHLC."""
+        candles_5m = await self._rest_get_ohlc(symbol, interval=5)
+        if not candles_5m:
+            raise RuntimeError(f"no 5m candles returned for {symbol}")
+        self._seed_5m_indicators(symbol, candles_5m[:-1])
+        await asyncio.sleep(REST_PAIR_STAGGER_SEC)
+        candles_60m = await self._rest_get_ohlc(symbol, interval=60)
+        if candles_60m:
+            self._seed_htf_ema(symbol, candles_60m[:-1])
+        if (self.atr_14.get(symbol) is not None
+                and self.rsi_14_avg_gain.get(symbol) is not None
+                and self.ema_9.get(symbol) is not None
+                and self.ema_21.get(symbol) is not None
+                and self.volume_ma_20.get(symbol) is not None):
+            self.warm_up_state[symbol] = "READY"
+            self._log("PAIR_READY", level="INFO", pair=symbol)
+
+    def _seed_5m_indicators(self, symbol: str, candles: list) -> None:
+        """Seed ATR, RSI(Wilder), EMA9, EMA21, VolMA20 from 5m candles."""
+        if len(candles) < 21:
+            return
+        closes = [Decimal(str(c[4])) for c in candles]
+        highs = [Decimal(str(c[2])) for c in candles]
+        lows = [Decimal(str(c[3])) for c in candles]
+        vols = [Decimal(str(c[6])) for c in candles]
+
+        # ATR(14) seed.
+        trs: _t.List[Decimal] = []
+        for i in range(1, len(candles)):
+            tr = max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1]),
+            )
+            trs.append(tr)
+        if len(trs) >= 14:
+            atr = sum(trs[:14], Decimal("0")) / Decimal("14")
+            for tr in trs[14:]:
+                atr = (atr * Decimal("13") + tr) / Decimal("14")
+            self.atr_14[symbol] = atr
+            self.prev_tr[symbol] = trs[-1] if trs else Decimal("0")
+
+        # RSI(14) Wilder SMMA seed (HR-WM-018).
+        gains: _t.List[Decimal] = []
+        losses: _t.List[Decimal] = []
+        for i in range(1, len(closes)):
+            d = closes[i] - closes[i - 1]
+            if d > 0:
+                gains.append(d)
+                losses.append(Decimal("0"))
+            else:
+                gains.append(Decimal("0"))
+                losses.append(-d)
+        if len(gains) >= 14:
+            avg_g = sum(gains[:14], Decimal("0")) / Decimal("14")
+            avg_l = sum(losses[:14], Decimal("0")) / Decimal("14")
+            for g, l in zip(gains[14:], losses[14:]):
+                avg_g = (avg_g * Decimal("13") + g) / Decimal("14")
+                avg_l = (avg_l * Decimal("13") + l) / Decimal("14")
+            self.rsi_14_avg_gain[symbol] = avg_g
+            self.rsi_14_avg_loss[symbol] = avg_l
+
+        # EMA(9): SMA(9) seed, alpha=2/10.
+        if len(closes) >= 9:
+            ema = sum(closes[:9], Decimal("0")) / Decimal("9")
+            alpha = Decimal("2") / Decimal("10")
+            for c in closes[9:]:
+                ema = alpha * c + (Decimal("1") - alpha) * ema
+            self.ema_9[symbol] = ema
+
+        # EMA(21): SMA(21) seed, alpha=2/22.
+        if len(closes) >= 21:
+            ema = sum(closes[:21], Decimal("0")) / Decimal("21")
+            alpha = Decimal("2") / Decimal("22")
+            for c in closes[21:]:
+                ema = alpha * c + (Decimal("1") - alpha) * ema
+            self.ema_21[symbol] = ema
+
+        # Vol MA(20): rolling SMA.
+        if len(vols) >= 20:
+            window = vols[-20:]
+            self.volume_ma_20[symbol] = (
+                sum(window, Decimal("0")) / Decimal("20")
+            )
+            self.volume_history[symbol] = list(window)
+
+        # Last interval_begin per AR-045.
+        if len(candles) >= 1:
+            self.last_interval_begin[symbol] = str(candles[-1][0])
+            try:
+                last = candles[-1]
+                self.last_complete_candle[symbol] = OHLCCandle(
+                    interval_begin=str(last[0]),
+                    open=Decimal(str(last[1])),
+                    high=Decimal(str(last[2])),
+                    low=Decimal(str(last[3])),
+                    close=Decimal(str(last[4])),
+                    volume=Decimal(str(last[6])),
+                    interval=5,
+                )
+                self.previous_close_5m[symbol] = Decimal(str(last[4]))
+            except Exception:
+                pass
+
+    def _seed_htf_ema(self, symbol: str, candles_60m: list) -> None:
+        if len(candles_60m) < 50:
+            return
+        closes = [Decimal(str(c[4])) for c in candles_60m]
+        ema20 = sum(closes[:20], Decimal("0")) / Decimal("20")
+        a20 = Decimal("2") / Decimal("21")
+        for c in closes[20:]:
+            ema20 = a20 * c + (Decimal("1") - a20) * ema20
+        ema50 = sum(closes[:50], Decimal("0")) / Decimal("50")
+        a50 = Decimal("2") / Decimal("51")
+        for c in closes[50:]:
+            ema50 = a50 * c + (Decimal("1") - a50) * ema50
+        self.htf_ema_20[symbol] = ema20
+        self.htf_ema_50[symbol] = ema50
+        if candles_60m:
+            self.last_interval_begin_60[symbol] = str(candles_60m[-1][0])
+
+    async def _trigger_daily_regime_refresh(self) -> None:
+        if self._regime_engine_fn is None:
+            return
+        self._log("REGIME_STARTUP_SEED_STARTED", level="INFO")
+        try:
+            res = self._regime_engine_fn(self.tradeable_universe)
+            if asyncio.iscoroutine(res):
+                await res
+        except Exception as e:
+            self._log("REGIME_REFRESH_FAILED", level="WARN", error=str(e))
+        self._log("REGIME_STARTUP_SEED_COMPLETE", level="INFO")
+
+    # ----------------------------------------------------------
+    # Liquidity refresh loop (WM-LIQ-005..008)
+    # ----------------------------------------------------------
+
+    async def _liquidity_refresh_loop(self) -> None:
+        sleep_sec = int(self._cfg.get(
+            "liquidity_refresh_hours", LIQUIDITY_REFRESH_HOURS
+        )) * 3600
+        while True:
+            try:
+                await asyncio.sleep(sleep_sec)
+                result = await self._rest_get_ticker(
+                    sorted(self.tradeable_universe)
+                )
+                if result:
+                    self.liquidity_24h.update(result)
+                    self._log("LIQUIDITY_REFRESHED", level="INFO",
+                              pairs_count=len(result), timestamp=_ts())
+                else:
+                    self._log("LIQUIDITY_REFRESH_FAILED", level="WARN",
+                              timestamp=_ts(), error="empty_result")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._log("LIQUIDITY_REFRESH_FAILED",
+                          level="WARN", error=str(e))
+
+    # ----------------------------------------------------------
+    # Private connect (live only)
+    # ----------------------------------------------------------
+
+    async def _connect_private_and_subscribe(self) -> None:
+        if self.paper_mode:
+            return
+        self._ws_private = await self._ws_connect_one(PRIVATE_WS_URI)
+        self._log("WS_CONNECTED", level="INFO", endpoint="private")
+        await self._subscribe_private(
+            "executions",
+            extra={
+                "token": self._ws_token,
+                "snap_orders": True,
+                "snap_trades": True,
+                "order_status": True,  # HR-WM-005 - MANDATORY.
+                "ratecounter": True,
+            },
+        )
+        await self._subscribe_private(
+            "balances",
+            extra={"token": self._ws_token, "snapshot": True},
+        )
+
+    # ----------------------------------------------------------
+    # Main loop - TaskGroup with per-shard recv + ping + zombie
+    # ----------------------------------------------------------
 
     async def _main_loop(self) -> None:
-        """
-        Run concurrent receive loops + health monitoring tasks.
-        Paper mode: private recv loop omitted (_ws_private is None).
-        FIX-WM-PT-002: gate _recv_loop_private on paper_mode (DEFECT-WM-PT-002).
-        """
-        if self.paper_mode:
-            async with asyncio.TaskGroup() as tg:
-                tg.create_task(self._recv_loop_public())
-                tg.create_task(self._ping_loop())
-                tg.create_task(self._zombie_monitor())
-            return
         async with asyncio.TaskGroup() as tg:
-            tg.create_task(self._recv_loop_public())
-            tg.create_task(self._recv_loop_private())
-            tg.create_task(self._ping_loop())
-            tg.create_task(self._zombie_monitor())
+            for shard in self.shards:
+                already_started = (shard.shard_index == 0)
+                if not already_started:
+                    tg.create_task(
+                        self._recv_loop_shard(shard),
+                        name=f"shard_{shard.shard_index}_recv",
+                    )
+                tg.create_task(
+                    self._ping_loop_shard(shard),
+                    name=f"shard_{shard.shard_index}_ping",
+                )
+                tg.create_task(
+                    self._zombie_loop_shard(shard),
+                    name=f"shard_{shard.shard_index}_zombie",
+                )
+            if not self.paper_mode and self._ws_private is not None:
+                tg.create_task(
+                    self._recv_loop_private(),
+                    name="private_recv",
+                )
+                tg.create_task(
+                    self._ping_loop_private(),
+                    name="private_ping",
+                )
+                tg.create_task(
+                    self._zombie_loop_private(),
+                    name="private_zombie",
+                )
 
-    # =================================================================
-    # RECEIVE LOOPS
-    # =================================================================
+    # ----------------------------------------------------------
+    # Recv loops (per-shard + private)
+    # ----------------------------------------------------------
 
-    async def _recv_loop_public(self) -> None:
-        """
-        Receive loop for public WS. Dispatches all inbound messages.
-
-        WM-RECONNECT-016: the async-for iterator (which raises
-        ConnectionClosedError / ConnectionClosedOK / ConnectionResetError
-        on CloudFlare cycling — see DEFECT-WM-RECONNECT-001) is wrapped
-        in an outer try/except. On transient disconnect the helper
-        _handle_recv_loop_disconnect awaits an orderly reconnect and the
-        outer while-loop then resumes iteration on the NEW self._ws_public
-        object assigned inside _execute_reconnect_sequence.
-
-        A clean (non-exception) exit of the async-for is unusual but is
-        ALSO treated as a disconnect — trigger reconnect and resume.
-
-        WM-RECONNECT-018: the _fatal_reconnect_failure flag is the only
-        path that terminates this loop. It is set by _initiate_reconnect
-        after all attempts are exhausted; when observed here, we return
-        cleanly and let the TaskGroup propagate the fatal RuntimeError
-        raised by whichever task first hit exhaustion.
-        """
-        while True:
-            if self._fatal_reconnect_failure:
-                return
+    async def _recv_loop_shard(self, shard: WSShard) -> None:
+        """Per-shard inbound dispatch (WM-SHARD-006)."""
+        while not self._fatal_reconnect_failure:
+            conn = shard.connection
+            if conn is None:
+                ev = self._reconnect_done_events.get(shard.shard_index)
+                if ev is not None:
+                    await ev.wait()
+                continue
             try:
-                async for raw in self._ws_public:
+                async for raw in conn:
                     try:
                         msg = orjson.loads(raw)
-                        channel = msg.get("channel") or msg.get("method", "")
-                        handler = self._channel_dispatch.get(channel)
-                        if handler:
-                            await handler(msg, is_public=True)
-                        else:
-                            self._logger.warning(log_record({
-                                "event": "UNKNOWN_MESSAGE_TYPE",
-                                "level": "WARN",
-                                "component": "WS_MGR",
-                                "channel": channel,
-                                "raw": str(raw)[:200],
-                            }))
-                    except Exception as exc:  # noqa: BP-ERR-001
-                        self._logger.error(log_record({
-                            "event": "PUBLIC_RECV_ERROR",
-                            "level": "WARN",
-                            "component": "WS_MGR",
-                            "error": str(exc),
-                        }))
-            except _TRANSIENT_WS_ERRORS as exc:
-                await self._handle_recv_loop_disconnect(
-                    "_recv_loop_public", exc
-                )
+                    except Exception:
+                        self._log("UNKNOWN_MESSAGE_TYPE",
+                                  level="WARN", reason="json_parse_fail")
+                        continue
+                    msg["_shard_index"] = shard.shard_index
+                    await self._dispatch_inbound(msg, shard=shard)
+            except Exception as e:
+                self._log("RECONNECT_TRIGGERED", level="HIGH",
+                          source="_recv_loop_shard",
+                          error_type=type(e).__name__,
+                          shard_index=shard.shard_index)
+                await self._initiate_reconnect_shard(shard.shard_index)
                 continue
-            # async-for exited cleanly — also treat as disconnect
-            await self._handle_recv_loop_disconnect(
-                "_recv_loop_public", None
-            )
+            # Clean exit (WM-RECONNECT-016).
+            self._log("RECONNECT_TRIGGERED", level="HIGH",
+                      source="_recv_loop_shard",
+                      error_type="clean_exit",
+                      shard_index=shard.shard_index)
+            await self._initiate_reconnect_shard(shard.shard_index)
 
     async def _recv_loop_private(self) -> None:
-        """
-        Receive loop for private WS. Dispatches all inbound messages.
-
-        WM-RECONNECT-016: same transient-catch pattern as _recv_loop_public.
-        See that method for the full rationale.
-        """
-        while True:
-            if self._fatal_reconnect_failure:
-                return
+        if self.paper_mode:
+            return
+        while not self._fatal_reconnect_failure:
+            conn = self._ws_private
+            if conn is None:
+                await self._private_reconnect_done.wait()
+                continue
             try:
-                async for raw in self._ws_private:
+                async for raw in conn:
                     try:
                         msg = orjson.loads(raw)
-                        channel = msg.get("channel") or msg.get("method", "")
-                        handler = self._channel_dispatch.get(channel)
-                        if handler:
-                            await handler(msg, is_public=False)
-                        else:
-                            self._logger.warning(log_record({
-                                "event": "UNKNOWN_MESSAGE_TYPE",
-                                "level": "WARN",
-                                "component": "WS_MGR",
-                                "channel": channel,
-                                "raw": str(raw)[:200],
-                            }))
-                    except Exception as exc:  # noqa: BP-ERR-001
-                        self._logger.error(log_record({
-                            "event": "PRIVATE_RECV_ERROR",
-                            "level": "WARN",
-                            "component": "WS_MGR",
-                            "error": str(exc),
-                        }))
-            except _TRANSIENT_WS_ERRORS as exc:
-                await self._handle_recv_loop_disconnect(
-                    "_recv_loop_private", exc
-                )
+                    except Exception:
+                        self._log("UNKNOWN_MESSAGE_TYPE",
+                                  level="WARN", reason="json_parse_fail")
+                        continue
+                    await self._dispatch_inbound(msg, shard=None)
+            except Exception as e:
+                self._log("RECONNECT_TRIGGERED", level="HIGH",
+                          source="_recv_loop_private",
+                          error_type=type(e).__name__)
+                await self._initiate_reconnect_private()
                 continue
-            # async-for exited cleanly — also treat as disconnect
-            await self._handle_recv_loop_disconnect(
-                "_recv_loop_private", None
-            )
+            self._log("RECONNECT_TRIGGERED", level="HIGH",
+                      source="_recv_loop_private",
+                      error_type="clean_exit")
+            await self._initiate_reconnect_private()
 
-    # =================================================================
-    # CHANNEL HANDLERS
-    # =================================================================
+    # ----------------------------------------------------------
+    # Inbound dispatch
+    # ----------------------------------------------------------
 
-    async def _handle_ohlc(self, msg: dict, is_public: bool = True) -> None:
-        """
-        OHLC channel handler. Applies candle-close detection (Section 8).
-        Fires pipeline on 5m close. Fires Exit Controller on 60m close.
-        Updates last_real_data_time (HR-WM-004).
-        """
-        self._last_real_data_public = time.monotonic()
-
-        msg_type = msg.get("type")
-        if msg_type not in ("snapshot", "update"):
-            return
-
-        data_list = msg.get("data", [])
-        interval = msg.get("data", [{}])[0].get("interval", 5) if data_list else 5
-
-        for candle_data in data_list:
-            symbol = candle_data.get("symbol", "")
-            interval_begin = candle_data.get("interval_begin", "")
-
-            if not symbol or not interval_begin:
-                continue
-
-            candle = OHLCCandle(
-                symbol=symbol,
-                interval=interval,
-                interval_begin=interval_begin,
-                open=Decimal(str(candle_data.get("open", 0))),
-                high=Decimal(str(candle_data.get("high", 0))),
-                low=Decimal(str(candle_data.get("low", 0))),
-                close=Decimal(str(candle_data.get("close", 0))),
-                volume=Decimal(str(candle_data.get("volume", 0))),
-                vwap=Decimal(str(candle_data.get("vwap", 0))),
-            )
-
-            if interval == 5:
-                await self._process_ohlc_5m(symbol, interval_begin, candle)
-            elif interval == 60:
-                await self._process_ohlc_60m(symbol, interval_begin, candle)
-
-    async def _process_ohlc_5m(
-        self, symbol: str, interval_begin: str, candle: OHLCCandle
+    async def _dispatch_inbound(
+        self,
+        msg: dict,
+        shard: _t.Optional[WSShard],
     ) -> None:
-        """
-        Candle-close detection for 5m (WM-OHLC-002).
-        Uses interval_begin ONLY — NOT timestamp field (WM-OHLC-003).
-        """
-        prev_begin = self.last_interval_begin.get(symbol, "")
-
-        if interval_begin == prev_begin:
-            # In-progress candle update — store but DO NOT fire pipeline
-            self.last_complete_candle[symbol] = candle
+        if "method" in msg and msg.get("method") == "pong":
+            await self._handle_pong(msg, shard)
+            return
+        if "method" in msg and "result" in msg:
+            await self._handle_method_ack(msg, shard)
+            return
+        channel = msg.get("channel")
+        if channel:
+            handler = self._channel_dispatch.get(channel)
+            if handler is None:
+                self._log("UNKNOWN_MESSAGE_TYPE", level="WARN",
+                          channel=channel)
+                return
+            try:
+                await handler(msg, shard)
+            except Exception as e:
+                self._log("DISPATCH_HANDLER_ERROR", level="WARN",
+                          channel=channel, error=str(e))
+            return
+        if "error" in msg and msg.get("error"):
+            self._log("WS_ERROR", level="WARN",
+                      error=msg.get("error"),
+                      req_id=msg.get("req_id"))
             return
 
-        # NEW interval → previous candle is CLOSED
-        if prev_begin and symbol in self.last_complete_candle:
-            closed_candle = self.last_complete_candle[symbol]
-
-            # Update incremental indicators
-            self._update_indicators_5m(symbol, closed_candle)
-            self._increment_hold_candle_counts()
-
-            # Fire pipeline (if not reconnecting — HR-WM-012)
-            if (
-                not self._is_reconnecting
-                and self.warm_up_state.get(symbol) == WARMUP_READY
-                and self.system_state != STATE_FULL_HALT
-                and self.pair_status.get(symbol, "") == "online"
-                and self.pair_status.get(symbol, "") not in BLOCKED_PAIR_STATUSES
-            ):
-                self._logger.info(log_record({
-                    "event": "CANDLE_CLOSE",
-                    "level": "INFO",
-                    "component": "WS_MGR",
-                    "symbol": symbol,
-                    "interval": 5,
-                    "interval_begin": closed_candle.interval_begin,
-                    "open": closed_candle.open,
-                    "high": closed_candle.high,
-                    "low": closed_candle.low,
-                    "close": closed_candle.close,
-                    "volume": closed_candle.volume,
-                    "atr_14": self.atr_14.get(symbol, Decimal("0")),
-                }))
-
-                if self._signal_pipeline_fn:
-                    pre_comp_cache = self._build_pre_comp_cache(symbol)
-                    params_snapshot = dict(self._ciats_params)
-                    await self._signal_pipeline_fn(
-                        closed_candle, pre_comp_cache, params_snapshot
-                    )
-
-            # Fire max hold count check via Exit Controller (L1a-003)
-            if symbol in self.position_mirror and self._exit_ctrl_fn:
-                await self._exit_ctrl_fn(symbol, {"trigger": "candle_close"}, self)
-
-        # Advance state
-        self.last_complete_candle[symbol] = candle
-        self.last_interval_begin[symbol] = interval_begin
-
-    async def _process_ohlc_60m(
-        self, symbol: str, interval_begin: str, candle: OHLCCandle
+    async def _handle_method_ack(
+        self, msg: dict, shard: _t.Optional[WSShard]
     ) -> None:
-        """
-        1H HTF candle-close detection (WM-OHLC-004).
-        Updates htf_ema_20/htf_ema_50. Fires Exit Controller L1a HTF check.
-        """
-        prev_begin = self.last_interval_begin_60.get(symbol, "")
+        warnings = msg.get("warnings") or []
+        if warnings:
+            self._log("SUBSCRIPTION_ACK_WARNING", level="INFO",
+                      warnings=warnings,
+                      req_id=msg.get("req_id"))
+        result = msg.get("result") or {}
+        if isinstance(result, dict) and "maxratecount" in result:
+            try:
+                self.maxratecount = int(result["maxratecount"])
+                self._log("MAXRATECOUNT_SET", level="INFO",
+                          maxratecount=self.maxratecount)
+            except Exception:
+                pass
 
-        if interval_begin == prev_begin:
-            self.last_complete_candle_60[symbol] = candle
+    # ----------------------------------------------------------
+    # Channel handlers
+    # ----------------------------------------------------------
+
+    async def _handle_ohlc(
+        self, msg: dict, shard: _t.Optional[WSShard]
+    ) -> None:
+        data_list = msg.get("data") or []
+        if not data_list:
             return
-
-        if prev_begin and symbol in self.last_complete_candle_60:
-            closed = self.last_complete_candle_60[symbol]
-            self._update_htf_ema(symbol, closed.close)
-
-            # Fire Exit Controller L1a HTF check
-            if symbol in self.position_mirror and self._exit_ctrl_fn:
-                await self._exit_ctrl_fn(
-                    symbol,
-                    {"trigger": "ohlc_60_close", "candle": closed},
-                    self,
-                )
-
-            # Daily regime check at 00:00 UTC
-            dt = datetime.fromisoformat(interval_begin.rstrip("Z")).replace(
-                tzinfo=timezone.utc
-            )
-            if dt.hour == 0 and dt.minute == 0:
-                await self._trigger_daily_regime_refresh()
-
-        self.last_complete_candle_60[symbol] = candle
-        self.last_interval_begin_60[symbol] = interval_begin
-
-    async def _handle_ticker(self, msg: dict, is_public: bool = True) -> None:
-        """
-        Ticker bbo/trades handler.
-        Updates latest_bid. Fires Exit Controller MAE check (WM-EC-002).
-        Updates drawdown (WM-DD-001). Does NOT reset zombie timer (HR-WM-004
-        — ticker IS a real data event, so it DOES reset the timer).
-        """
-        self._last_real_data_public = time.monotonic()
-
-        data_list = msg.get("data", [])
-        for item in data_list:
-            symbol = item.get("symbol", "")
-            bid = item.get("bid")
-            if bid is not None:
-                self.latest_bid[symbol] = Decimal(str(bid))
-
-            # Drawdown mark-to-market (WM-DD-001)
-            self._compute_drawdown()
-
-            # MAE check for open positions (WM-EC-001/002)
-            if symbol in self.position_mirror and self._exit_ctrl_fn:
-                await self._exit_ctrl_fn(
-                    symbol,
-                    {"trigger": "ticker_bbo", "bid": self.latest_bid.get(symbol)},
-                    self,
-                )
-
-            # Paper fill detection (TB00063 §2.4.10, FC-005)
-            if self.paper_mode and symbol in self.position_mirror:
-                pos = self.position_mirror[symbol]
-                ask = item.get("ask")
-
-                # Paper TP: ask >= tp_price AND PAPER_TP_ prefix guard
-                if (
-                    ask is not None
-                    and pos.tp_price > Decimal("0")
-                    and Decimal(str(ask)) >= pos.tp_price
-                    and pos.tp_order_id.startswith("PAPER_TP_")
-                    and self._exit_ctrl_fn
-                ):
-                    self._logger.info(log_record({
-                        "event": "PAPER_TP_FILL_DETECTED",
-                        "level": "INFO",
-                        "component": "WS_MGR",
-                        "symbol": symbol,
-                        "ask": ask,
-                        "tp_price": pos.tp_price,
-                    }))
-                    pos.tp_price = Decimal("0")  # prevent re-fire
-                    await self._exit_ctrl_fn(symbol, {"trigger": "tp_filled"}, self)
-
-                # Paper emergSL: bid <= emergsl_price AND PAPER_SL_ prefix guard
-                elif (
-                    bid is not None
-                    and pos.emergsl_price > Decimal("0")
-                    and Decimal(str(bid)) <= pos.emergsl_price
-                    and pos.emergsl_order_id.startswith("PAPER_SL_")
-                    and self._exit_ctrl_fn
-                ):
-                    self._logger.critical(log_record({
-                        "event": "PAPER_EMERG_SL_TRIGGERED",
-                        "level": "CRITICAL",
-                        "component": "WS_MGR",
-                        "symbol": symbol,
-                        "bid": bid,
-                        "emergsl_price": pos.emergsl_price,
-                        "note": "PT-VAL-004 VIOLATION — emergSL must never fire in paper mode",
-                    }))
-                    _alert_operator_direct(
-                        f"PT-VAL-004 VIOLATION: paper emergSL triggered for {symbol}. "
-                        f"bid={bid} <= emergsl_price={pos.emergsl_price}. "
-                        "Indicates defect in MAE logic. Closing position."
-                    )
-                    pos.emergsl_price = Decimal("0")  # prevent re-fire
-                    await self._exit_ctrl_fn(symbol, {"trigger": "ticker_bbo", "bid": bid}, self)
-
-    async def _handle_instrument(self, msg: dict, is_public: bool = True) -> None:
-        """
-        Instrument channel handler. Builds pair_cache and monitored_universe.
-        WM-PS-001 through WM-PS-004.
-        """
-        self._last_real_data_public = time.monotonic()
-
-        msg_type = msg.get("type")
-        data = msg.get("data", {})
-
-        pairs = data.get("pairs", [])
-        if not pairs:
-            return
-
-        for pair in pairs:
-            symbol = pair.get("symbol", "")
+        if shard is not None:
+            shard.last_real_data_time = time.monotonic()
+        for entry in data_list:
+            symbol = entry.get("symbol")
             if not symbol:
                 continue
-
-            status = pair.get("status", "")
-            self.pair_status[symbol] = status
-
-            # Build pair_cache — convert ALL via Decimal(str()) (HR-WM-008)
-            self.pair_cache[symbol] = {
-                "price_increment": Decimal(str(pair.get("price_increment", "0.01"))),
-                "qty_increment":   Decimal(str(pair.get("qty_increment", "0.00000001"))),
-                "qty_min":         Decimal(str(pair.get("qty_min", "0"))),
-                "cost_min":        Decimal(str(pair.get("cost_min", "0"))),
-                "status":          status,
-                "quote_currency":  symbol.split("/")[1] if "/" in symbol else "",
-            }
-
-            # Build REST Ticker name maps from altname field (WM-LIQ-003)
-            # altname = Kraken REST classic name (e.g. "XBTUSD") for pair "BTC/USD"
-            altname = pair.get("altname", "")
-            if altname:
-                self._wsname_to_classic[symbol] = altname
-                self._classic_to_wsname[altname] = symbol
-
-        if msg_type == "snapshot":
-            self._build_monitored_universe()
-            self._logger.info(log_record({
-                "event": "INSTRUMENT_SNAPSHOT_COMPLETE",
-                "level": "INFO",
-                "component": "WS_MGR",
-                "pair_count": len(self.pair_cache),
-            }))
-            # Subscribe ohlc now that universe is known (HR-WM-004 — keeps
-            # _last_real_data_public fresh; subscription requires symbol list)
-            asyncio.create_task(self._subscribe_ohlc_channels())
-
-    def _build_monitored_universe(self) -> None:
-        """
-        Build monitored_universe from pair_cache.
-        Filter: USD/USDC/USDT, online, volume >= $500k. NO Top-N cap (D-08 retired). BTC/USD always in.
-        WM-PS-002/003.
-        """
-        candidates = []
-        for sym, spec in self.pair_cache.items():
-            quote = spec.get("quote_currency", "")
-            status = spec.get("status", "")
-            if quote not in ("USD", "USDC", "USDT"):
+            interval = int(entry.get("interval", 5))
+            interval_begin = str(entry.get("interval_begin", ""))
+            try:
+                close = Decimal(str(entry.get("close", 0)))
+                high = Decimal(str(entry.get("high", 0)))
+                low = Decimal(str(entry.get("low", 0)))
+                op = Decimal(str(entry.get("open", 0)))
+                vol = Decimal(str(entry.get("volume", 0)))
+            except Exception:
                 continue
-            if status != "online":
-                continue
-            candidates.append(sym)
-
-        # Sort by volume (not available in instrument snapshot — use alphabetical
-        # as placeholder; actual volume filter applied via 24h volume from REST)
-        # BTC/USD always included (AR-074, WM-PS-003)
-        if "BTC/USD" not in candidates and "BTC/USD" in self.pair_cache:
-            candidates.append("BTC/USD")
-
-        self.monitored_universe = candidates
-
-    async def _handle_status(self, msg: dict, is_public: bool = True) -> None:
-        """
-        Status channel handler. Captures connection_id and engine state.
-        WM-STATUS-001. Resets zombie timer (WM-ZOM-004 — status IS real data).
-        """
-        self._last_real_data_public = time.monotonic()
-
-        msg_type = msg.get("type")
-        data_list = msg.get("data", [])
-
-        for item in data_list:
-            connection_id = item.get("connection_id")
-            system_status = item.get("system", "online")
-            api_version = item.get("api_version", "")
-
-            if connection_id:
-                prev_id = self.connection_id_public
-                self.connection_id_public = connection_id
-                self.engine_state = system_status
-
-                if prev_id is None:
-                    self._logger.info(log_record({
-                        "event": "WS_CONNECTED",
-                        "level": "INFO",
-                        "component": "WS_MGR",
-                        "endpoint": "public",
-                        "connection_id": connection_id,
-                        "system": system_status,
-                        "api_version": api_version,
-                    }))
+            if shard is not None:
+                self._on_pair_data_received(shard, symbol)
+            if interval == 5:
+                prev_begin = self.last_interval_begin.get(symbol)
+                if prev_begin == interval_begin:
+                    self.last_complete_candle[symbol] = OHLCCandle(
+                        interval_begin=interval_begin,
+                        open=op, high=high, low=low,
+                        close=close, volume=vol, interval=5,
+                    )
                 else:
-                    self._logger.info(log_record({
-                        "event": "WS_RECONNECTED",
-                        "level": "INFO",
-                        "component": "WS_MGR",
-                        "old_connection_id": prev_id,
-                        "new_connection_id": connection_id,
-                    }))
+                    closed_candle = self.last_complete_candle.get(symbol)
+                    if closed_candle is not None and prev_begin is not None:
+                        self._update_indicators_5m(symbol, closed_candle)
+                        await self._fire_pipeline(symbol, closed_candle)
+                    self.last_complete_candle[symbol] = OHLCCandle(
+                        interval_begin=interval_begin,
+                        open=op, high=high, low=low,
+                        close=close, volume=vol, interval=5,
+                    )
+                    self.last_interval_begin[symbol] = interval_begin
+                    self._log("CANDLE_CLOSE", level="DEBUG",
+                              symbol=symbol, interval=5,
+                              interval_begin=interval_begin)
+            elif interval == 60:
+                # ohlc(60) is REST-only per HR-WM-021; if it arrives, log only.
+                self._log("UNEXPECTED_OHLC_60", level="WARN", symbol=symbol)
 
-    async def _handle_executions(self, msg: dict, is_public: bool = False) -> None:
-        """
-        Executions channel handler.
-        Checks sequence gap. Updates rate counter. Dispatches exec_type.
-        WM-EXE-014/015/016 (last_qty, last_price captured).
-        """
-        self._last_real_data_private = time.monotonic()
+    async def _handle_ticker(
+        self, msg: dict, shard: _t.Optional[WSShard]
+    ) -> None:
+        data_list = msg.get("data") or []
+        if not data_list:
+            return
+        if shard is not None:
+            shard.last_real_data_time = time.monotonic()
+        for entry in data_list:
+            symbol = entry.get("symbol")
+            if not symbol:
+                continue
+            try:
+                bid = Decimal(str(entry.get("bid", 0)))
+                ask = Decimal(str(entry.get("ask", 0)))
+            except Exception:
+                continue
+            if shard is not None:
+                self._on_pair_data_received(shard, symbol)
+            self.latest_bid[symbol] = bid
+            if symbol in self.position_mirror:
+                self._compute_drawdown_for_pair(symbol)
+                if self.paper_mode:
+                    await self._maybe_paper_fill(symbol, bid=bid, ask=ask)
+                if self._exit_controller_fn is not None:
+                    try:
+                        res = self._exit_controller_fn(
+                            event="bbo", symbol=symbol, bid=bid, ask=ask
+                        )
+                        if asyncio.iscoroutine(res):
+                            await res
+                    except Exception as e:
+                        self._log("EXIT_CONTROLLER_ERROR", level="WARN",
+                                  error=str(e), symbol=symbol)
 
-        msg_type = msg.get("type")
-        data_list = msg.get("data", [])
+    async def _handle_instrument(
+        self, msg: dict, shard: _t.Optional[WSShard]
+    ) -> None:
+        if shard is not None:
+            shard.last_real_data_time = time.monotonic()
+        data_list = msg.get("data") or []
+        msg_type = msg.get("type", "snapshot")
+        for entry in data_list:
+            pairs = entry.get("pairs") or []
+            for pair in pairs:
+                symbol = pair.get("symbol", "")
+                if not symbol:
+                    continue
+                quote_split = symbol.split("/", 1)
+                quote_currency = quote_split[1] if len(quote_split) == 2 else ""
+                try:
+                    self.pair_cache[symbol] = {
+                        "status": pair.get("status", ""),
+                        "quote_currency": quote_currency,
+                        "price_increment": Decimal(
+                            str(pair.get("price_increment", "0"))),
+                        "qty_increment": Decimal(
+                            str(pair.get("qty_increment", "0"))),
+                        "qty_min": Decimal(str(pair.get("qty_min", "0"))),
+                        "cost_min": Decimal(str(pair.get("cost_min", "0"))),
+                    }
+                except Exception:
+                    continue
+        self._log(
+            "INSTRUMENT_SNAPSHOT_COMPLETE",
+            level="INFO" if msg_type == "snapshot" else "DEBUG",
+        )
 
-        # Extract seq for gap detection (A-10)
-        seq = msg.get("sequence", 0)
-        if seq and self.executions_last_seq > 0:
-            if seq > self.executions_last_seq + 1:
+    async def _handle_status(
+        self, msg: dict, shard: _t.Optional[WSShard]
+    ) -> None:
+        if shard is not None:
+            shard.last_real_data_time = time.monotonic()
+        data_list = msg.get("data") or []
+        for entry in data_list:
+            connection_id = entry.get("connection_id")
+            system_status = entry.get("system", "")
+            api_version = entry.get("api_version", "")
+            if shard is not None and connection_id is not None:
+                try:
+                    shard.connection_id = int(connection_id)
+                except Exception:
+                    pass
+            self._log(
+                "WS_CONNECTED", level="INFO",
+                endpoint=("private" if shard is None else "public"),
+                shard_index=(shard.shard_index if shard is not None else None),
+                connection_id=connection_id,
+                system=system_status, api_version=api_version,
+            )
+
+    async def _handle_executions(
+        self, msg: dict, shard: _t.Optional[WSShard]
+    ) -> None:
+        # Private channel - shard is None.
+        self._last_real_data_time_private = time.monotonic()
+        data_list = msg.get("data") or []
+        seq = msg.get("sequence")
+        if isinstance(seq, int):
+            if (self.executions_last_seq != 0
+                    and seq != self.executions_last_seq + 1):
                 await self._handle_executions_gap(seq)
-        if seq:
             self.executions_last_seq = seq
+        rate_counter = msg.get("ratecounter")
+        if rate_counter is not None:
+            for entry in data_list:
+                sym = entry.get("symbol")
+                if sym:
+                    try:
+                        self.rate_counter_by_pair[sym] = Decimal(
+                            str(rate_counter)
+                        )
+                    except Exception:
+                        pass
+        for entry in data_list:
+            etype = entry.get("exec_type", "status")
+            handler = self._exec_dispatch.get(etype)
+            if handler is None:
+                self._log("UNKNOWN_EXEC_TYPE", level="WARN", exec_type=etype)
+                continue
+            try:
+                await handler(entry)
+            except Exception as e:
+                self._log("EXEC_HANDLER_ERROR", level="WARN",
+                          exec_type=etype, error=str(e))
 
-        # Rate counter from executions event (A-1, AR-030)
-        # Subscription ACK: extract maxratecount
-        if msg_type in ("snapshot", "update"):
-            pass  # rate counter is per event, extracted below
-
-        for event in data_list:
-            # Update rate counter (AR-030)
-            symbol = event.get("symbol", "")
-            rate_counter = event.get("rate_counter")
-            if rate_counter is not None and symbol:
-                self.rate_counter_by_pair[symbol] = int(rate_counter)
-                self._logger.debug(log_record({
-                    "event": "RATE_COUNTER_UPDATE",
-                    "level": "DEBUG",
-                    "component": "WS_MGR",
-                    "symbol": symbol,
-                    "rate_counter": int(rate_counter),
-                    "maxratecount": self.maxratecount,
-                }))
-
-            # Dispatch on exec_type
-            exec_type = event.get("exec_type", "")
-            handler = self._exec_type_dispatch.get(exec_type)
-            if handler:
-                await handler(event)
-            else:
-                self._logger.warning(log_record({
-                    "event": "UNKNOWN_EXEC_TYPE",
-                    "level": "WARN",
-                    "component": "WS_MGR",
-                    "raw_exec_type": exec_type,
-                }))
-
-        # Process executions subscription ACK (maxratecount)
-        if msg.get("method") == "subscribe" and msg.get("result"):
-            result = msg["result"]
-            if result.get("channel") == "executions":
-                max_rc = result.get("maxratecount")
-                if max_rc:
-                    self.maxratecount = int(max_rc)
-                    self._logger.info(log_record({
-                        "event": "MAXRATECOUNT_SET",
-                        "level": "INFO",
-                        "component": "WS_MGR",
-                        "value": self.maxratecount,
-                    }))
-                warnings = result.get("warnings", [])
-                self._logger.info(log_record({
-                    "event": "SUBSCRIPTION_ACK",
-                    "level": "INFO",
-                    "component": "WS_MGR",
-                    "channel": "executions",
-                    "warnings": warnings,
-                }))
-
-    async def _handle_balances(self, msg: dict, is_public: bool = False) -> None:
-        """
-        Balances channel handler. Updates spot_usd_balance.
-        Checks sequence gap (A-9, Section 7.2).
-        WM-BAL-001/002/003.
-        """
-        self._last_real_data_private = time.monotonic()
-
-        seq = msg.get("sequence", 0)
-        if seq and self.balances_last_seq > 0:
-            if seq > self.balances_last_seq + 1:
+    async def _handle_balances(
+        self, msg: dict, shard: _t.Optional[WSShard]
+    ) -> None:
+        self._last_real_data_time_private = time.monotonic()
+        seq = msg.get("sequence")
+        if isinstance(seq, int):
+            if (self.balances_last_seq != 0
+                    and seq != self.balances_last_seq + 1):
                 await self._handle_balances_gap(seq)
-        if seq:
             self.balances_last_seq = seq
+        for wallet in msg.get("data") or []:
+            if (wallet.get("wallet_type") == "spot"
+                    and wallet.get("wallet_id") == "main"
+                    and wallet.get("asset") == "USD"):
+                try:
+                    self.spot_usd_balance = Decimal(
+                        str(wallet.get("balance", "0"))
+                    )
+                except Exception:
+                    continue
+                # HR-WM-011: set baseline ONCE in live mode (paper sets it earlier).
+                if self.portfolio_baseline_USD is None and not self.paper_mode:
+                    self.portfolio_baseline_USD = self.spot_usd_balance
+                    self._log("PORTFOLIO_BASELINE_SET", level="INFO",
+                              baseline=self.portfolio_baseline_USD)
 
-        data_list = msg.get("data", [])
-        for item in data_list:
-            # Filter: spot wallet, main account, USD (WM-BAL-001/002/003)
-            if (
-                item.get("wallet_type") == "spot"
-                and item.get("wallet_id") == "main"
-                and item.get("asset") == "USD"
-            ):
-                balance_raw = item.get("balance", item.get("wallet_balance", "0"))
-                self.spot_usd_balance = Decimal(str(balance_raw))
+    async def _handle_pong(
+        self, msg: dict, shard: _t.Optional[WSShard]
+    ) -> None:
+        if shard is not None:
+            shard.last_pong_time = time.monotonic()
+        else:
+            self._last_pong_time_private = time.monotonic()
+        self._log(
+            "PONG_RECEIVED", level="DEBUG",
+            shard=(shard.shard_index if shard is not None else "private"),
+        )
 
-    async def _handle_pong(self, msg: dict, is_public: bool = True) -> None:
-        """
-        Pong handler.
-        DO NOT reset zombie timer (HR-WM-004, WM-ZOM-005).
-        Cancel pending ping timeout. Record latency.
-        """
-        req_id = msg.get("req_id")
-        now = time.monotonic()
-
-        if is_public and req_id == self._ping_req_id_pub:
-            latency_ms = (
-                (now - self._ping_sent_pub) * 1000
-                if self._ping_sent_pub else 0
-            )
-            self._awaiting_pong_pub = False
-            self._logger.debug(log_record({
-                "event": "PONG_RECEIVED",
-                "level": "DEBUG",
-                "component": "WS_MGR",
-                "connection_id": self.connection_id_public,
-                "latency_ms": Decimal(str(round(latency_ms, 3))),
-            }))
-        elif not is_public and req_id == self._ping_req_id_priv:
-            latency_ms = (
-                (now - self._ping_sent_priv) * 1000
-                if self._ping_sent_priv else 0
-            )
-            self._awaiting_pong_priv = False
-            self._logger.debug(log_record({
-                "event": "PONG_RECEIVED",
-                "level": "DEBUG",
-                "component": "WS_MGR",
-                "connection_id": self.connection_id_private,
-                "latency_ms": Decimal(str(round(latency_ms, 3))),
-            }))
-
-    # =================================================================
-    # EXEC_TYPE HANDLERS — All 10 (HR-WM-006)
-    # =================================================================
+    # ----------------------------------------------------------
+    # exec_type handlers (Section 5.3)
+    # ----------------------------------------------------------
 
     async def _handle_pending_new(self, event: dict) -> None:
-        """Order accepted by matching engine. Register in req_id_registry."""
-        req_id = event.get("req_id")
-        order_id = event.get("order_id", "")
-        cl_ord_id = event.get("cl_ord_id", "")
-        if req_id:
-            self.req_id_registry[req_id] = {
-                "method": "add_order",
-                "order_id": order_id,
-                "cl_ord_id": cl_ord_id,
-                "timestamp": time.time(),
-            }
+        self._log("EXEC_PENDING_NEW", level="DEBUG",
+                  order_id=event.get("order_id"),
+                  cl_ord_id=event.get("cl_ord_id"))
 
     async def _handle_new(self, event: dict) -> None:
-        """Order live on book. Confirm via log."""
-        self._logger.info(log_record({
-            "event": "ORDER_NEW",
-            "level": "INFO",
-            "component": "WS_MGR",
-            "order_id": event.get("order_id", ""),
-            "cl_ord_id": event.get("cl_ord_id", ""),
-            "symbol": event.get("symbol", ""),
-        }))
+        self._log("EXEC_NEW", level="DEBUG",
+                  order_id=event.get("order_id"),
+                  cl_ord_id=event.get("cl_ord_id"))
 
     async def _handle_trade(self, event: dict) -> None:
-        """
-        Partial fill event. Captures all four values (WM-EXE-014).
-        Identifies TP vs entry fill. Routes accordingly.
-        """
+        try:
+            cum_qty = Decimal(str(event.get("cum_qty", 0)))
+            avg_price = Decimal(str(event.get("avg_price", 0)))
+            last_qty = Decimal(str(event.get("last_qty", 0)))
+            last_price = Decimal(str(event.get("last_price", 0)))
+        except Exception:
+            return
         order_id = event.get("order_id", "")
         cl_ord_id = event.get("cl_ord_id", "")
         symbol = event.get("symbol", "")
-
-        # Capture all four fill values (WM-EXE-014, HR-WM-008)
-        last_qty = Decimal(str(event.get("last_qty", 0)))
-        last_price = Decimal(str(event.get("last_price", 0)))
-        cum_qty = Decimal(str(event.get("cum_qty", 0)))
-        avg_price = Decimal(str(event.get("avg_price", 0)))
-
-        # Log all four values (WM-EXE-016)
-        self._logger.info(log_record({
-            "event": "FILL_EVENT",
-            "level": "INFO",
-            "component": "WS_MGR",
-            "order_id": order_id,
-            "cl_ord_id": cl_ord_id,
-            "symbol": symbol,
-            "last_qty": last_qty,
-            "last_price": last_price,
-            "cum_qty": cum_qty,
-            "avg_price": avg_price,
-            "exec_type": "trade",
-        }))
-
-        # Identify order type: TP vs entry partial (WM-EC-005)
         for sym, pos in self.position_mirror.items():
-            if order_id == pos.tp_order_id:
-                # TP partial fill (Section 5.4)
-                await self._handle_partial_tp_fill(event, sym)
-                return
-
-        # Entry partial update — update Position Mirror cumulative values
-        if symbol in self.position_mirror:
-            self.position_mirror[symbol].qty = cum_qty
-            self.position_mirror[symbol].entry_fill_price = avg_price
+            if pos.tp_order_id and order_id == pos.tp_order_id:
+                await self._handle_partial_tp_fill(sym, event)
+                break
+            if pos.cl_ord_id and (cl_ord_id == pos.cl_ord_id
+                                   or order_id == pos.cl_ord_id):
+                pos.qty = cum_qty
+                pos.entry_price = avg_price
+                break
+        self._log(
+            "FILL_EVENT", level="INFO",
+            order_id=order_id, cl_ord_id=cl_ord_id, symbol=symbol,
+            last_qty=last_qty, last_price=last_price,
+            cum_qty=cum_qty, avg_price=avg_price, exec_type="trade",
+        )
 
     async def _handle_filled(self, event: dict) -> None:
-        """
-        Full fill. Routes entry fill → batch_add dispatch.
-        Routes TP fill → L1b logic.
-        """
         order_id = event.get("order_id", "")
         cl_ord_id = event.get("cl_ord_id", "")
-        symbol = event.get("symbol", "")
-        cum_qty = Decimal(str(event.get("cum_qty", 0)))
-        avg_price = Decimal(str(event.get("avg_price", 0)))
-        fees = Decimal(str(event.get("fees", [{"asset": "USD", "qty": "0"}])[0].get("qty", 0)))
-
-        # Check if TP fill (full close)
-        for sym, pos in self.position_mirror.items():
-            if order_id == pos.tp_order_id:
-                # TP full fill → L1b
-                self._logger.info(log_record({
-                    "event": "LAYER1B_TP_FILL",
-                    "level": "INFO",
-                    "component": "WS_MGR",
-                    "symbol": sym,
-                    "fill_price": avg_price,
-                    "fees": fees,
-                }))
-                if self._exit_ctrl_fn:
-                    await self._exit_ctrl_fn(
-                        sym,
-                        {
-                            "trigger": "tp_filled",
-                            "fill_price": avg_price,
-                            "qty": cum_qty,
-                            "fees": fees,
-                            "exit_reason": "TP_FILL",
-                        },
-                        self,
-                    )
+        for sym, pos in list(self.position_mirror.items()):
+            if pos.tp_order_id and order_id == pos.tp_order_id:
+                if pos.emergsl_order_id:
+                    await self.cancel_order(pos.emergsl_order_id)
+                self._fire_ciats_outcome(sym, exit_reason="TP_FILL", pos=pos)
+                self.position_mirror.pop(sym, None)
+                await self._update_ticker_event_trigger(sym, "trades")
+                self._log("TP_FILLED", level="INFO", symbol=sym)
                 return
-
-        # Entry fill — dispatch TP + emergSL via Execution Engine
-        if symbol in self.position_mirror:
-            pos = self.position_mirror[symbol]
-            pos.entry_fill_price = avg_price
-            pos.qty = cum_qty
-            pos.fees_entry_usd = fees
-            pos.entry_timestamp_utc = datetime.now(timezone.utc).isoformat()
-
-            self._logger.info(log_record({
-                "event": "ENTRY_FILLED",
-                "level": "INFO",
-                "component": "WS_MGR",
-                "symbol": symbol,
-                "cl_ord_id": cl_ord_id,
-                "fill_price": avg_price,
-                "qty": cum_qty,
-                "fees": fees,
-            }))
-
-            # Remove from Pending Order Registry (WM-POR-003)
-            self.pending_orders.pop(cl_ord_id, None)
-
-            if self._exec_engine_fn:
-                await self._exec_engine_fn(
-                    {
-                        # Kraken-format keys required by EE._on_entry_filled
-                        "exec_type":  "filled",
-                        "symbol":     symbol,
-                        "cl_ord_id":  cl_ord_id,
-                        "order_id":   order_id,
-                        "avg_price":  str(avg_price),    # Decimal → str (EE parses)
-                        "cum_qty":    str(cum_qty),      # Decimal → str (EE parses)
-                        "fees":       str(fees),
-                        # WM-format keys for compatibility
-                        "entry_fill_price": avg_price,
-                        "qty":              cum_qty,
-                        "fees_entry_usd":   fees,
-                    },
-                    self,
-                )
+            if pos.cl_ord_id and pos.cl_ord_id == cl_ord_id:
+                if self._execution_engine_fn is not None:
+                    try:
+                        res = self._execution_engine_fn(
+                            event="entry_filled",
+                            symbol=sym,
+                            cum_qty=Decimal(str(event.get("cum_qty", 0))),
+                            avg_price=Decimal(str(event.get("avg_price", 0))),
+                        )
+                        if asyncio.iscoroutine(res):
+                            await res
+                    except Exception as e:
+                        self._log("EXEC_ENGINE_ERROR", level="WARN",
+                                  error=str(e), symbol=sym)
+                return
+        self._log("EXEC_FILLED_UNMATCHED", level="WARN",
+                  order_id=order_id, cl_ord_id=cl_ord_id)
 
     async def _handle_iceberg_refill(self, event: dict) -> None:
-        """Iceberg order refill. Log only. No Mirror update. No action."""
-        self._logger.debug(log_record({
-            "event": "ICEBERG_REFILL",
-            "level": "DEBUG",
-            "component": "WS_MGR",
-            "order_id": event.get("order_id", ""),
-        }))
+        self._log("EXEC_ICEBERG_REFILL", level="DEBUG",
+                  order_id=event.get("order_id"))
 
     async def _handle_canceled(self, event: dict) -> None:
-        """
-        Order canceled. Entry with cum_qty>0 → partial fill protection (CASE B).
-        Entry with cum_qty==0 → CASE C (no fill). Exit canceled → timeout fallback.
-        HR-WM-007: use reason field (NOT cancel_reason — deprecated).
-        """
+        order_id = event.get("order_id", "")
         cl_ord_id = event.get("cl_ord_id", "")
-        cum_qty = Decimal(str(event.get("cum_qty", 0)))
-        reason = event.get("reason", "")  # HR-WM-007: NOT cancel_reason
-
-        # Clear from Pending Order Registry (WM-POR-003)
+        try:
+            cum_qty = Decimal(str(event.get("cum_qty", 0)))
+        except Exception:
+            cum_qty = Decimal("0")
         self.pending_orders.pop(cl_ord_id, None)
-
-        symbol = event.get("symbol", "")
-
-        if cum_qty > Decimal("0"):
-            # CASE B: entry partial fill → protection (WM-DISP-020/021)
-            await self._handle_entry_partial_fill(event, "canceled")
-        else:
-            # CASE C: no fill — clean cancel (WM-DISP-022)
-            self._logger.info(log_record({
-                "event": "EXEC_CANCELED",
-                "level": "INFO",
-                "component": "WS_MGR",
-                "order_id": event.get("order_id", ""),
-                "cl_ord_id": cl_ord_id,
-                "reason": reason,
-            }))
-            # Route to EE for entry order cleanup: clear Position Mirror,
-            # clear Pending Registry entry, release BoundedSemaphore.
-            # EE._on_entry_canceled handles this only if cl_ord_id is in
-            # EE._entry_orders — non-entry cancels (TP, emergSL) are no-ops.
-            if self._exec_engine_fn:
-                await self._exec_engine_fn(
-                    {
-                        "exec_type": "canceled",
-                        "symbol":    symbol,
-                        "cl_ord_id": cl_ord_id,
-                        "order_id":  event.get("order_id", ""),
-                        "cum_qty":   "0",
-                        "reason":    reason,
-                    },
-                    self,
-                )
+        self._log("EXEC_CANCELED", level="INFO",
+                  order_id=order_id, cl_ord_id=cl_ord_id,
+                  cum_qty=cum_qty, reason=event.get("reason", ""))
+        if cum_qty > 0:
+            await self._handle_entry_partial_fill(event)
 
     async def _handle_expired(self, event: dict) -> None:
-        """
-        GTD order expired. Entry with cum_qty>0 → CASE A.
-        Entry with cum_qty==0 → CASE C.
-        """
+        order_id = event.get("order_id", "")
         cl_ord_id = event.get("cl_ord_id", "")
-        cum_qty = Decimal(str(event.get("cum_qty", 0)))
-        symbol = event.get("symbol", "")
-
+        try:
+            cum_qty = Decimal(str(event.get("cum_qty", 0)))
+        except Exception:
+            cum_qty = Decimal("0")
         self.pending_orders.pop(cl_ord_id, None)
-
-        if cum_qty > Decimal("0"):
-            # CASE A: entry partial fill → protection (WM-DISP-020/021)
-            await self._handle_entry_partial_fill(event, "expired")
-        else:
-            # CASE C: clean expiry
-            self._logger.info(log_record({
-                "event": "EXEC_EXPIRED",
-                "level": "INFO",
-                "component": "WS_MGR",
-                "order_id": event.get("order_id", ""),
-                "cl_ord_id": cl_ord_id,
-                "cum_qty": cum_qty,
-            }))
-            # Route to EE for entry order cleanup (same pattern as _handle_canceled
-            # CASE C). EE._on_entry_expired handles cum_qty==0 path: clear Position
-            # Mirror, clear Pending Registry, release BoundedSemaphore.
-            # Non-entry expired events are no-ops in EE (cl_ord_id not in _entry_orders).
-            if self._exec_engine_fn:
-                await self._exec_engine_fn(
-                    {
-                        "exec_type": "expired",
-                        "symbol":    symbol,
-                        "cl_ord_id": cl_ord_id,
-                        "order_id":  event.get("order_id", ""),
-                        "cum_qty":   "0",
-                    },
-                    self,
-                )
+        self._log("EXEC_EXPIRED", level="INFO",
+                  order_id=order_id, cl_ord_id=cl_ord_id,
+                  cum_qty=cum_qty, reason=event.get("reason", ""))
+        if cum_qty > 0:
+            await self._handle_entry_partial_fill(event)
 
     async def _handle_amended(self, event: dict) -> None:
-        """
-        Any inbound amended = UNEXPECTED (WM-DISP-024/025).
-        TothBot never amends its own orders during normal operation.
-        Log CRITICAL. Cross-reference Position Mirror. NO auto-correction.
+        """UNEXPECTED - TothBot V2 never amends its own orders.
+
+        AR-057 / WM-DISP-024..026.
         """
         order_id = event.get("order_id", "")
         cl_ord_id = event.get("cl_ord_id", "")
         new_limit = event.get("limit_price")
         new_qty = event.get("order_qty")
-
-        self._logger.critical(log_record({
-            "event": "UNEXPECTED_ORDER_AMENDED",
-            "level": "CRITICAL",
-            "component": "WS_MGR",
-            "order_id": order_id,
-            "cl_ord_id": cl_ord_id,
-            "new_limit_price": new_limit,
-            "new_qty": new_qty,
-        }))
-        _alert_operator_direct(
-            f"UNEXPECTED order amendment: order_id={order_id} cl_ord_id={cl_ord_id}"
+        self._log(
+            "UNEXPECTED_ORDER_AMENDED", level="CRITICAL",
+            order_id=order_id, cl_ord_id=cl_ord_id,
+            new_limit_price=new_limit, new_qty=new_qty,
         )
-
-        # Cross-reference Position Mirror (WM-DISP-025)
+        try:
+            self._alert_fn(
+                "HIGH",
+                f"UNEXPECTED order amendment: order_id={order_id} "
+                f"cl_ord_id={cl_ord_id}",
+            )
+        except Exception:
+            pass
         for sym, pos in self.position_mirror.items():
-            if order_id == pos.tp_order_id:
-                self._logger.critical(log_record({
-                    "event": "AMENDED_ORDER_IS_TP",
-                    "level": "CRITICAL",
-                    "component": "WS_MGR",
-                    "symbol": sym,
-                }))
-                _alert_operator_direct(
-                    f"TP for {sym} was amended — sacred R:R may be violated"
-                )
-            elif order_id == pos.emergsl_order_id:
-                self._logger.critical(log_record({
-                    "event": "AMENDED_ORDER_IS_EMERGSL",
-                    "level": "CRITICAL",
-                    "component": "WS_MGR",
-                    "symbol": sym,
-                }))
-                _alert_operator_direct(
-                    f"emergSL for {sym} was amended — crash protection altered"
-                )
-        # WM-DISP-026: NO auto-correction. Bill must review and act.
+            if pos.tp_order_id and order_id == pos.tp_order_id:
+                self._log("AMENDED_ORDER_IS_TP",
+                          level="CRITICAL", symbol=sym)
+                try:
+                    self._alert_fn(
+                        "CRITICAL",
+                        f"TP for {sym} amended - sacred R:R may be violated",
+                    )
+                except Exception:
+                    pass
+            elif pos.emergsl_order_id and order_id == pos.emergsl_order_id:
+                self._log("AMENDED_ORDER_IS_EMERGSL",
+                          level="CRITICAL", symbol=sym)
+                try:
+                    self._alert_fn(
+                        "CRITICAL",
+                        f"emergSL for {sym} amended - "
+                        f"crash protection altered",
+                    )
+                except Exception:
+                    pass
 
     async def _handle_restated(self, event: dict) -> None:
-        """
-        Engine maintenance amend. NOT a fill or cancel.
-        DO NOT update Position Mirror. Elevated alert if resting order.
-        """
-        order_id = event.get("order_id", "")
-        self._logger.warning(log_record({
-            "event": "EXEC_RESTATED",
-            "level": "HIGH",
-            "component": "WS_MGR",
-            "order_id": order_id,
-        }))
+        self._log("EXEC_RESTATED", level="WARN",
+                  order_id=event.get("order_id"))
 
     async def _handle_exec_status(self, event: dict) -> None:
-        """Order status snapshot. Log. Confirm emergSL placement (WM-EXE-013)."""
-        order_id = event.get("order_id", "")
-        status = event.get("status", "")
-        self._logger.debug(log_record({
-            "event": "EXEC_STATUS",
-            "level": "DEBUG",
-            "component": "WS_MGR",
-            "order_id": order_id,
-            "status": status,
-        }))
+        self._log("EXEC_STATUS", level="DEBUG",
+                  order_id=event.get("order_id"))
 
-    # =================================================================
-    # TP PARTIAL FILL HANDLING — Section 5.4 (AR-066)
-    # =================================================================
+    # ----------------------------------------------------------
+    # Partial fill handlers (Section 5.4 / 5.5)
+    # ----------------------------------------------------------
 
     async def _handle_partial_tp_fill(
-        self, event: dict, symbol: str
+        self, symbol: str, event: dict
     ) -> None:
-        """
-        TP partial fill: amend emergSL qty (NOT cancel+resubmit).
-        Saves 7 rate units vs cancel+resubmit (WM-EC-007).
-        """
-        cum_qty = Decimal(str(event.get("cum_qty", 0)))
-        avg_exit = Decimal(str(event.get("avg_price", 0)))
-
-        pos = self.position_mirror[symbol]
+        try:
+            cum_qty = Decimal(str(event.get("cum_qty", 0)))
+            avg_exit = Decimal(str(event.get("avg_price", 0)))
+        except Exception:
+            return
+        pos = self.position_mirror.get(symbol)
+        if pos is None:
+            return
         orig_qty = pos.qty
         remaining = orig_qty - cum_qty
-        emergsl_id = pos.emergsl_order_id
-
-        spec = self.pair_cache.get(symbol, {})
-        q_incr = spec.get("qty_increment", Decimal("0.00000001"))
-        qty_min = spec.get("qty_min", Decimal("0"))
-        cost_min = spec.get("cost_min", Decimal("0"))
+        cache = self.pair_cache.get(symbol, {})
+        q_incr = cache.get("qty_increment") or Decimal("0")
+        qty_min = cache.get("qty_min") or Decimal("0")
+        cost_min = cache.get("cost_min") or Decimal("0")
         bid = self.latest_bid.get(symbol, Decimal("0"))
-
-        # Update Position Mirror
-        self.position_mirror[symbol].qty = remaining
-
-        # Quantize remaining qty (ROUND_DOWN — BP-DEC-002)
-        remaining_r = remaining.quantize(q_incr, rounding=ROUND_DOWN)
-
-        # Check minimum size (WM-EC-006)
-        if (remaining_r < qty_min or
-                (bid > Decimal("0") and remaining_r * bid < cost_min)):
-            # Cannot protect — exit remainder via market sell
-            await self.cancel_order(emergsl_id)
-            await self.dispatch_market_sell(symbol, remaining_r)
-            del self.position_mirror[symbol]
-            self._logger.warning(log_record({
-                "event": "TP_PARTIAL_FILL_BELOW_MIN_EXIT",
-                "level": "WARN",
-                "component": "WS_MGR",
-                "symbol": symbol,
-                "remaining": remaining_r,
-            }))
+        if q_incr > 0:
+            remaining = remaining.quantize(q_incr, rounding=ROUND_DOWN)
+        if remaining < qty_min or remaining * bid < cost_min:
+            if pos.emergsl_order_id:
+                await self.cancel_order(pos.emergsl_order_id)
+            await self.dispatch_market_sell(symbol, remaining)
+            self._log("TP_PARTIAL_FILL_BELOW_MIN_EXIT", level="INFO",
+                      symbol=symbol, remaining=remaining)
+            self.position_mirror.pop(symbol, None)
+            await self._update_ticker_event_trigger(symbol, "trades")
             return
-
-        # Amend emergSL qty (NOT cancel+resubmit — WM-EC-007)
-        await self.amend_order(
-            order_id=emergsl_id,
-            order_qty=remaining_r,
+        pos.qty = remaining
+        if pos.emergsl_order_id:
+            await self.amend_order(pos.emergsl_order_id, remaining)
+        self._log(
+            "TP_PARTIAL_FILL", level="INFO",
+            symbol=symbol, filled_qty=cum_qty,
+            remaining_qty=remaining, avg_exit_price=avg_exit,
+            emergsl_amended_to=remaining,
         )
-        self._logger.info(log_record({
-            "event": "TP_PARTIAL_FILL",
-            "level": "INFO",
-            "component": "WS_MGR",
-            "symbol": symbol,
-            "filled_qty": cum_qty,
-            "remaining_qty": remaining_r,
-            "avg_exit_price": avg_exit,
-            "emergsl_amended_to": remaining_r,
-        }))
 
-    # =================================================================
-    # ENTRY PARTIAL FILL PROTECTION — Section 5.5 (AR-054)
-    # =================================================================
-
-    async def _handle_entry_partial_fill(
-        self, event: dict, trigger: str
-    ) -> None:
-        """
-        Entry partial fill protection. Cases A (expired) and B (canceled).
-        WM-DISP-020/021. Sacred R:R preserved using ACTUAL fill price.
-        """
-        symbol = event.get("symbol", "")
-        cl_ord_id = event.get("cl_ord_id", "")
-        cum_qty = Decimal(str(event.get("cum_qty", 0)))
-        avg_price = Decimal(str(event.get("avg_price", 0)))
-
-        spec = self.pair_cache.get(symbol, {})
-        qty_min = spec.get("qty_min", Decimal("0"))
-        cost_min = spec.get("cost_min", Decimal("0"))
-
-        # Validate minimum size (WM-DISP-021 step 3)
-        if cum_qty < qty_min or (avg_price > Decimal("0") and
-                                  cum_qty * avg_price < cost_min):
-            await self.dispatch_market_sell(symbol, cum_qty)
-            self._logger.info(log_record({
-                "event": "ENTRY_PARTIAL_FILL_BELOW_MIN",
-                "level": "INFO",
-                "component": "WS_MGR",
-                "symbol": symbol,
-                "cum_qty": cum_qty,
-            }))
+    async def _handle_entry_partial_fill(self, event: dict) -> None:
+        """AR-054: GTD entry partial-fill protection."""
+        try:
+            cum_qty = Decimal(str(event.get("cum_qty", 0)))
+            entry_price = Decimal(str(event.get("avg_price", 0)))
+        except Exception:
             return
-
-        # Recalculate TP and emergSL from ACTUAL fill price (WM-DISP-023)
-        atr = self.atr_14.get(symbol, Decimal("0"))
-        mae_mult = Decimal(str(self._ciats_params.get("mae_mult", MAE_MULT)))
-        emerg_mult = Decimal(str(
-            self._ciats_params.get("emergency_sl_mult", EMERGENCY_SL_MULT)
-        ))
-
-        mae_pct = atr * mae_mult / avg_price
-        net_loss = mae_pct + Decimal("0.0016") + Decimal("0.0026")
-        net_gain = net_loss * Decimal("1.5")   # SACRED R:R
-
-        gross_target = avg_price * (Decimal("1") + net_gain)
-        sl_trigger = avg_price * (Decimal("1") - atr * emerg_mult / avg_price)
-
-        spec = self.pair_cache.get(symbol, {})
-        p_incr = spec.get("price_increment", Decimal("0.01"))
-        q_incr = spec.get("qty_increment", Decimal("0.00000001"))
-
-        tp_price = gross_target.quantize(p_incr, rounding=ROUND_UP)
-        sl_price = sl_trigger.quantize(p_incr, rounding=ROUND_DOWN)
-        qty_r = cum_qty.quantize(q_incr, rounding=ROUND_DOWN)
-
-        # Update Position Mirror (WM-DISP-021 step 6)
-        if symbol in self.position_mirror:
-            self.position_mirror[symbol].entry_fill_price = avg_price
-            self.position_mirror[symbol].qty = cum_qty
-
-        # Dispatch batch_add TP + emergSL (WM-DISP-021 step 5)
+        symbol = event.get("symbol", "")
+        if not symbol:
+            return
+        cache = self.pair_cache.get(symbol, {})
+        qty_min = cache.get("qty_min") or Decimal("0")
+        cost_min = cache.get("cost_min") or Decimal("0")
+        if cum_qty < qty_min or cum_qty * entry_price < cost_min:
+            await self.dispatch_market_sell(symbol, cum_qty)
+            self._log("ENTRY_PARTIAL_FILL_BELOW_MIN", level="INFO",
+                      symbol=symbol)
+            return
+        atr = self.atr_14.get(symbol)
+        if atr is None or atr <= 0:
+            await self.dispatch_market_sell(symbol, cum_qty)
+            self._log("ENTRY_PARTIAL_FILL_NO_ATR", level="WARN",
+                      symbol=symbol)
+            return
+        mae_pct = atr * MAE_MULT / entry_price
+        net_loss = mae_pct + FEE_MAKER_PCT + FEE_TAKER_PCT
+        net_gain = net_loss * NET_RR_RATIO
+        tp_price = entry_price * (Decimal("1") + net_gain)
+        sl_trigger = entry_price * (Decimal("1") - mae_pct)
+        cl_ord_id = self._make_cl_ord_id(symbol, prefix="EP")
         await self.batch_add(
             symbol=symbol,
-            entry_fill_price=avg_price,
+            cl_ord_id=cl_ord_id,
+            qty=cum_qty,
             tp_price=tp_price,
-            sl_trigger=sl_price,
-            qty=qty_r,
+            emergsl_trigger_price=sl_trigger,
+        )
+        self.position_mirror[symbol] = PositionRecord(
+            symbol=symbol, qty=cum_qty, entry_price=entry_price,
+            cl_ord_id=cl_ord_id,
+            tp_price=tp_price, emergsl_price=sl_trigger,
+            tp_order_id=f"PAPER_TP_{cl_ord_id}" if self.paper_mode else None,
+            emergsl_order_id=(f"PAPER_SL_{cl_ord_id}"
+                              if self.paper_mode else None),
+        )
+        self._log(
+            "ENTRY_PARTIAL_FILL_PROTECTED", level="INFO",
+            symbol=symbol, qty=cum_qty, entry=entry_price,
+            tp=tp_price, sl=sl_trigger,
         )
 
-        self._logger.warning(log_record({
-            "event": "ENTRY_PARTIAL_FILL_PROTECTED",
-            "level": "HIGH",
-            "component": "WS_MGR",
-            "symbol": symbol,
-            "cum_qty": cum_qty,
-            "avg_price": avg_price,
-        }))
+    @staticmethod
+    def _make_cl_ord_id(symbol: str, prefix: str = "EN") -> str:
+        ts_ms = int(time.time() * 1000) % 1_000_000_000
+        sym_part = symbol.replace("/", "")[:6]
+        s = f"{prefix}{sym_part}{ts_ms}"
+        return s[:18]
 
-    # =================================================================
-    # OUTBOUND MESSAGES — Section 6
-    # =================================================================
+    # ----------------------------------------------------------
+    # Outbound order methods (Section 6 / paper-mode gates)
+    # ----------------------------------------------------------
 
     async def add_order(
         self,
         symbol: str,
-        limit_price: Decimal,
-        order_qty: Decimal,
         cl_ord_id: str,
-        expire_sec: int = ENTRY_GTD_SEC,
+        qty: Decimal,
+        limit_price: Decimal,
     ) -> None:
-        """
-        Dispatch entry limit order (Section 6.4).
-        stp_type: cancel_newest (underscore — HR-WM-009, AR-032).
-        deadline: now + 5s (HR-WM-014, AR-033).
-        post_only: true. time_in_force: gtd.
-        Records cl_ord_id in Position Mirror IMMEDIATELY at dispatch.
-        Registers in Pending Order Registry (WM-POR-002).
-        """
-        # Validate cost (WM-ROUND-006)
-        spec = self.pair_cache.get(symbol, {})
-        qty_min = spec.get("qty_min", Decimal("0"))
-        cost_min = spec.get("cost_min", Decimal("0"))
-        if order_qty < qty_min or order_qty * limit_price < cost_min:
-            self._logger.warning(log_record({
-                "event": "INSUFFICIENT_QTY",
-                "level": "WARN",
-                "component": "WS_MGR",
-                "symbol": symbol,
-                "order_qty": order_qty,
-                "limit_price": limit_price,
-                "qty_min": qty_min,
-                "cost_min": cost_min,
-            }))
+        cache = self.pair_cache.get(symbol, {})
+        q_incr = cache.get("qty_increment") or Decimal("0")
+        p_incr = cache.get("price_increment") or Decimal("0")
+        if q_incr > 0:
+            qty = qty.quantize(q_incr, rounding=ROUND_DOWN)
+        if p_incr > 0:
+            limit_price = limit_price.quantize(p_incr, rounding=ROUND_DOWN)
+        self.pending_orders[cl_ord_id] = qty * limit_price
+        if self.paper_mode:
+            self._log(
+                "PAPER_ORDER_SIMULATED", level="INFO",
+                symbol=symbol, cl_ord_id=cl_ord_id,
+                qty=qty, price=limit_price,
+            )
+            asyncio.create_task(
+                self._simulate_entry_fill(cl_ord_id, symbol, limit_price, qty),
+                name=f"paper_entry_{cl_ord_id}",
+            )
             return
-
-        now_utc = datetime.now(timezone.utc)
-        deadline = (now_utc + timedelta(seconds=5)).isoformat()
-        expire_time = (now_utc + timedelta(seconds=expire_sec)).isoformat()
-        req_id = self._next_req_id()
-
+        deadline = (datetime.now(timezone.utc)
+                    + timedelta(seconds=DEADLINE_OFFSET_SEC)).isoformat()
+        expire_time = (datetime.now(timezone.utc)
+                       + timedelta(seconds=ENTRY_GTD_SECONDS)).isoformat()
         payload = {
             "method": "add_order",
             "params": {
@@ -2456,1422 +2185,747 @@ class WSManager:
                 "side": "buy",
                 "symbol": symbol,
                 "limit_price": str(limit_price),
-                "order_qty": str(order_qty),
+                "order_qty": str(qty),
                 "post_only": True,
                 "time_in_force": "gtd",
                 "expire_time": expire_time,
-                "stp_type": "cancel_newest",   # HR-WM-009: underscore in WS v2
+                "stp_type": "cancel_newest",
                 "deadline": deadline,
                 "cl_ord_id": cl_ord_id,
                 "token": self._ws_token,
             },
-            "req_id": req_id,
+            "req_id": self._next_req_id(),
         }
-
-        # Register in Pending Order Registry BEFORE sending (WM-POR-002)
-        estimated_cost = order_qty * limit_price
-        self.pending_orders[cl_ord_id] = estimated_cost
-
-        # Record cl_ord_id in Position Mirror IMMEDIATELY (no async gap)
-        if symbol not in self.position_mirror:
-            self.position_mirror[symbol] = PositionRecord(
-                symbol=symbol,
-                cl_ord_id=cl_ord_id,
-            )
-
-        # Paper mode gate — intercept ALL order dispatch (FC-001)
-        if self.paper_mode:
-            self._logger.info(log_record({
-                "event": "PAPER_ORDER_SIMULATED",
-                "level": "INFO",
-                "component": "WS_MGR",
-                "symbol": symbol,
-                "cl_ord_id": cl_ord_id,
-                "limit_price": limit_price,
-                "order_qty": order_qty,
-            }))
-            asyncio.create_task(
-                self._simulate_entry_fill(symbol, cl_ord_id, limit_price, order_qty)
-            )
-            await self._update_ticker_event_trigger(symbol, "bbo")
-            return
-
         await self._send_private(payload)
-
-        self._logger.info(log_record({
-            "event": "ENTRY_DISPATCHED",
-            "level": "INFO",
-            "component": "WS_MGR",
-            "symbol": symbol,
-            "cl_ord_id": cl_ord_id,
-            "entry_price": limit_price,
-            "qty": order_qty,
-            "deadline": deadline,
-            "connection_id": self.connection_id_private,
-        }))
-
-        # Switch ticker to bbo mode (position now open — Section 16)
-        await self._update_ticker_event_trigger(symbol, "bbo")
+        self._log("ENTRY_DISPATCHED", level="INFO",
+                  symbol=symbol, cl_ord_id=cl_ord_id,
+                  qty=qty, limit_price=limit_price)
 
     async def _simulate_entry_fill(
         self,
-        symbol: str,
         cl_ord_id: str,
-        limit_price: Decimal,
-        order_qty: Decimal,
+        symbol: str,
+        price: Decimal,
+        qty: Decimal,
     ) -> None:
-        """
-        Simulate entry fill for paper trading mode (TB00063 §2.4.4, FC-006).
-        100ms delay avoids same-tick race. Fee = 0.26% taker (FC-007).
-        Drives downstream fill pipeline identically to live Kraken fill.
-        """
-        await asyncio.sleep(0.1)  # 100ms — avoids same-tick race
-        fee_usd = order_qty * limit_price * Decimal("0.0026")
-        synthetic_order_id = f"PAPER_ENTRY_{cl_ord_id}"
-        synthetic_event = {
-            "order_id":         synthetic_order_id,
-            "cl_ord_id":        cl_ord_id,
-            "symbol":           symbol,
-            "exec_type":        "filled",
-            "side":             "buy",
-            "last_price":       str(limit_price),
-            "last_qty":         str(order_qty),
-            "cum_cost":         str(order_qty * limit_price),
-            "fee_usd_equiv":    str(fee_usd),
-            "timestamp":        datetime.now(timezone.utc).isoformat(),
-        }
-        await self._handle_filled(synthetic_event)
+        await asyncio.sleep(0.1)
+        self.position_mirror[symbol] = PositionRecord(
+            symbol=symbol, qty=qty, entry_price=price,
+            cl_ord_id=cl_ord_id,
+        )
+        self.pending_orders.pop(cl_ord_id, None)
+        self._log("PAPER_ENTRY_FILLED", level="INFO",
+                  symbol=symbol, cl_ord_id=cl_ord_id,
+                  qty=qty, price=price)
+        await self._update_ticker_event_trigger(symbol, "bbo")
+        if self._execution_engine_fn is not None:
+            try:
+                res = self._execution_engine_fn(
+                    event="entry_filled",
+                    symbol=symbol, cum_qty=qty, avg_price=price,
+                )
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception as e:
+                self._log("EXEC_ENGINE_ERROR", level="WARN",
+                          error=str(e), symbol=symbol)
 
     async def batch_add(
         self,
         symbol: str,
-        entry_fill_price: Decimal,
-        tp_price: Decimal,
-        sl_trigger: Decimal,
+        cl_ord_id: str,
         qty: Decimal,
-        tp_cl_ord_id: str = "",
-        sl_cl_ord_id: str = "",
+        tp_price: Decimal,
+        emergsl_trigger_price: Decimal,
     ) -> None:
-        """
-        Dispatch TP limit + emergSL stop-loss as atomic batch (Section 6.5).
-        emergSL triggers block MANDATORY with reference="last" (HR-WM-015, AR-046).
-        Validates R:R and prices BEFORE dispatch.
-        """
-        # Pre-dispatch validation (Section 6.5)
-        if tp_price <= entry_fill_price:
-            self._logger.critical(log_record({
-                "event": "BATCH_ADD_VALIDATION_FAIL",
-                "level": "CRITICAL",
-                "component": "WS_MGR",
-                "symbol": symbol,
-                "reason": "tp_price <= entry_fill_price",
-                "tp_price": tp_price,
-                "entry": entry_fill_price,
-            }))
+        cache = self.pair_cache.get(symbol, {})
+        q_incr = cache.get("qty_increment") or Decimal("0")
+        p_incr = cache.get("price_increment") or Decimal("0")
+        if q_incr > 0:
+            qty = qty.quantize(q_incr, rounding=ROUND_DOWN)
+        if p_incr > 0:
+            tp_price = tp_price.quantize(p_incr, rounding=ROUND_UP)
+            emergsl_trigger_price = emergsl_trigger_price.quantize(
+                p_incr, rounding=ROUND_DOWN
+            )
+        tp_cl = f"TP_{cl_ord_id}"[:18]
+        sl_cl = f"SL_{cl_ord_id}"[:18]
+        if self.paper_mode:
+            pos = self.position_mirror.get(symbol)
+            if pos is not None:
+                pos.tp_price = tp_price
+                pos.emergsl_price = emergsl_trigger_price
+                pos.tp_order_id = f"PAPER_TP_{cl_ord_id}"
+                pos.emergsl_order_id = f"PAPER_SL_{cl_ord_id}"
+            self._log("PAPER_BATCH_ADD_SIMULATED", level="INFO",
+                      symbol=symbol, cl_ord_id=cl_ord_id,
+                      tp_price=tp_price,
+                      emergsl_price=emergsl_trigger_price)
             return
-        if sl_trigger >= entry_fill_price:
-            self._logger.critical(log_record({
-                "event": "BATCH_ADD_VALIDATION_FAIL",
-                "level": "CRITICAL",
-                "component": "WS_MGR",
-                "symbol": symbol,
-                "reason": "sl_trigger >= entry_fill_price",
-                "sl_trigger": sl_trigger,
-                "entry": entry_fill_price,
-            }))
-            return
-
-        now_utc = datetime.now(timezone.utc)
-        deadline = (now_utc + timedelta(seconds=5)).isoformat()
-        req_id = self._next_req_id()
-
-        if not tp_cl_ord_id:
-            tp_cl_ord_id = f"tp_{self._req_id_counter}"
-        if not sl_cl_ord_id:
-            sl_cl_ord_id = f"sl_{self._req_id_counter}"
-
+        deadline = (datetime.now(timezone.utc)
+                    + timedelta(seconds=DEADLINE_OFFSET_SEC)).isoformat()
         payload = {
             "method": "batch_add",
             "params": {
                 "orders": [
-                    {   # TP limit sell
+                    {
                         "order_type": "limit",
                         "side": "sell",
                         "symbol": symbol,
                         "limit_price": str(tp_price),
                         "order_qty": str(qty),
-                        "post_only": False,
+                        "cl_ord_id": tp_cl,
                         "stp_type": "cancel_newest",
                         "deadline": deadline,
-                        "cl_ord_id": tp_cl_ord_id,
                     },
-                    {   # emergSL stop-loss — HR-WM-015 triggers block MANDATORY
+                    {
                         "order_type": "stop-loss",
                         "side": "sell",
                         "symbol": symbol,
-                        "trigger_price": str(sl_trigger),
+                        "limit_price": str(emergsl_trigger_price),
                         "order_qty": str(qty),
+                        "cl_ord_id": sl_cl,
                         "triggers": {
-                            "reference":  "last",     # AR-046: NEVER rely on default
-                            "price":      str(sl_trigger),
+                            "reference": "last",
+                            "price": str(emergsl_trigger_price),
                             "price_type": "static",
                         },
                         "stp_type": "cancel_newest",
                         "deadline": deadline,
-                        "cl_ord_id": sl_cl_ord_id,
                     },
                 ],
                 "token": self._ws_token,
             },
-            "req_id": req_id,
+            "req_id": self._next_req_id(),
         }
-        # Paper mode gate — intercept batch_add dispatch (FC-001)
-        if self.paper_mode:
-            if symbol in self.position_mirror:
-                pos = self.position_mirror[symbol]
-                pos.tp_price = tp_price
-                pos.emergsl_price = sl_trigger
-                pos.tp_order_id = f"PAPER_TP_{tp_cl_ord_id}"
-                pos.emergsl_order_id = f"PAPER_SL_{sl_cl_ord_id}"
-                pos.tp_cl_ord_id = tp_cl_ord_id
-                pos.emergsl_cl_ord_id = sl_cl_ord_id
-            self._logger.info(log_record({
-                "event": "PAPER_BATCH_ADD_SIMULATED",
-                "level": "INFO",
-                "component": "WS_MGR",
-                "symbol": symbol,
-                "tp_price": tp_price,
-                "sl_trigger": sl_trigger,
-            }))
-            return
-
         await self._send_private(payload)
-
-        self._logger.info(log_record({
-            "event": "TP_PLACED",
-            "level": "INFO",
-            "component": "WS_MGR",
-            "symbol": symbol,
-            "cl_ord_id": tp_cl_ord_id,
-            "tp_price": tp_price,
-        }))
-        self._logger.info(log_record({
-            "event": "EMERG_SL_PLACED",
-            "level": "INFO",
-            "component": "WS_MGR",
-            "symbol": symbol,
-            "cl_ord_id": sl_cl_ord_id,
-            "sl_trigger": sl_trigger,
-        }))
+        self._log("BATCH_ADD_DISPATCHED", level="INFO",
+                  symbol=symbol, cl_ord_id=cl_ord_id)
 
     async def cancel_order(self, order_id: str) -> None:
-        """
-        Individual cancel with per-order ACK tracking (Section 6.6).
-        Used for Layer 2 MAE exit cancel. NOT batch_cancel.
-        """
-        # Paper mode gate (FC-001)
         if self.paper_mode:
-            self._logger.info(log_record({
-                "event": "PAPER_CANCEL_SIMULATED",
-                "level": "INFO",
-                "component": "WS_MGR",
-                "order_id": order_id,
-            }))
+            self._log("PAPER_CANCEL_SIMULATED", level="INFO",
+                      order_id=order_id)
             return
-
-        req_id = self._next_req_id()
-        self.req_id_registry[req_id] = {
-            "method": "cancel_order",
-            "order_id": order_id,
-            "timestamp": time.time(),
-        }
-        await self._send_private({
+        payload = {
             "method": "cancel_order",
             "params": {
                 "order_id": [order_id],
                 "token": self._ws_token,
             },
-            "req_id": req_id,
-        })
+            "req_id": self._next_req_id(),
+        }
+        await self._send_private(payload)
 
     async def amend_order(self, order_id: str, order_qty: Decimal) -> None:
-        """
-        Amend emergSL qty after TP partial fill (Section 6.7).
-        Use ONLY for emergSL qty amendment. NOT price. NOT entry orders.
-        Saves 7 rate units vs cancel+resubmit (WM-EC-007).
-        """
-        # Paper mode gate (FC-001) — emergSL is simulated via ticker in paper mode
         if self.paper_mode:
-            self._logger.info(log_record({
-                "event": "PAPER_AMEND_SIMULATED",
-                "level": "INFO",
-                "component": "WS_MGR",
-                "order_id": order_id,
-                "order_qty": order_qty,
-            }))
+            self._log("PAPER_AMEND_SIMULATED", level="INFO",
+                      order_id=order_id, new_qty=order_qty)
             return
-
-        req_id = self._next_req_id()
-        await self._send_private({
+        payload = {
             "method": "amend_order",
             "params": {
                 "order_id": order_id,
                 "order_qty": str(order_qty),
                 "token": self._ws_token,
             },
-            "req_id": req_id,
-        })
+            "req_id": self._next_req_id(),
+        }
+        await self._send_private(payload)
 
-    async def batch_cancel(self) -> None:
-        """
-        Batch cancel ALL pending entry GTD orders — FULL HALT ONLY (Section 6.8).
-        Bypasses rate counter max (AR-019).
-        Does NOT cancel TP or emergSL (WM-DMS-004, HR-WM-010).
-        NOT DMS — batch_cancel is explicit, targeted, operator-triggered.
-        """
-        # EXPLICIT PROHIBITION CHECK (WM-DMS-001, HR-WM-010)
-        # This method is batch_cancel — NOT cancel_all_orders_after.
-        # cancel_all_orders_after is NEVER called in TothBot V2.
-
-        # Paper mode gate — FULL_HALT fires normally; no real orders to cancel
+    async def batch_cancel(self, order_ids: _t.List[str]) -> None:
         if self.paper_mode:
-            self._logger.warning(log_record({
-                "event": "PAPER_CANCEL_SIMULATED",
-                "level": "HIGH",
-                "component": "WS_MGR",
-                "note": "FULL_HALT in paper mode — batch_cancel suppressed",
-                "count": len(self.pending_orders),
-            }))
+            for oid in order_ids:
+                self._log("PAPER_CANCEL_SIMULATED",
+                          level="INFO", order_id=oid)
             return
-
-        req_id = self._next_req_id()
-        await self._send_private({
+        payload = {
             "method": "batch_cancel",
             "params": {
-                "orders": [],   # empty = cancel all pending non-resting
+                "orders": order_ids,
                 "token": self._ws_token,
             },
-            "req_id": req_id,
-        })
-        self._logger.warning(log_record({
-            "event": "BATCH_CANCEL_SENT",
-            "level": "HIGH",
-            "component": "WS_MGR",
-            "count": len(self.pending_orders),
-        }))
+            "req_id": self._next_req_id(),
+        }
+        await self._send_private(payload)
 
-    async def dispatch_market_sell(self, symbol: str, qty: Decimal) -> None:
-        """Market sell — used ONLY for partial fill protection cleanup."""
-        # Paper mode gate (FC-001) — simulated entries fill immediately; rarely fires
+    async def dispatch_market_sell(
+        self, symbol: str, qty: Decimal
+    ) -> None:
         if self.paper_mode:
-            bid = self.latest_bid.get(symbol, Decimal("0"))
-            self._logger.info(log_record({
-                "event": "PAPER_MARKET_SELL_SIMULATED",
-                "level": "INFO",
-                "component": "WS_MGR",
-                "symbol": symbol,
-                "qty": qty,
-                "bid": bid,
-            }))
+            self._log("PAPER_MARKET_SELL_SIMULATED", level="INFO",
+                      symbol=symbol, qty=qty)
+            self.position_mirror.pop(symbol, None)
             return
-
-        req_id = self._next_req_id()
-        now_utc = datetime.now(timezone.utc)
-        deadline = (now_utc + timedelta(seconds=5)).isoformat()
-        await self._send_private({
+        cl_ord_id = self._make_cl_ord_id(symbol, prefix="MS")
+        deadline = (datetime.now(timezone.utc)
+                    + timedelta(seconds=DEADLINE_OFFSET_SEC)).isoformat()
+        payload = {
             "method": "add_order",
             "params": {
                 "order_type": "market",
                 "side": "sell",
                 "symbol": symbol,
                 "order_qty": str(qty),
+                "stp_type": "cancel_newest",
                 "deadline": deadline,
+                "cl_ord_id": cl_ord_id,
                 "token": self._ws_token,
             },
-            "req_id": req_id,
-        })
-
-    # =================================================================
-    # CONNECTION HEALTH MONITORING
-    # =================================================================
-
-    async def _ping_loop(self) -> None:
-        """
-        Application-level JSON ping every 30s on EACH connection (WM-CONN-005).
-        No pong within 10s = PING_TIMEOUT, reconnect immediately.
-        Library TCP PING is disabled — this is the SOLE keepalive.
-        """
-        while True:
-            await asyncio.sleep(PING_INTERVAL_SEC)
-            now = time.monotonic()
-
-            # Ping public
-            if self._awaiting_pong_pub:
-                if (self._ping_sent_pub and
-                        now - self._ping_sent_pub > PING_TIMEOUT_SEC):
-                    self._logger.critical(log_record({
-                        "event": "PING_TIMEOUT",
-                        "level": "CRITICAL",
-                        "component": "WS_MGR",
-                        "connection_id": self.connection_id_public,
-                    }))
-                    await self._initiate_reconnect()
-                    return
-            else:
-                pub_req_id = self._next_req_id()
-                self._ping_req_id_pub = pub_req_id
-                self._ping_sent_pub = now
-                self._awaiting_pong_pub = True
-                await self._send_public({
-                    "method": "ping",
-                    "req_id": pub_req_id,
-                })
-                self._logger.debug(log_record({
-                    "event": "PING_SENT",
-                    "level": "DEBUG",
-                    "component": "WS_MGR",
-                    "connection_id": self.connection_id_public,
-                    "req_id": pub_req_id,
-                }))
-
-            # Ping private — skipped in paper mode (_ws_private is None)
-            # FIX-WM-PT-003: guard private ping (DEFECT-WM-PT-002)
-            if self._ws_private is not None:
-                if self._awaiting_pong_priv:
-                    if (self._ping_sent_priv and
-                            now - self._ping_sent_priv > PING_TIMEOUT_SEC):
-                        self._logger.critical(log_record({
-                            "event": "PING_TIMEOUT",
-                            "level": "CRITICAL",
-                            "component": "WS_MGR",
-                            "connection_id": self.connection_id_private,
-                        }))
-                        await self._initiate_reconnect()
-                        return
-                else:
-                    priv_req_id = self._next_req_id()
-                    self._ping_req_id_priv = priv_req_id
-                    self._ping_sent_priv = now
-                    self._awaiting_pong_priv = True
-                    await self._send_private({
-                        "method": "ping",
-                        "req_id": priv_req_id,
-                    })
-                    self._logger.debug(log_record({
-                        "event": "PING_SENT",
-                        "level": "DEBUG",
-                        "component": "WS_MGR",
-                        "connection_id": self.connection_id_private,
-                        "req_id": priv_req_id,
-                    }))
-
-    async def _zombie_monitor(self) -> None:
-        """
-        Zombie connection detection (WM-ZOM-001 through -007).
-        Tracks last_real_data_time_public/private independently.
-        last_real_data_time reset ONLY on real channel events (HR-WM-004).
-        Pong, ACK, heartbeat MUST NOT reset timer (WM-ZOM-005).
-        """
-        while True:
-            await asyncio.sleep(10)  # check every 10s
-            now = time.monotonic()
-
-            if now - self._last_real_data_public > ZOMBIE_THRESHOLD_SEC:
-                elapsed = now - self._last_real_data_public
-                self._logger.critical(log_record({
-                    "event": "ZOMBIE_CONNECTION_DETECTED",
-                    "level": "CRITICAL",
-                    "component": "WS_MGR",
-                    "connection_id": self.connection_id_public,
-                    "elapsed_seconds": Decimal(str(round(elapsed, 1))),
-                }))
-                _alert_operator_direct(
-                    f"ZOMBIE connection detected (public). "
-                    f"No real data for {elapsed:.0f}s. Reconnecting."
-                )
-                await self._initiate_reconnect()
-                return
-
-            # Private zombie check — skipped in paper mode (_ws_private is None)
-            # FIX-WM-PT-004: guard private zombie (DEFECT-WM-PT-002)
-            if self._ws_private is not None:
-                if now - self._last_real_data_private > ZOMBIE_THRESHOLD_SEC:
-                    elapsed = now - self._last_real_data_private
-                    self._logger.critical(log_record({
-                        "event": "ZOMBIE_CONNECTION_DETECTED",
-                        "level": "CRITICAL",
-                        "component": "WS_MGR",
-                        "connection_id": self.connection_id_private,
-                        "elapsed_seconds": Decimal(str(round(elapsed, 1))),
-                    }))
-                    _alert_operator_direct(
-                        f"ZOMBIE connection detected (private). "
-                        f"No real data for {elapsed:.0f}s. Reconnecting."
-                    )
-                    await self._initiate_reconnect()
-                    return
-
-    # =================================================================
-    # SEQUENCE GAP DETECTION
-    # =================================================================
-
-    async def _handle_executions_gap(self, current_seq: int) -> None:
-        """
-        Executions sequence gap — CRITICAL (A-10, Section 7.3).
-        Trigger REST GetOpenOrders reconciliation.
-        """
-        self._logger.critical(log_record({
-            "event": "EXECUTIONS_SEQUENCE_GAP",
-            "level": "CRITICAL",
-            "component": "WS_MGR",
-            "expected": self.executions_last_seq + 1,
-            "received": current_seq,
-            "connection_id": self.connection_id_private,
-        }))
-        _alert_operator_direct(
-            f"EXECUTIONS sequence gap: expected {self.executions_last_seq + 1}, "
-            f"received {current_seq}. Reconciling via REST."
-        )
-        try:
-            open_orders = await self._rest_get_open_orders()
-            await self._reconcile_pending_orders(open_orders)
-        except Exception as exc:  # noqa: BP-ERR-001
-            self._logger.critical(log_record({
-                "event": "EXECUTIONS_GAP_RECONCILE_FAIL",
-                "level": "CRITICAL",
-                "component": "WS_MGR",
-                "error": str(exc),
-            }))
-
-    async def _handle_balances_gap(self, current_seq: int) -> None:
-        """
-        Balances sequence gap — HIGH (A-9, Section 7.2).
-        Trigger REST GetAccountBalance reconciliation.
-        """
-        self._logger.warning(log_record({
-            "event": "BALANCES_SEQUENCE_GAP",
-            "level": "HIGH",
-            "component": "WS_MGR",
-            "expected": self.balances_last_seq + 1,
-            "received": current_seq,
-            "connection_id": self.connection_id_private,
-        }))
-        try:
-            balance_data = await self._rest_get_account_balance()
-            usd_balance = balance_data.get("USD", "0")
-            self.spot_usd_balance = Decimal(str(usd_balance))
-        except Exception as exc:  # noqa: BP-ERR-001
-            self._logger.critical(log_record({
-                "event": "BALANCES_GAP_RECONCILE_FAIL",
-                "level": "CRITICAL",
-                "component": "WS_MGR",
-                "error": str(exc),
-            }))
-
-    async def _reconcile_pending_orders(self, open_orders: dict) -> None:
-        """Reconcile Pending Order Registry against REST GetOpenOrders (WM-POR-005)."""
-        open_cl_ids = {
-            v.get("userref", ""): v
-            for v in open_orders.values()
+            "req_id": self._next_req_id(),
         }
-        # Remove stale entries (closed during gap)
-        stale = [
-            cl_id for cl_id in self.pending_orders
-            if cl_id not in open_cl_ids
-        ]
-        for cl_id in stale:
-            del self.pending_orders[cl_id]
-
-    # =================================================================
-    # DRAWDOWN MONITORING — Section 11
-    # =================================================================
-
-    def _compute_drawdown(self) -> None:
-        """
-        Mark-to-market portfolio value (WM-DD-001/002).
-        Uses bid price from ticker bbo (AR-048).
-        Enforces SESSION_PAUSE (5%) and FULL_HALT (10%) thresholds.
-        portfolio_baseline_USD fixed at startup — NEVER reset (HR-WM-011).
-        """
-        if self.portfolio_baseline_USD is None:
-            return
-
-        # MTM: spot_usd_balance + sum(bid * qty) for all open positions
-        mtm_positions = sum(
-            self.latest_bid.get(sym, Decimal("0")) * pos.qty
-            for sym, pos in self.position_mirror.items()
-        )
-        current_portfolio = self.spot_usd_balance + mtm_positions
-
-        drawdown_pct = max(
-            Decimal("0"),
-            (self.portfolio_baseline_USD - current_portfolio)
-            / self.portfolio_baseline_USD,
-        )
-
-        # FULL_HALT threshold (WM-DD-005)
-        full_halt_thresh = Decimal(str(
-            self._ciats_params.get("full_halt_drawdown", FULL_HALT_THRESHOLD)
-        ))
-        session_pause_thresh = Decimal(str(
-            self._ciats_params.get("session_pause_drawdown", SESSION_PAUSE_THRESHOLD)
-        ))
-
-        if drawdown_pct >= full_halt_thresh and self.system_state != STATE_FULL_HALT:
-            self.system_state = STATE_FULL_HALT
-            self._logger.critical(log_record({
-                "event": "FULL_HALT_TRIGGERED",
-                "level": "CRITICAL",
-                "component": "WS_MGR",
-                "drawdown_pct": drawdown_pct,
-                "open_count": len(self.position_mirror),
-            }))
-            _alert_operator_direct(
-                f"FULL HALT: drawdown {float(drawdown_pct):.1%}. "
-                f"All new entries blocked. batch_cancel dispatched."
-            )
-            asyncio.ensure_future(self.batch_cancel())
-
-        elif (drawdown_pct >= session_pause_thresh and
-              self.system_state == STATE_NORMAL):
-            self.system_state = STATE_SESSION_PAUSE
-            self._logger.warning(log_record({
-                "event": "SESSION_PAUSE_TRIGGERED",
-                "level": "HIGH",
-                "component": "WS_MGR",
-                "drawdown_pct": drawdown_pct,
-            }))
-
-        elif (drawdown_pct < session_pause_thresh and
-              self.system_state == STATE_SESSION_PAUSE):
-            self.system_state = STATE_NORMAL
-            self._logger.info(log_record({
-                "event": "SESSION_PAUSE_RECOVERED",
-                "level": "INFO",
-                "component": "WS_MGR",
-                "drawdown_pct": drawdown_pct,
-            }))
-
-    # =================================================================
-    # REST AssetPairs PAIR MAP BUILD — WM-LIQ-011
-    # =================================================================
-
-    async def _rest_build_pair_maps(self) -> None:
-        """
-        Build _wsname_to_classic and _classic_to_wsname from REST AssetPairs.
-        Called from _warm_up_all_pairs() BEFORE _rest_get_ticker() (WM-LIQ-011).
-        Calls GET /0/public/AssetPairs (public, no auth required).
-        Instrument snapshot does NOT contain altname — maps MUST come from here.
-        Normalizes wsname: "XBT/USD" → "BTC/USD" to match WS v2 pair names.
-        Logs PAIR_MAPS_BUILT on success. Logs PAIR_MAP_BUILD_FAILED on any error.
-        Never raises — caller handles empty maps as fail-safe via Gate 2.
-        """
-        try:
-            async with self._make_http_session() as session:
-                resp = await session.get(
-                    f"{REST_BASE_URL}/0/public/AssetPairs"
-                )
-                data = orjson.loads(await resp.read())
-
-            errors = data.get("error", [])
-            if errors:
-                self._logger.warning(log_record({
-                    "event": "PAIR_MAP_BUILD_FAILED",
-                    "level": "WARN",
-                    "component": "WS_MGR",
-                    "reason": str(errors),
-                }))
-                return
-
-            count = 0
-            for classic_key, info in data.get("result", {}).items():
-                altname = info.get("altname", "")
-                wsname_raw = info.get("wsname", "")
-                if not altname or not wsname_raw:
-                    continue
-
-                # Normalize wsname: WS v2 uses "BTC/USD", AssetPairs uses "XBT/USD"
-                ws_v2_name = wsname_raw.replace("XBT/", "BTC/").replace("/XBT", "/BTC")
-
-                if ws_v2_name in self.pair_cache:
-                    self._wsname_to_classic[ws_v2_name] = altname
-                    self._classic_to_wsname[altname] = ws_v2_name
-                    # Also store normalized classic key for reverse lookup
-                    norm = self._normalize_classic_key(classic_key)
-                    self._classic_to_wsname[norm] = ws_v2_name
-                    count += 1
-                elif wsname_raw in self.pair_cache:
-                    # Fallback: no BTC/XBT substitution needed for this pair
-                    self._wsname_to_classic[wsname_raw] = altname
-                    self._classic_to_wsname[altname] = wsname_raw
-                    norm = self._normalize_classic_key(classic_key)
-                    self._classic_to_wsname[norm] = wsname_raw
-                    count += 1
-
-            self._logger.info(log_record({
-                "event": "PAIR_MAPS_BUILT",
-                "level": "INFO",
-                "component": "WS_MGR",
-                "pairs_mapped": count,
-            }))
-
-        except Exception as exc:  # noqa: BP-ERR-001
-            self._logger.warning(log_record({
-                "event": "PAIR_MAP_BUILD_FAILED",
-                "level": "WARN",
-                "component": "WS_MGR",
-                "reason": str(exc),
-            }))
-
-    # =================================================================
-    # INDICATOR SEEDING — from REST GetOHLCData (Section 9.2/9.3)
-    # =================================================================
-
-    async def _warm_up_all_pairs(self) -> None:
-        """
-        Seed indicators for all pairs in monitored_universe (WM-WARMUP-001/002).
-        DEFECT-SS-006: Step 0 added — fetch 24h liquidity for ALL online
-        USD/USDC candidates via REST Ticker before seeding indicators (WM-LIQ-004).
-        After liquidity fetch: re-rank monitored_universe by actual USD volume
-        (volume not available during _build_monitored_universe — placeholder order
-        replaced here). Filter by UNIVERSE_MIN_VOLUME_USD. Top N=50. BTC/USD always in.
-        Launch _liquidity_refresh_loop() asyncio task (WM-LIQ-006).
-        asyncio.gather() parallelizes indicator seeding across pairs.
-        return_exceptions=True: one pair failure does not abort others.
-        Logs SYSTEM_OPERATIONAL when at least one pair reaches READY (SS-STARTUP-022).
-        Called from _subscribe_ohlc_channels() after ohlc(5) subscription sent.
-        Paper mode: identical path (WM-WARMUP-001).
-        """
-        if not self.monitored_universe and not self.pair_cache:
-            return
-
-        self._logger.info(log_record({
-            "event": "WARMUP_REST_STARTED",
-            "level": "INFO",
-            "component": "WS_MGR",
-            "pairs": len(self.monitored_universe),
-        }))
-
-        # ── Step 0: Fetch 24h liquidity for ALL online USD/USDC/USDT candidates ──
-        # Must fetch ALL (not just monitored_universe) to rank by volume (WM-LIQ-004)
-        candidates = [
-            sym for sym, spec in self.pair_cache.items()
-            if spec.get("quote_currency") in ("USD", "USDC", "USDT")
-            and spec.get("status") == "online"
-        ]
-
-        # Build WS name → REST altname maps from AssetPairs (WM-LIQ-011, dv1_17 fix)
-        # Must be called BEFORE _rest_get_ticker() — maps required for Ticker lookup.
-        await self._rest_build_pair_maps()
-
-        liquidity_result = await self._rest_get_ticker(candidates)
-
-        if liquidity_result:
-            self.liquidity_24h.update(liquidity_result)
-            self._logger.info(log_record({
-                "event": "LIQUIDITY_SEEDED",
-                "level": "INFO",
-                "component": "WS_MGR",
-                "pairs_count": len(liquidity_result),
-                "threshold": str(UNIVERSE_MIN_VOLUME_USD),
-            }))
-            for sym, vol in liquidity_result.items():
-                self._logger.debug(log_record({
-                    "event": "LIQUIDITY_SEEDED_DETAIL",
-                    "level": "DEBUG",
-                    "component": "WS_MGR",
-                    "symbol": sym,
-                    "usd_volume_24h": str(vol),
-                }))
-        else:
-            # Retry once after 2s (WM-LIQ-008b)
-            await asyncio.sleep(2)
-            liquidity_result = await self._rest_get_ticker(candidates)
-            if liquidity_result:
-                self.liquidity_24h.update(liquidity_result)
-                self._logger.info(log_record({
-                    "event": "LIQUIDITY_SEEDED",
-                    "level": "INFO",
-                    "component": "WS_MGR",
-                    "pairs_count": len(liquidity_result),
-                    "threshold": str(UNIVERSE_MIN_VOLUME_USD),
-                }))
-            else:
-                self._logger.warning(log_record({
-                    "event": "LIQUIDITY_SEED_FAILED",
-                    "level": "WARN",
-                    "component": "WS_MGR",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "reason": "startup_failure",
-                    "note": "Gate 2 will block all entries until refresh succeeds",
-                }))
-                # Gate 2 blocks all entries — system is fail-safe (WM-LIQ-010)
-
-        # ── Step 0b: Re-rank monitored_universe by actual volume ─────────────
-        # _build_monitored_universe() used alphabetical order as placeholder.
-        # Now that volume data is available, apply proper ranking (WM-PS-002/003).
-        if self.liquidity_24h:
-            min_vol = Decimal(str(
-                self._ciats_params.get("min_volume_usd_daily", UNIVERSE_MIN_VOLUME_USD)
-            ))
-            # Filter candidates by volume threshold
-            ranked = [
-                (sym, vol)
-                for sym, vol in self.liquidity_24h.items()
-                if vol >= min_vol and sym in self.pair_cache
-            ]
-            # Sort by volume descending
-            ranked.sort(key=lambda x: x[1], reverse=True)
-            top_symbols = [sym for sym, _ in ranked]
-            # BTC/USD always included (AR-074, WM-PS-003)
-            if "BTC/USD" not in top_symbols and "BTC/USD" in self.pair_cache:
-                top_symbols.append("BTC/USD")
-            self.monitored_universe = top_symbols
-            self._logger.info(log_record({
-                "event": "UNIVERSE_RANKED_BY_VOLUME",
-                "level": "INFO",
-                "component": "WS_MGR",
-                "universe_size": len(self.monitored_universe),
-                "volume_threshold_usd": str(min_vol),
-            }))
-
-        # ── Step 0c: Launch periodic liquidity refresh task (WM-LIQ-006) ────
-        # Launched regardless of seed success — will populate on next cycle.
-        asyncio.create_task(self._liquidity_refresh_loop())
-
-        # ── Step 1: Seed indicators for all monitored pairs (WM-WARMUP-002) ─
-        await asyncio.gather(
-            *[self.seed_indicators_from_rest(s) for s in self.monitored_universe],
-            return_exceptions=True,
-        )
-
-        ready_count = sum(
-            1 for s in self.monitored_universe
-            if self.warm_up_state.get(s) == WARMUP_READY
-        )
-        self._logger.info(log_record({
-            "event": "WARMUP_REST_COMPLETE",
-            "level": "INFO",
-            "component": "WS_MGR",
-            "ready_pairs": ready_count,
-            "total_pairs": len(self.monitored_universe),
-        }))
-
-        # WM-WARMUP-004: Seed regime cache at startup before declaring SYSTEM_OPERATIONAL.
-        # Gate 3 blocks all entries with NO_REGIME_DATA until this completes (~55s).
-        # Awaited (not a task) — SYSTEM_OPERATIONAL must not fire until regime is ready.
-        if self._regime_engine_fn:
-            self._logger.info(log_record({
-                "event": "REGIME_STARTUP_SEED_STARTED",
-                "level": "INFO",
-                "component": "WS_MGR",
-                "pairs": len(self.monitored_universe),
-                "note": "Gate 3 blocks entries until complete",
-            }))
-            await self._trigger_daily_regime_refresh()
-            self._logger.info(log_record({
-                "event": "REGIME_STARTUP_SEED_COMPLETE",
-                "level": "INFO",
-                "component": "WS_MGR",
-            }))
-
-        if ready_count > 0:
-            self._logger.info(log_record({
-                "event": "SYSTEM_OPERATIONAL",
-                "level": "INFO",
-                "component": "WS_MGR",
-                "ready_pairs": ready_count,
-                "total_pairs": len(self.monitored_universe),
-                "note": "Pipeline active for READY pairs",
-            }))
-
-    async def _liquidity_refresh_loop(self) -> None:
-        """
-        Periodic REST Ticker refresh for monitored_universe (WM-LIQ-005/006).
-        Long-lived asyncio task for the lifetime of the TothBot process.
-        Sleeps liquidity_refresh_hours (CIATS starting value: 4) between cycles.
-        On each cycle: refreshes liquidity_24h for monitored_universe pairs only.
-        On success: liquidity_24h.update() — existing values preserved for other pairs.
-        On failure: NEVER zeros out existing values (WM-LIQ-008a).
-        Never raises — catches all exceptions, logs, sleeps, retries (WM-LIQ-008c).
-        """
-        while True:
-            try:
-                refresh_hours = int(
-                    self._ciats_params.get(
-                        "liquidity_refresh_hours", LIQUIDITY_REFRESH_HOURS
-                    )
-                )
-                await asyncio.sleep(refresh_hours * 3600)
-
-                result = await self._rest_get_ticker(
-                    list(self.monitored_universe)
-                )
-
-                if result:
-                    self.liquidity_24h.update(result)
-                    self._logger.info(log_record({
-                        "event": "LIQUIDITY_REFRESHED",
-                        "level": "INFO",
-                        "component": "WS_MGR",
-                        "pairs_count": len(result),
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    }))
-                else:
-                    self._logger.warning(log_record({
-                        "event": "LIQUIDITY_REFRESH_FAILED",
-                        "level": "WARN",
-                        "component": "WS_MGR",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "error": "empty_result",
-                        "note": "Prior cache values preserved",
-                    }))
-                    # Prior cache preserved — Gate 2 still functional (WM-LIQ-008a)
-
-            except Exception as exc:  # noqa: BP-ERR-001
-                self._logger.warning(log_record({
-                    "event": "LIQUIDITY_REFRESH_FAILED",
-                    "level": "WARN",
-                    "component": "WS_MGR",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "error": str(exc),
-                    "note": "Prior cache values preserved",
-                }))
-                # Continue loop — next sleep cycle will retry (WM-LIQ-008c)
-
-    async def seed_indicators_from_rest(self, symbol: str) -> None:
-        """
-        Seed all five SSS indicators + HTF cache from REST GetOHLCData.
-        Uses response[:-1] — HR-WM-013.
-        Stagger 1.1s between sequential calls to same pair (AR-036).
-        HR-WM-017: All five indicators seeded before pair reaches READY.
-        """
-        async with self._make_http_session() as session:
-            # Seed 5m indicators
-            candles_5m = await self._rest_get_ohlc(session, symbol, 5)
-            await asyncio.sleep(OHLC_REST_STAGGER_SEC)
-
-            # Seed 60m HTF cache
-            candles_60m = await self._rest_get_ohlc(session, symbol, 60)
-
-        self.warm_up_state[symbol] = WARMUP_WARMING
-
-        self._logger.debug(log_record({
-            "event": "PAIR_WARM_UP_STARTED",
-            "level": "DEBUG",
-            "component": "WS_MGR",
-            "symbol": symbol,
-        }))
-
-        # Seed 5m indicators from 5m candles
-        self._seed_5m_indicators(symbol, candles_5m)
-
-        # Seed SignalPipeline SSS state (DEFECT-SS-005)
-        # Pipeline has its own _sss_state dict that must be seeded
-        # separately from WSManager's indicator caches.
-        if self._signal_pipeline is not None:
-            ohlc_dicts = [
-                {"close": str(c[4]), "volume": str(c[6])}
-                for c in candles_5m
-            ]
-            self._signal_pipeline.seed_indicators(symbol, ohlc_dicts)
-
-        # Seed HTF EMAs from 60m candles
-        self._seed_htf_ema(symbol, candles_60m)
-
-        # Initialize last_interval_begin from response[-2].interval_begin
-        # (WM-OHLC-006: response[-1] excluded, so "last" = candles_5m[-1])
-        if len(candles_5m) >= 1:
-            last_candle = candles_5m[-1]  # already excludes uncommitted
-            # Kraken REST OHLC: [time, open, high, low, close, vwap, volume, count]
-            self.last_interval_begin[symbol] = str(last_candle[0])
-
-        if len(candles_60m) >= 1:
-            self.last_interval_begin_60[symbol] = str(candles_60m[-1][0])
-
-        self.warm_up_state[symbol] = WARMUP_READY
-        self._logger.info(log_record({
-            "event": "PAIR_READY",
-            "level": "INFO",
-            "component": "WS_MGR",
-            "symbol": symbol,
-        }))
-
-    def _seed_5m_indicators(self, symbol: str, candles: list) -> None:
-        """
-        Seed ATR(14), RSI(14) Wilder SMMA, EMA(9), EMA(21), VolMA(20).
-        Section 9.2. Uses response[:-1] per HR-WM-013 (already applied).
-        Kraken REST OHLC format: [time, open, high, low, close, vwap, volume, count]
-        """
-        if len(candles) < 21:
-            return  # Not enough data to seed
-
-        opens  = [Decimal(str(c[1])) for c in candles]
-        highs  = [Decimal(str(c[2])) for c in candles]
-        lows   = [Decimal(str(c[3])) for c in candles]
-        closes = [Decimal(str(c[4])) for c in candles]
-        vols   = [Decimal(str(c[6])) for c in candles]
-
-        # ── ATR(14) ──────────────────────────────────────────────────────
-        trs = []
-        for i in range(1, len(closes)):
-            tr = max(
-                highs[i] - lows[i],
-                abs(highs[i] - closes[i - 1]),
-                abs(lows[i] - closes[i - 1]),
-            )
-            trs.append(tr)
-
-        # Seed: SMA of first 14 TRs
-        atr = sum(trs[:14]) / Decimal("14")
-        # Incremental update for remaining
-        for tr in trs[14:]:
-            atr = (atr * Decimal("13") + tr) / Decimal("14")
-        self.atr_14[symbol] = atr
-        self._prev_close[symbol] = closes[-1]
-
-        # ── RSI(14) — Wilder's SMMA (HR-WM-018, AR-076) ─────────────────
-        gains = []
-        losses = []
-        for i in range(1, len(closes)):
-            delta = closes[i] - closes[i - 1]
-            gains.append(delta if delta > Decimal("0") else Decimal("0"))
-            losses.append(abs(delta) if delta < Decimal("0") else Decimal("0"))
-
-        # Seed: SMA of first 14
-        avg_gain = sum(gains[:14]) / Decimal("14")
-        avg_loss = sum(losses[:14]) / Decimal("14")
-        # Incremental Wilder SMMA for remaining
-        for i in range(14, len(gains)):
-            avg_gain = (avg_gain * Decimal("13") + gains[i]) / Decimal("14")
-            avg_loss = (avg_loss * Decimal("13") + losses[i]) / Decimal("14")
-        self.rsi_avg_gain[symbol] = avg_gain
-        self.rsi_avg_loss[symbol] = avg_loss
-
-        # ── EMA(9) — alpha = 2/10 = 0.2 ─────────────────────────────────
-        alpha_9 = Decimal("2") / Decimal("10")
-        ema9 = sum(closes[:9]) / Decimal("9")
-        for c in closes[9:]:
-            ema9 = alpha_9 * c + (Decimal("1") - alpha_9) * ema9
-        self.ema_9[symbol] = ema9
-
-        # ── EMA(21) — alpha = 2/22 ────────────────────────────────────────
-        alpha_21 = Decimal("2") / Decimal("22")
-        ema21 = sum(closes[:21]) / Decimal("21")
-        for c in closes[21:]:
-            ema21 = alpha_21 * c + (Decimal("1") - alpha_21) * ema21
-        self.ema_21[symbol] = ema21
-
-        # ── VolMA(20) — rolling SMA ───────────────────────────────────────
-        vol_window = list(vols[-20:])
-        self._volume_buffer[symbol] = vol_window
-        self.volume_ma_20[symbol] = sum(vol_window) / Decimal("20")
-
-    def _seed_htf_ema(self, symbol: str, candles_60m: list) -> None:
-        """
-        Seed HTF EMA(20) and EMA(50) from 1H candles (Section 9.3).
-        alpha_20 = 2/21. alpha_50 = 2/51.
-        """
-        if len(candles_60m) < 50:
-            return
-
-        closes_60 = [Decimal(str(c[4])) for c in candles_60m]
-
-        # EMA(20) — alpha = 2/21
-        alpha_20 = Decimal("2") / Decimal("21")
-        htf20 = sum(closes_60[:20]) / Decimal("20")
-        for c in closes_60[20:]:
-            htf20 = alpha_20 * c + (Decimal("1") - alpha_20) * htf20
-        self.htf_ema_20[symbol] = htf20
-
-        # EMA(50) — alpha = 2/51
-        alpha_50 = Decimal("2") / Decimal("51")
-        htf50 = sum(closes_60[:50]) / Decimal("50")
-        for c in closes_60[50:]:
-            htf50 = alpha_50 * c + (Decimal("1") - alpha_50) * htf50
-        self.htf_ema_50[symbol] = htf50
-
-    def _update_indicators_5m(self, symbol: str, candle: OHLCCandle) -> None:
-        """
-        Incremental O(1) indicator update on each closed 5m candle.
-        ATR: Wilder SMMA. RSI: Wilder SMMA. EMA9/21: standard EMA.
-        VolMA20: rolling SMA.
-        """
-        close = candle.close
-        high = candle.high
-        low = candle.low
-        prev_close = self._prev_close.get(symbol, close)
-
-        # ATR(14) incremental (AR-016)
-        tr = max(
-            high - low,
-            abs(high - prev_close),
-            abs(low - prev_close),
-        )
-        prev_atr = self.atr_14.get(symbol, tr)
-        self.atr_14[symbol] = (prev_atr * Decimal("13") + tr) / Decimal("14")
-        self._prev_close[symbol] = close
-
-        # RSI(14) Wilder SMMA (HR-WM-018)
-        delta = close - prev_close
-        gain = delta if delta > Decimal("0") else Decimal("0")
-        loss = abs(delta) if delta < Decimal("0") else Decimal("0")
-        prev_gain = self.rsi_avg_gain.get(symbol, gain)
-        prev_loss = self.rsi_avg_loss.get(symbol, loss)
-        self.rsi_avg_gain[symbol] = (prev_gain * Decimal("13") + gain) / Decimal("14")
-        self.rsi_avg_loss[symbol] = (prev_loss * Decimal("13") + loss) / Decimal("14")
-
-        # EMA(9) alpha=0.2
-        alpha_9 = Decimal("2") / Decimal("10")
-        prev_ema9 = self.ema_9.get(symbol, close)
-        self.ema_9[symbol] = alpha_9 * close + (Decimal("1") - alpha_9) * prev_ema9
-
-        # EMA(21) alpha=2/22
-        alpha_21 = Decimal("2") / Decimal("22")
-        prev_ema21 = self.ema_21.get(symbol, close)
-        self.ema_21[symbol] = alpha_21 * close + (Decimal("1") - alpha_21) * prev_ema21
-
-        # VolMA(20) rolling SMA
-        buf = self._volume_buffer.get(symbol, [])
-        buf.append(candle.volume)
-        if len(buf) > 20:
-            buf.pop(0)
-        self._volume_buffer[symbol] = buf
-        self.volume_ma_20[symbol] = sum(buf) / Decimal(str(len(buf)))
-
-    def _update_htf_ema(self, symbol: str, close_60: Decimal) -> None:
-        """Incremental HTF EMA update on each 1H candle close."""
-        alpha_20 = Decimal("2") / Decimal("21")
-        alpha_50 = Decimal("2") / Decimal("51")
-
-        prev20 = self.htf_ema_20.get(symbol, close_60)
-        prev50 = self.htf_ema_50.get(symbol, close_60)
-        self.htf_ema_20[symbol] = alpha_20 * close_60 + (Decimal("1") - alpha_20) * prev20
-        self.htf_ema_50[symbol] = alpha_50 * close_60 + (Decimal("1") - alpha_50) * prev50
-
-    def _increment_hold_candle_counts(self) -> None:
-        """Increment hold_candle_count for all open positions on 5m candle."""
-        for pos in self.position_mirror.values():
-            pos.hold_candle_count += 1
-
-    # =================================================================
-    # DAILY REGIME REFRESH — 00:00 UTC
-    # =================================================================
-
-    async def _trigger_daily_regime_refresh(self) -> None:
-        """
-        Trigger Regime Engine daily computation at 00:00 UTC.
-        Passes daily OHLC (interval=1440) response[:-1].
-        """
-        if not self._regime_engine_fn:
-            return
-        try:
-            async with self._make_http_session() as session:
-                daily_candles = await self._rest_get_ohlc(
-                    session, "BTC/USD", 1440
-                )
-            await self._regime_engine_fn(daily_candles, "BTC/USD")
-        except Exception as exc:  # noqa: BP-ERR-001
-            self._logger.warning(log_record({
-                "event": "REGIME_REFRESH_FAIL",
-                "level": "WARN",
-                "component": "WS_MGR",
-                "error": str(exc),
-            }))
-
-    # =================================================================
-    # PIPELINE PRE-COMPUTATION CACHE — AR-I-2
-    # =================================================================
-
-    def _build_pre_comp_cache(self, symbol: str) -> dict:
-        """
-        Build pre-computation cache for pipeline eval (AR-I-2).
-        Hot path reads: regime cache, HTF EMAs, ATR, 24h liquidity, pair status,
-        exit_cooldown_log, consecutive_loss_count.
-        """
-        return {
-            "symbol": symbol,
-            "atr_14": self.atr_14.get(symbol, Decimal("0")),
-            "rsi_14_avg_gain": self.rsi_avg_gain.get(symbol, Decimal("0")),
-            "rsi_14_avg_loss": self.rsi_avg_loss.get(symbol, Decimal("0")),
-            "ema_9": self.ema_9.get(symbol, Decimal("0")),
-            "ema_21": self.ema_21.get(symbol, Decimal("0")),
-            "volume_ma_20": self.volume_ma_20.get(symbol, Decimal("0")),
-            "htf_ema_20": self.htf_ema_20.get(symbol, Decimal("0")),
-            "htf_ema_50": self.htf_ema_50.get(symbol, Decimal("0")),
-            "spot_usd_balance": self.spot_usd_balance,
-            "pending_orders_total": sum(self.pending_orders.values()),
-            "open_position_count": len(self.position_mirror),
-            "pair_status": self.pair_status.get(symbol, "online"),
-            "engine_state": self.engine_state,
-            "system_state": self.system_state,
-            "exit_cooldown_log": dict(self.exit_cooldown_log),
-            "consecutive_loss_count": dict(self.consecutive_loss_count),
-            "rate_counter_by_pair": dict(self.rate_counter_by_pair),
-            "maxratecount": self.maxratecount,
-            "latest_bid": dict(self.latest_bid),
-        }
-
-    # =================================================================
-    # SELECTION CONTROLLER STATE (AR-073) — Section 9.4
-    # =================================================================
-
-    def update_selection_controller_state(
-        self, symbol: str, exit_reason: str
+        await self._send_private(payload)
+        self._log("MARKET_SELL_DISPATCHED", level="INFO",
+                  symbol=symbol, qty=qty)
+
+    # ----------------------------------------------------------
+    # Paper fill detection (HR-WM-024 / Section 13.3)
+    # ----------------------------------------------------------
+
+    async def _maybe_paper_fill(
+        self, symbol: str, bid: Decimal, ask: Decimal
     ) -> None:
-        """
-        Update exit_cooldown_log and consecutive_loss_count on position close.
-        WM-SC-001/002. Both dicts PRESERVED across reconnect (WM-SC-003).
-        """
-        self.exit_cooldown_log[symbol] = time.monotonic()
+        pos = self.position_mirror.get(symbol)
+        if pos is None or pos.tp_price is None or pos.emergsl_price is None:
+            return
+        # TP check first (HR-WM-024).
+        if ask >= pos.tp_price:
+            self._log("PAPER_TP_FILL_DETECTED", level="INFO",
+                      symbol=symbol, tp_price=pos.tp_price, ask=ask)
+            self._fire_ciats_outcome(symbol, exit_reason="TP_FILL", pos=pos)
+            self.position_mirror.pop(symbol, None)
+            await self._update_ticker_event_trigger(symbol, "trades")
+            return
+        if bid <= pos.emergsl_price:
+            self._log("PAPER_EMERG_SL_TRIGGERED", level="INFO",
+                      symbol=symbol, emergsl_price=pos.emergsl_price,
+                      bid=bid)
+            self._fire_ciats_outcome(
+                symbol, exit_reason="EMERGENCY_SL", pos=pos
+            )
+            self.position_mirror.pop(symbol, None)
+            await self._update_ticker_event_trigger(symbol, "trades")
 
-        loss_reasons = {
-            "MAE_THRESHOLD_BREACH", "TIME_EXPIRY",
+    def _fire_ciats_outcome(
+        self, symbol: str, exit_reason: str, pos: PositionRecord
+    ) -> None:
+        # Selection Controller state update (WM-SC-002).
+        self.exit_cooldown_log[symbol] = time.monotonic()
+        if exit_reason == "TP_FILL":
+            self.consecutive_loss_count[symbol] = 0
+        elif exit_reason in (
+            "EMERGENCY_SL", "MAE_THRESHOLD_BREACH", "TIME_EXPIRY",
             "HTF_REGIME_REVERSAL", "DAILY_REGIME_DOWNGRADE",
             "SIGNAL_DECAY",
-        }
-        if exit_reason in loss_reasons:
+        ):
             self.consecutive_loss_count[symbol] = (
                 self.consecutive_loss_count.get(symbol, 0) + 1
             )
-        elif exit_reason == "TP_FILL":
-            self.consecutive_loss_count[symbol] = 0
+        if self._ciats_outcome_bus_fn is not None:
+            try:
+                res = self._ciats_outcome_bus_fn(
+                    symbol=symbol, exit_reason=exit_reason, pos=pos
+                )
+                if asyncio.iscoroutine(res):
+                    asyncio.create_task(res, name=f"ciats_{symbol}")
+            except Exception as e:
+                self._log("CIATS_OUTCOME_ERROR", level="WARN",
+                          error=str(e), symbol=symbol)
 
-    # =================================================================
-    # MID-SESSION RECONNECT — Section 15 (HR-WM-016, AR-056)
-    # =================================================================
+    # ----------------------------------------------------------
+    # Indicator updates on candle close (Section 9.2)
+    # ----------------------------------------------------------
 
-    async def _handle_recv_loop_disconnect(
-        self, source: str, exc: BaseException | None
+    def _update_indicators_5m(
+        self, symbol: str, candle: OHLCCandle
     ) -> None:
-        """
-        WM-RECONNECT-016 / WM-RECONNECT-018: shared disconnect handler
-        for both receive loops. Logs RECONNECT_TRIGGERED and awaits the
-        orderly reconnect cycle managed by _initiate_reconnect.
-
-        If another task is already driving a reconnect, awaits the done
-        event and returns without starting a second cycle. If a prior
-        reconnect exhausted all attempts and set the terminal fatal
-        flag, returns immediately so TaskGroup teardown can proceed.
-        """
-        self._logger.warning(log_record({
-            "event": "RECONNECT_TRIGGERED",
-            "level": "HIGH",
-            "component": "WS_MGR",
-            "source": source,
-            "error_type": type(exc).__name__ if exc else "clean_exit",
-            "error": str(exc) if exc else "async-for exited without exception",
-        }))
-        if self._fatal_reconnect_failure:
-            return
-        if self._is_reconnecting:
-            await self._reconnect_done_event.wait()
-            return
-        await self._initiate_reconnect()
-
-    async def _initiate_reconnect(self) -> None:
-        """
-        Initiate mid-session reconnect. SEPARATE code path from startup.
-        NEVER reuses startup code (HR-WM-016).
-        20 attempts over ~481s (~8 min) → FATAL_RECONNECT_FAILURE
-        (WM-RECONNECT-002, OI-020).
-
-        WM-RECONNECT-017: retry schedule uses module-level constants
-        RECONNECT_BACKOFF_BASE_SEC / _CAP_SEC / _FACTOR — no magic
-        numbers (DC-4).
-
-        WM-RECONNECT-018: _reconnect_done_event is cleared on entry and
-        re-set in the finally block (on success, fatal, or re-entry).
-        Concurrent callers await the event and return without starting a
-        second retry cycle. _fatal_reconnect_failure is set before
-        raising the final RuntimeError so siblings awaken from the event
-        wait in a terminal state and do not start new cycles before
-        TaskGroup teardown completes.
-        """
-        if self._is_reconnecting:
-            await self._reconnect_done_event.wait()
-            return
-        if self._fatal_reconnect_failure:
-            raise RuntimeError(
-                "Fatal reconnect already signaled — systemd restart required"
+        prev_close = self.previous_close_5m.get(symbol)
+        prev_atr = self.atr_14.get(symbol)
+        if prev_atr is not None and prev_close is not None:
+            tr = max(
+                candle.high - candle.low,
+                abs(candle.high - prev_close),
+                abs(candle.low - prev_close),
             )
+            self.atr_14[symbol] = (
+                (prev_atr * Decimal("13") + tr) / Decimal("14")
+            )
+            self.prev_tr[symbol] = tr
+        if prev_close is not None:
+            d = candle.close - prev_close
+            gain = d if d > 0 else Decimal("0")
+            loss = -d if d < 0 else Decimal("0")
+            ag = self.rsi_14_avg_gain.get(symbol)
+            al = self.rsi_14_avg_loss.get(symbol)
+            if ag is not None and al is not None:
+                self.rsi_14_avg_gain[symbol] = (
+                    (ag * Decimal("13") + gain) / Decimal("14")
+                )
+                self.rsi_14_avg_loss[symbol] = (
+                    (al * Decimal("13") + loss) / Decimal("14")
+                )
+        for k, alpha in (
+            ("ema_9", Decimal("2") / Decimal("10")),
+            ("ema_21", Decimal("2") / Decimal("22")),
+        ):
+            prev = getattr(self, k).get(symbol)
+            if prev is not None:
+                getattr(self, k)[symbol] = (
+                    alpha * candle.close + (Decimal("1") - alpha) * prev
+                )
+        hist = self.volume_history.setdefault(symbol, [])
+        hist.append(candle.volume)
+        if len(hist) > 20:
+            hist.pop(0)
+        if len(hist) == 20:
+            self.volume_ma_20[symbol] = (
+                sum(hist, Decimal("0")) / Decimal("20")
+            )
+        if symbol in self.position_mirror:
+            self.position_mirror[symbol].hold_candle_count += 1
+        self.previous_close_5m[symbol] = candle.close
 
-        self._is_reconnecting = True
-        self._reconnect_done_event.clear()
-        self._disconnect_time = time.monotonic()
-        self._reconnect_attempt = 0
+    # ----------------------------------------------------------
+    # Pipeline trigger (HR-WM-012 / WM-SHARD-009 generalized)
+    # ----------------------------------------------------------
 
-        self._logger.warning(log_record({
-            "event": "RECONNECT_INITIATED",
-            "level": "HIGH",
-            "component": "WS_MGR",
-            "connection_id": self.connection_id_public,
-            "attempt_number": 1,
-        }))
-
+    async def _fire_pipeline(
+        self, symbol: str, candle: OHLCCandle
+    ) -> None:
+        if not self._all_connections_healthy():
+            return
+        if symbol == REGIME_ANCHOR and not bool(
+            self._cfg.get("ciats_btc_entry_enabled", False)
+        ):
+            return
+        if self.warm_up_state.get(symbol) != "READY":
+            return
+        shard_idx = self.pair_to_shard_index.get(symbol)
+        if shard_idx is None:
+            return
+        shard = self.shards[shard_idx]
+        if shard.pair_states.get(symbol) != PairState.DATA_READY:
+            return
+        if self.system_state in ("SESSION_PAUSE", "FULL_HALT"):
+            return
+        if self._signal_pipeline_fn is None:
+            return
         try:
-            backoff_sec = RECONNECT_BACKOFF_BASE_SEC
-            while self._reconnect_attempt < MAX_RECONNECT_ATTEMPTS:
-                self._reconnect_attempt += 1
-                try:
-                    await self._execute_reconnect_sequence()
-                    self._awaiting_pong_pub = False
-                    self._awaiting_pong_priv = False
-                    self._logger.info(log_record({
-                        "event": "RECONNECT_COMPLETE",
-                        "level": "INFO",
-                        "component": "WS_MGR",
-                        "connection_id": self.connection_id_public,
-                        "attempts": self._reconnect_attempt,
-                    }))
-                    return
-                except Exception as exc:  # noqa: BP-ERR-001
-                    self._logger.warning(log_record({
-                        "event": "RECONNECT_ATTEMPT_FAILED",
-                        "level": "WARN",
-                        "component": "WS_MGR",
-                        "attempt": self._reconnect_attempt,
-                        "error": str(exc),
-                    }))
-                    await asyncio.sleep(backoff_sec)
-                    backoff_sec = min(
-                        backoff_sec * RECONNECT_BACKOFF_FACTOR,
-                        RECONNECT_BACKOFF_CAP_SEC,
-                    )
-
-            # Fatal — systemd will restart (WM-RECONNECT-002 / WM-RECONNECT-017)
-            self._fatal_reconnect_failure = True
-            self._logger.critical(log_record({
-                "event": "FATAL_RECONNECT_FAILURE",
-                "level": "CRITICAL",
-                "component": "WS_MGR",
-                "attempt_count": self._reconnect_attempt,
-            }))
-            _alert_operator_direct(
-                f"FATAL RECONNECT FAILURE after {self._reconnect_attempt} attempts. "
-                f"systemd will restart TothBot."
+            res = self._signal_pipeline_fn(
+                symbol=symbol, candle=candle,
+                pre_comp_cache=self._build_pre_comp_cache(symbol),
             )
+            if asyncio.iscoroutine(res):
+                await res
+        except Exception as e:
+            self._log("SIGNAL_PIPELINE_ERROR", level="WARN",
+                      symbol=symbol, error=str(e))
+
+    def _all_connections_healthy(self) -> bool:
+        for shard in self.shards:
+            if shard.in_reconnect or shard.connection is None:
+                return False
+        if not self.paper_mode:
+            if self._private_in_reconnect or self._ws_private is None:
+                return False
+        return True
+
+    def _build_pre_comp_cache(self, symbol: str) -> dict:
+        return {
+            "atr_14": self.atr_14.get(symbol),
+            "rsi_14": self._compute_rsi_for(symbol),
+            "ema_9": self.ema_9.get(symbol),
+            "ema_21": self.ema_21.get(symbol),
+            "volume_ma_20": self.volume_ma_20.get(symbol),
+            "htf_ema_20": self.htf_ema_20.get(symbol),
+            "htf_ema_50": self.htf_ema_50.get(symbol),
+            "liquidity_24h": self.liquidity_24h.get(symbol, Decimal("0")),
+            "spot_usd_balance": self.spot_usd_balance,
+            "portfolio_baseline_USD": self.portfolio_baseline_USD,
+            "exit_cooldown_log": dict(self.exit_cooldown_log),
+            "consecutive_loss_count": dict(self.consecutive_loss_count),
+            "max_concurrent": MAX_CONCURRENT,
+            "tradeable_pct": TRADEABLE_PCT,
+            "per_trade_pct": PER_TRADE_PCT,
+        }
+
+    def _compute_rsi_for(self, symbol: str) -> _t.Optional[Decimal]:
+        ag = self.rsi_14_avg_gain.get(symbol)
+        al = self.rsi_14_avg_loss.get(symbol)
+        if ag is None or al is None:
+            return None
+        if al == 0:
+            return Decimal("100")
+        rs = ag / al
+        return Decimal("100") - (Decimal("100") / (Decimal("1") + rs))
+
+    # ----------------------------------------------------------
+    # Drawdown computation (Section 11)
+    # ----------------------------------------------------------
+
+    def _compute_drawdown_for_pair(self, symbol: str) -> None:
+        if self.portfolio_baseline_USD is None:
+            return
+        current = self.spot_usd_balance
+        for sym, pos in self.position_mirror.items():
+            bid = self.latest_bid.get(sym, Decimal("0"))
+            current += bid * pos.qty
+        if self.portfolio_baseline_USD <= 0:
+            return
+        drawdown = max(
+            Decimal("0"),
+            (self.portfolio_baseline_USD - current) /
+            self.portfolio_baseline_USD,
+        )
+        if drawdown >= FULL_HALT_DRAWDOWN and self.system_state != "FULL_HALT":
+            self.system_state = "FULL_HALT"
+            self._log("FULL_HALT_TRIGGERED",
+                      level="CRITICAL", drawdown=drawdown)
+            try:
+                self._alert_fn("CRITICAL", "FULL_HALT_TRIGGERED")
+            except Exception:
+                pass
+        elif (drawdown >= SESSION_PAUSE_DRAWDOWN
+              and self.system_state == "NORMAL"):
+            self.system_state = "SESSION_PAUSE"
+            self._log("SESSION_PAUSE_TRIGGERED",
+                      level="HIGH", drawdown=drawdown)
+            try:
+                self._alert_fn("HIGH", "SESSION_PAUSE_TRIGGERED")
+            except Exception:
+                pass
+        elif (drawdown < SESSION_PAUSE_DRAWDOWN
+              and self.system_state == "SESSION_PAUSE"):
+            self.system_state = "NORMAL"
+            self._log("SESSION_PAUSE_RECOVERED",
+                      level="INFO", drawdown=drawdown)
+
+    # ----------------------------------------------------------
+    # Sequence-gap recovery (Section 7.2 / 7.3)
+    # ----------------------------------------------------------
+
+    async def _handle_executions_gap(self, current_seq: int) -> None:
+        self._log("EXECUTIONS_SEQUENCE_GAP", level="CRITICAL",
+                  expected=self.executions_last_seq + 1, actual=current_seq)
+        try:
+            self._alert_fn("CRITICAL", "EXECUTIONS_SEQUENCE_GAP")
+        except Exception:
+            pass
+        open_orders = await self._rest_get_open_orders()
+        await self._reconcile_pending_orders(open_orders)
+
+    async def _handle_balances_gap(self, current_seq: int) -> None:
+        self._log("BALANCES_SEQUENCE_GAP", level="HIGH",
+                  expected=self.balances_last_seq + 1, actual=current_seq)
+        try:
+            self._alert_fn("HIGH", "BALANCES_SEQUENCE_GAP")
+        except Exception:
+            pass
+        balances = await self._rest_get_account_balance()
+        usd_str = balances.get("ZUSD") or balances.get("USD")
+        if usd_str is not None:
+            try:
+                self.spot_usd_balance = Decimal(str(usd_str))
+            except Exception:
+                pass
+
+    async def _reconcile_pending_orders(
+        self, open_orders: dict
+    ) -> None:
+        live_clord = set()
+        for oid, info in (open_orders.get("open") or {}).items():
+            cl = info.get("descr", {}).get("close") or info.get("userref", "")
+            if cl:
+                live_clord.add(str(cl))
+        for cl_ord_id in list(self.pending_orders.keys()):
+            if cl_ord_id not in live_clord:
+                self.pending_orders.pop(cl_ord_id, None)
+
+    # ----------------------------------------------------------
+    # Ping + zombie monitors (per shard + private)
+    # ----------------------------------------------------------
+
+    async def _ping_loop_shard(self, shard: WSShard) -> None:
+        while not self._fatal_reconnect_failure:
+            try:
+                if shard.connection is None or shard.in_reconnect:
+                    await asyncio.sleep(PING_INTERVAL_SEC)
+                    continue
+                req_id = self._next_req_id()
+                payload = {"method": "ping", "req_id": req_id}
+                t0 = time.monotonic()
+                await self._send_shard(shard, payload)
+                deadline = t0 + PING_TIMEOUT_SEC
+                pong_seen = False
+                while time.monotonic() < deadline:
+                    if shard.last_pong_time >= t0:
+                        pong_seen = True
+                        break
+                    await asyncio.sleep(0.5)
+                if not pong_seen:
+                    self._log("PING_TIMEOUT", level="ERROR",
+                              shard_index=shard.shard_index)
+                    await self._initiate_reconnect_shard(shard.shard_index)
+                    continue
+                await asyncio.sleep(PING_INTERVAL_SEC)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._log("PING_LOOP_ERROR", level="WARN",
+                          shard_index=shard.shard_index, error=str(e))
+                await asyncio.sleep(PING_INTERVAL_SEC)
+
+    async def _ping_loop_private(self) -> None:
+        while not self._fatal_reconnect_failure:
+            try:
+                if self._ws_private is None or self._private_in_reconnect:
+                    await asyncio.sleep(PING_INTERVAL_SEC)
+                    continue
+                req_id = self._next_req_id()
+                payload = {"method": "ping", "req_id": req_id}
+                t0 = time.monotonic()
+                await self._send_private(payload)
+                deadline = t0 + PING_TIMEOUT_SEC
+                pong_seen = False
+                while time.monotonic() < deadline:
+                    if self._last_pong_time_private >= t0:
+                        pong_seen = True
+                        break
+                    await asyncio.sleep(0.5)
+                if not pong_seen:
+                    self._log("PING_TIMEOUT", level="ERROR",
+                              endpoint="private")
+                    await self._initiate_reconnect_private()
+                    continue
+                await asyncio.sleep(PING_INTERVAL_SEC)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._log("PING_LOOP_ERROR", level="WARN",
+                          endpoint="private", error=str(e))
+                await asyncio.sleep(PING_INTERVAL_SEC)
+
+    async def _zombie_loop_shard(self, shard: WSShard) -> None:
+        while not self._fatal_reconnect_failure:
+            try:
+                if shard.connection is None or shard.in_reconnect:
+                    await asyncio.sleep(15)
+                    continue
+                age = time.monotonic() - shard.last_real_data_time
+                if age > ZOMBIE_THRESHOLD_SEC:
+                    self._log(
+                        "ZOMBIE_CONNECTION_DETECTED", level="CRITICAL",
+                        shard_index=shard.shard_index, age_sec=round(age, 2),
+                    )
+                    try:
+                        self._alert_fn(
+                            "HIGH",
+                            f"Zombie shard {shard.shard_index} age {age:.1f}s",
+                        )
+                    except Exception:
+                        pass
+                    await self._initiate_reconnect_shard(shard.shard_index)
+                    continue
+                # Long-DATA_PENDING alert (HR-WM-030).
+                now = time.monotonic()
+                for sym, started in list(shard.data_pending_at.items()):
+                    if now - started > DATA_PENDING_LONG_ALERT_SEC:
+                        self._log("PAIR_DATA_PENDING_LONG", level="WARN",
+                                  pair=sym, shard=shard.shard_index,
+                                  age_sec=round(now - started, 2))
+                        # Reset trigger so we alert at most once per hour.
+                        shard.data_pending_at[sym] = now
+                await asyncio.sleep(15)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._log("ZOMBIE_LOOP_ERROR", level="WARN",
+                          shard_index=shard.shard_index, error=str(e))
+                await asyncio.sleep(15)
+
+    async def _zombie_loop_private(self) -> None:
+        while not self._fatal_reconnect_failure:
+            try:
+                if self._ws_private is None or self._private_in_reconnect:
+                    await asyncio.sleep(15)
+                    continue
+                age = time.monotonic() - self._last_real_data_time_private
+                if age > ZOMBIE_THRESHOLD_SEC:
+                    self._log("ZOMBIE_CONNECTION_DETECTED",
+                              level="CRITICAL", endpoint="private",
+                              age_sec=round(age, 2))
+                    await self._initiate_reconnect_private()
+                    continue
+                await asyncio.sleep(15)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._log("ZOMBIE_LOOP_ERROR", level="WARN",
+                          endpoint="private", error=str(e))
+                await asyncio.sleep(15)
+
+    # ----------------------------------------------------------
+    # Reconnect (per-shard + private)
+    # ----------------------------------------------------------
+
+    async def _initiate_reconnect_shard(self, shard_index: int) -> None:
+        ev = self._reconnect_done_events.get(shard_index)
+        if ev is None:
+            return
+        if not ev.is_set():
+            await ev.wait()
+            return
+        if self._fatal_reconnect_failure:
+            return
+        ev.clear()
+        try:
+            shard = self.shards[shard_index]
+            shard.in_reconnect = True
+            try:
+                if shard.connection is not None:
+                    await shard.connection.close()
+            except Exception:
+                pass
+            shard.connection = None
+            for attempt in range(1, MAX_RECONNECT_ATTEMPTS + 1):
+                try:
+                    new_conn = await self._ws_connect_one(PUBLIC_WS_URI)
+                    shard.connection = new_conn
+                    shard.last_real_data_time = time.monotonic()
+                    shard.last_pong_time = time.monotonic()
+                    if shard.shard_index == 0:
+                        await self._subscribe_on_shard(
+                            shard, "instrument", extra={"snapshot": True}
+                        )
+                        await self._subscribe_on_shard(
+                            shard, "status", extra={"snapshot": True}
+                        )
+                    for sym in list(shard.symbols):
+                        await self._subscribe_on_shard(
+                            shard, "ohlc", symbols=[sym],
+                            extra={"interval": 5, "snapshot": True},
+                        )
+                        trigger = self._ticker_trigger_for(sym)
+                        await self._subscribe_on_shard(
+                            shard, "ticker", symbols=[sym],
+                            extra={"event_trigger": trigger,
+                                   "snapshot": True},
+                        )
+                        shard.pair_states[sym] = PairState.SUBSCRIBED
+                        shard.data_pending_at.pop(sym, None)
+                        self._arm_silent_timer(shard, sym)
+                    shard.in_reconnect = False
+                    self._log("RECONNECT_COMPLETE", level="INFO",
+                              shard_index=shard_index, attempts=attempt)
+                    return
+                except Exception as e:
+                    self._log("RECONNECT_ATTEMPT_FAILED", level="WARN",
+                              shard_index=shard_index, attempt=attempt,
+                              error=str(e))
+                    backoff = min(
+                        RECONNECT_BACKOFF_CAP_SEC,
+                        RECONNECT_BACKOFF_BASE_SEC
+                        * (RECONNECT_BACKOFF_FACTOR ** (attempt - 1)),
+                    )
+                    await asyncio.sleep(backoff)
+            self._fatal_reconnect_failure = True
+            self._log("FATAL_RECONNECT_FAILURE", level="CRITICAL",
+                      shard_index=shard_index)
+            try:
+                self._alert_fn(
+                    "CRITICAL",
+                    f"FATAL_RECONNECT_FAILURE shard {shard_index}",
+                )
+            except Exception:
+                pass
             raise RuntimeError(
-                "Fatal reconnect failure — systemd restart required"
+                f"FATAL_RECONNECT_FAILURE shard {shard_index}"
             )
         finally:
-            # WM-RECONNECT-018: always release the event gate, whether
-            # the reconnect succeeded, exhausted all attempts, or raised
-            # unexpectedly. Siblings waiting on the event will resume.
-            self._is_reconnecting = False
-            self._reconnect_done_event.set()
+            ev.set()
 
-    async def _execute_reconnect_sequence(self) -> None:
-        """
-        Mid-session reconnect steps 1-10 (WM-RECONNECT-001 through -015).
-        Separate from startup — no startup code reused (HR-WM-016).
-
-        Paper mode: skip all private-side steps (REST token, private WS
-        connect, private subscribe, REST open-orders snapshot, pending-
-        order reconcile, private-sequence-counter resets). Retains
-        Step 2a (public connect), Step 3a (public subscribe), Step 8
-        (ticker resume), and Step 10 (gap-conditional indicator re-seed).
-        FIX-WM-RECONNECT-019 / OI-028: restores parity with
-        _startup_connect_and_subscribe paper-mode early-return
-        (FIX-WM-PT-001, dv1_14).
-        """
+    async def _initiate_reconnect_private(self) -> None:
         if self.paper_mode:
-            # Step 2a: Public WS only (WM-RECONNECT-004, public-side)
-            self._ws_public = await self._ws_connect(PUBLIC_WS_URI)
-
-            # Step 3a: Subscribe public channels only (WM-RECONNECT-005,
-            # public-side)
-            await self._subscribe_public()
-
-            # Step 8: Resume ticker subscriptions (WM-RECONNECT-010)
-            for symbol in self.monitored_universe:
-                has_position = symbol in self.position_mirror
-                trigger = "bbo" if has_position else "trades"
-                await self._subscribe_ticker_pair(symbol, trigger)
-
-            # Step 10: Re-seed indicators if gap > 15 minutes
-            # (WM-RECONNECT-014)
-            gap_sec = time.monotonic() - (
-                self._disconnect_time or time.monotonic()
-            )
-            if gap_sec > RECONNECT_STALE_CACHE_SEC:
-                for symbol in self.monitored_universe:
-                    await self.seed_indicators_from_rest(symbol)
-
-            # HR-WM-013: portfolio_baseline_USD NEVER reset on reconnect
-            # HR-WM-011: system_state PRESERVED
-            # WM-SC-003: exit_cooldown_log and consecutive_loss_count
-            # PRESERVED
             return
+        if not self._private_reconnect_done.is_set():
+            await self._private_reconnect_done.wait()
+            return
+        if self._fatal_reconnect_failure:
+            return
+        self._private_reconnect_done.clear()
+        self._private_in_reconnect = True
+        try:
+            try:
+                if self._ws_private is not None:
+                    await self._ws_private.close()
+            except Exception:
+                pass
+            self._ws_private = None
+            for attempt in range(1, MAX_RECONNECT_ATTEMPTS + 1):
+                try:
+                    self._ws_token = await self._rest_get_ws_token()
+                    self._ws_private = await self._ws_connect_one(
+                        PRIVATE_WS_URI
+                    )
+                    self._last_real_data_time_private = time.monotonic()
+                    self._last_pong_time_private = time.monotonic()
+                    await self._subscribe_private(
+                        "executions",
+                        extra={
+                            "token": self._ws_token,
+                            "snap_orders": True,
+                            "snap_trades": True,
+                            "order_status": True,
+                            "ratecounter": True,
+                        },
+                    )
+                    await self._subscribe_private(
+                        "balances",
+                        extra={"token": self._ws_token, "snapshot": True},
+                    )
+                    self.executions_last_seq = 0
+                    self.balances_last_seq = 0
+                    open_orders = await self._rest_get_open_orders()
+                    await self._reconcile_pending_orders(open_orders)
+                    self._private_in_reconnect = False
+                    self._log("RECONNECT_COMPLETE", level="INFO",
+                              endpoint="private", attempts=attempt)
+                    return
+                except Exception as e:
+                    self._log("RECONNECT_ATTEMPT_FAILED", level="WARN",
+                              endpoint="private", attempt=attempt,
+                              error=str(e))
+                    backoff = min(
+                        RECONNECT_BACKOFF_CAP_SEC,
+                        RECONNECT_BACKOFF_BASE_SEC
+                        * (RECONNECT_BACKOFF_FACTOR ** (attempt - 1)),
+                    )
+                    await asyncio.sleep(backoff)
+            self._fatal_reconnect_failure = True
+            self._log("FATAL_RECONNECT_FAILURE", level="CRITICAL",
+                      endpoint="private")
+            try:
+                self._alert_fn(
+                    "CRITICAL", "FATAL_RECONNECT_FAILURE private",
+                )
+            except Exception:
+                pass
+            raise RuntimeError("FATAL_RECONNECT_FAILURE private")
+        finally:
+            self._private_reconnect_done.set()
 
-        # Live mode: full steps 1-10.
-        # Step 1: Acquire new WS token (WM-RECONNECT-003)
-        self._ws_token = await self._rest_get_ws_token()
 
-        # Step 2: Connect both WS (WM-RECONNECT-004) — same params as startup
-        self._ws_public = await self._ws_connect(PUBLIC_WS_URI)
-        self._ws_private = await self._ws_connect(PRIVATE_WS_URI)
+# ============================================================
+# Module entry point - kept minimal; tothbot.__main__ wires
+# Logger, Execution Engine, Exit Controller, and CIATS bus.
+# ============================================================
 
-        # Step 3: Subscribe all channels (WM-RECONNECT-005)
-        await self._subscribe_public()
-        await self._subscribe_private()
-        # Ticker resubscription handled in Step 8 below
 
-        # Step 4: Process snap_orders — detect gap-closed positions (WM-RECONNECT-006)
-        snap_orders = await self._rest_get_open_orders()
-        gap_closed = self._detect_gap_closed_positions(snap_orders)
+async def _amain() -> None:
+    """Standalone harness - not used in production wire-up."""
+    mgr = WSManager(config={"paper_trading_mode": True})
+    await mgr.run()
 
-        # Step 5: Fire CIATS Trade Outcome Bus for gap-closed (WM-RECONNECT-007)
-        for symbol in gap_closed:
-            self._logger.warning(log_record({
-                "event": "GAP_CLOSED_POSITION",
-                "level": "HIGH",
-                "component": "WS_MGR",
-                "symbol": symbol,
-                "estimated_PL": "unknown",
-            }))
-            del self.position_mirror[symbol]
 
-        # Step 6: Reconcile Pending Order Registry (WM-RECONNECT-008)
-        await self._reconcile_pending_orders(snap_orders)
-
-        # Step 7: Reset sequence counters (WM-RECONNECT-009)
-        self.executions_last_seq = 0
-        self.balances_last_seq = 0
-
-        # Step 8: Resume ticker subscriptions (WM-RECONNECT-010)
-        for symbol in self.monitored_universe:
-            has_position = symbol in self.position_mirror
-            trigger = "bbo" if has_position else "trades"
-            await self._subscribe_ticker_pair(symbol, trigger)
-
-        # Step 9: Discard queued pipeline events (WM-RECONNECT-011)
-        # is_reconnecting=True blocks pipeline during reconnect (HR-WM-012)
-        # Will be cleared after this method returns
-
-        # Step 10: Re-seed indicators if gap > 15 minutes (WM-RECONNECT-014)
-        gap_sec = time.monotonic() - (self._disconnect_time or time.monotonic())
-        if gap_sec > RECONNECT_STALE_CACHE_SEC:
-            for symbol in self.monitored_universe:
-                await self.seed_indicators_from_rest(symbol)
-
-        # HR-WM-013: portfolio_baseline_USD NEVER reset on reconnect
-        # HR-WM-011: system_state PRESERVED
-        # WM-SC-003: exit_cooldown_log and consecutive_loss_count PRESERVED
-
-    def _detect_gap_closed_positions(self, snap_orders: dict) -> list[str]:
-        """
-        Detect positions closed during reconnect gap.
-        A position was gap-closed if it's in position_mirror but its
-        TP or emergSL order is no longer in snap_orders.
-        """
-        gap_closed = []
-        open_order_ids = set(snap_orders.keys())
-
-        for symbol, pos in self.position_mirror.items():
-            tp_alive = pos.tp_order_id in open_order_ids
-            sl_alive = pos.emergsl_order_id in open_order_ids
-            if not tp_alive and not sl_alive:
-                gap_closed.append(symbol)
-
-        return gap_closed
+if __name__ == "__main__":
+    asyncio.run(_amain())

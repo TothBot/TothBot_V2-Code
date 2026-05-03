@@ -3,12 +3,27 @@
 # DocVersion: dv1_7
 # DocOwner:   Bill
 # DocPath:    github.com/TothBot/TothBot_V2-Code/requirements.txt
-# DocDate:    04-11-2026
-# DocTime:    23:59:59 UTC
+# DocDate:    05-03-2026
+# DocTime:    16:30:00 UTC
 #
 # ============================================================
 # REVISION HISTORY
 # ============================================================
+#
+#   dv1_7  05-03-2026  TB00144 STREAM 4 closure of OI-065-CAND
+#                      WSLIB-VERSION-PIN-MISMATCH. websockets
+#                      pin moved from ==12.0 to >=13.0 to
+#                      align with WS-LIB-001 import path
+#                      requirement (websockets.asyncio.client
+#                      .connect requires the 13.0+ asyncio
+#                      client surface; 12.0 only ships the
+#                      legacy websockets.connect path which
+#                      is deprecated in 14+ per AR-060).
+#                      Range exception per BP-LIB-001:
+#                      governing-rule update authorized by
+#                      TB00143 NSI §1 STREAM 4. Other pins
+#                      unchanged. Governing spec version
+#                      reference unchanged at 1011001 dv1_7.
 #
 #   dv1_7  04-11-2026  DocVersion updated to match 1011001
 #                      Engineering_Best_Practices dv1_7.
@@ -26,7 +41,8 @@
 # Governing spec: 1011001 Engineering_Best_Practices dv1_7
 #                 (BP-LIB-001 through BP-LIB-009)
 # Platform: Ubuntu 24.04.4 LTS, Python 3.12.3
-# All versions pinned to exact version. Never use ranges.
+# All versions pinned to exact version. Never use ranges
+# unless the governing spec explicitly authorizes a range.
 # ============================================================
 #
 
@@ -36,8 +52,12 @@ uvloop==0.19.0
 # JSON library — replaces stdlib json for all serialization (BP-JSON-001)
 orjson==3.9.15
 
-# WebSocket client (Kraken WS v2 Public and Private)
-websockets==12.0
+# WebSocket client (Kraken WS v2 Public and Private).
+# OI-065-CAND closure: pin moved to >=13.0 to align with WS-LIB-001
+# import path (`from websockets.asyncio.client import connect`).
+# 12.0 only ships the legacy websockets.connect path that is
+# deprecated in 14+ per AR-060. Range authorized TB00143 NSI §1.
+websockets>=13.0
 
 # Async HTTP client (Kraken REST API, Kraken Status API)
 aiohttp==3.9.5

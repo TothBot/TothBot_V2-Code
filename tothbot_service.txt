@@ -1,14 +1,37 @@
 # DocDCN:     1011013
 # DocTitle:   TothBot_Systemd_Service_Unit
-# DocVersion: dv1_4
+# DocVersion: dv1_6
 # DocOwner:   Bill
 # DocPath:    github.com/TothBot/TothBot_V2-Code/tothbot_service.txt
-# DocDate:    04-11-2026
-# DocTime:    23:59:59 UTC
+# DocDate:    05-03-2026
+# DocTime:    16:30:00 UTC
 #
 # ============================================================
 # REVISION HISTORY
 # ============================================================
+#
+#   dv1_6  05-03-2026  TB00144 STREAM 4 — operational-layer
+#                      defense against back-to-back-restart
+#                      subscribe-rate storm (companion to
+#                      ws_manager.py dv1_25 §4.7 Subscribe-
+#                      Pacing Token Bucket). Per 1011013
+#                      dv1_6 §6 VD-SYS-002 / VD-SYS-008:
+#                        - ADDED StartLimitBurst=3 in [Unit]
+#                          block.
+#                        - CHANGED StartLimitIntervalSec
+#                          from 0 to 600 in [Unit] block.
+#                      Together: bucket bounds subscribe
+#                      rate within a process lifetime;
+#                      StartLimit caps lifetimes per 10-min
+#                      window. On 4th crash inside 600s
+#                      systemd refuses restart and leaves
+#                      the service in failed state until
+#                      operator recovery (systemctl reset-
+#                      failed tothbot && systemctl start
+#                      tothbot). emergSL resting orders
+#                      protect open positions during the
+#                      operator-gated window. CIATS-owned
+#                      starting values per TB00000 §9.16.
 #
 #   dv1_4  04-11-2026  Document control header added per
 #                      BP-HDR-001. Governed by 1011013
@@ -21,7 +44,7 @@
 #
 # ============================================================
 # TothBot V2 — systemd Service Unit File
-# Governing spec: 1011013 VPS_Deployment_Coding_Spec dv1_4
+# Governing spec: 1011013 VPS_Deployment_Coding_Spec dv1_6
 # Deploy to VPS: /etc/systemd/system/tothbot.service
 # ============================================================
 
@@ -29,7 +52,8 @@
 Description=TothBot V2 Automated Cryptocurrency Trading System
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=0
+StartLimitBurst=3
+StartLimitIntervalSec=600
 
 [Service]
 Type=notify
