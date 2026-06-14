@@ -55,8 +55,12 @@ from .reconnect import (
 )
 from .transport import Transport, TransportClosed
 
-OpenSocket = Callable[[], Awaitable[Transport]]
-RunStep = Callable[[RestoreStep], Awaitable[None]]
+# The driver is shared across all shards (one coordinator = one global HR-WM-012
+# gate), so the injected socket opener and per-step executor receive the shard_index
+# they are acting for: open_socket(shard) opens that shard's fresh public socket and
+# run_step(shard, step) re-subscribes THAT shard's pairs / resumes its keepalive, etc.
+OpenSocket = Callable[[int], Awaitable[Transport]]
+RunStep = Callable[[int, RestoreStep], Awaitable[None]]
 Sleep = Callable[[float], Awaitable[None]]
 EventSink = Callable[[object], None]
 
@@ -134,7 +138,7 @@ class ReconnectDriver:
                 # 5 immediate attempts) or the Scenario-B 5 s floor.
                 await self._sleep(reconnect_delay_sec(scenario, attempt))
                 try:
-                    transport = await self._run_restore()
+                    transport = await self._run_restore(shard_index)
                 except TransportClosed:
                     continue  # attempt failed; never abandon - next attempt
                 self._emit(ReconnectComplete(shard_index, connection_id))
@@ -145,19 +149,20 @@ class ReconnectDriver:
             # the success return above.
             self._coordinator.complete(shard_index)
 
-    async def _run_restore(self) -> Transport:
+    async def _run_restore(self, shard_index: int) -> Transport:
         """Execute the WS-REC-004 restore sequence for this mode in figure order.
 
-        RECONNECT_SOCKET opens the fresh socket; every other (mode-eligible) step is
-        delegated to run_step. A failure part-way closes the partial socket and
-        re-raises TransportClosed so initiate() retries the whole sequence."""
+        RECONNECT_SOCKET opens the fresh socket for shard_index; every other
+        (mode-eligible) step is delegated to run_step(shard_index, step). A failure
+        part-way closes the partial socket and re-raises TransportClosed so initiate()
+        retries the whole sequence."""
         transport: Transport | None = None
         try:
             for step in build_restore_sequence(paper_mode=self._paper_mode):
                 if step is RestoreStep.RECONNECT_SOCKET:
-                    transport = await self._open_socket()
+                    transport = await self._open_socket(shard_index)
                 else:
-                    await self._run_step(step)
+                    await self._run_step(shard_index, step)
             if transport is None:  # RECONNECT_SOCKET is always in the sequence
                 raise TransportClosed("restore sequence opened no socket")
             return transport

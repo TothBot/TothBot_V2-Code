@@ -64,10 +64,10 @@ def test_paper_restore_sequence_skips_private_steps():
     sleeps: list = []
     events: list = []
 
-    async def open_socket():
+    async def open_socket(shard):
         return fresh
 
-    async def run_step(step):
+    async def run_step(shard, step):
         steps.append(step)
 
     driver = _driver(coordinator, paper_mode=True, open_socket=open_socket,
@@ -91,10 +91,10 @@ def test_live_restore_includes_private_steps():
     coordinator = ShardReconnectCoordinator()
     steps: list = []
 
-    async def open_socket():
+    async def open_socket(shard):
         return _FakeTransport()
 
-    async def run_step(step):
+    async def run_step(shard, step):
         steps.append(step)
 
     driver = _driver(coordinator, paper_mode=False, open_socket=open_socket,
@@ -118,11 +118,11 @@ def test_gate_held_during_restore_and_lifted_after():
     coordinator = ShardReconnectCoordinator()
     seen_during: list = []
 
-    async def open_socket():
+    async def open_socket(shard):
         seen_during.append(coordinator.any_reconnecting())
         return _FakeTransport()
 
-    async def run_step(step):
+    async def run_step(shard, step):
         seen_during.append(coordinator.any_reconnecting())
 
     driver = _driver(coordinator, paper_mode=True, open_socket=open_socket,
@@ -140,13 +140,13 @@ def test_scenario_a_backoff_seed_applied_until_success():
     sleeps: list = []
     fails = {"left": 6}  # fail the socket open 6 times, succeed on attempt 7
 
-    async def open_socket():
+    async def open_socket(shard):
         if fails["left"] > 0:
             fails["left"] -= 1
             raise TransportClosed("still down")
         return _FakeTransport()
 
-    async def run_step(step):
+    async def run_step(shard, step):
         pass
 
     driver = _driver(coordinator, paper_mode=True, open_socket=open_socket,
@@ -163,10 +163,10 @@ def test_scenario_b_uses_five_second_floor():
     coordinator = ShardReconnectCoordinator()
     sleeps: list = []
 
-    async def open_socket():
+    async def open_socket(shard):
         return _FakeTransport()
 
-    async def run_step(step):
+    async def run_step(shard, step):
         pass
 
     driver = _driver(coordinator, paper_mode=True, open_socket=open_socket,
@@ -183,12 +183,12 @@ def test_partial_restore_closes_socket_then_retries():
     opened: list = []
     attempts = {"n": 0}
 
-    async def open_socket():
+    async def open_socket(shard):
         t = _FakeTransport()
         opened.append(t)
         return t
 
-    async def run_step(step):
+    async def run_step(shard, step):
         # Fail the first attempt's first run_step (after the socket opened) so the
         # partial socket must be closed and the whole sequence retried.
         if step is RestoreStep.RESUBSCRIBE_PUBLIC and attempts["n"] == 0:

@@ -2,10 +2,12 @@
 
 Source: 0500000 dv1_240 sec 7 Image6 (mod:WS_Manager) + sec 2 Image1 + sec 12
 Image7. WS_Manager is the SINGLE point through which all Kraken traffic flows:
-every inbound push frame is routed by the O(1) dispatch table (dispatch.py) and
-every outbound order RPC passes through the paper/live seam (seam.py). It is
-also the SOLE writer to mod:Position_Mirror (rule:HR-PM-009) - that write
-authority is wired when Position_Mirror is built (later session).
+every inbound push frame is routed by the O(1) dispatch table (dispatch.py),
+every outbound order RPC passes through the paper/live seam (seam.py), and it is
+the SOLE writer to mod:Position_Mirror (rule:HR-PM-009). That write authority is
+wired here: WSManager holds the PositionMirror and is the ONLY caller that tags a
+write with the WRITER_ID sentinel (position_mirror.py); every other module reads
+the mirror through the helper methods below, never by direct dict access.
 
 This S2b shell assembles the three pieces and binds the run mode ONCE at
 construction (rule:HR-WM-021, immutable for the process lifetime):
@@ -22,8 +24,17 @@ simulator are injected here; their real implementations are built later.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+
 from .connection import ConnectionRole, WSConnection
 from .dispatch import Channel, DispatchTable, Handler
+from .position_mirror import (
+    WRITER_ID,
+    ExecOutcome,
+    Position,
+    PositionClosedDuringGap,
+    PositionMirror,
+)
 from .seam import DispatchSeam, EventSink, LiveSender, OutboundOp, PaperSimulator
 from ..config.settings import Mode
 
@@ -71,6 +82,12 @@ class WSManager:
             on_event=on_event,
         )
 
+        # Sole-writer mirror of all open positions (rule:HR-PM-009). WSManager is the
+        # only writer; the write source diverges by mode upstream (PA-004 div #4:
+        # paper = local sim fills; live = executions) but is byte-identical here.
+        self._on_event = on_event
+        self.positions = PositionMirror(on_event=on_event)
+
     @property
     def mode(self) -> Mode:
         return self._mode
@@ -96,3 +113,44 @@ class WSManager:
     def route_frame(self, name: str, frame: dict, interval: int | None = None) -> None:
         """Entry point for the WS read loop: resolve + dispatch one frame."""
         self.inbound.route(name, frame, interval)
+
+    # --- Position Mirror: WSManager is the SOLE writer (rule:HR-PM-009) -------
+    # These two methods are the ONLY callers that tag a mirror write with WRITER_ID,
+    # so the sole-writer contract holds by construction: any other module that
+    # reached for the mirror would have to forge the WS_Manager identity (and be
+    # caught by the position_mirror sole-writer guard).
+    def record_execution(
+        self,
+        event: Mapping[str, object],
+        *,
+        regime_at_entry: str | None = None,
+        emergsl_id: str | None = None,
+    ) -> ExecOutcome:
+        """Apply one executions-channel frame to the mirror (WS-EXE-009 dispatch).
+        The write source diverged by mode upstream (PA-004 div #4); the frame reaches
+        here byte-identical in both paper and live."""
+        return self.positions.apply_execution(
+            event, writer=WRITER_ID, regime_at_entry=regime_at_entry, emergsl_id=emergsl_id
+        )
+
+    def restore_position_mirror(
+        self, snap_orders: Sequence[Mapping[str, object]]
+    ) -> list[PositionClosedDuringGap]:
+        """Reconcile the mirror against the executions snapshot on reconnect/startup
+        (AR-056 RESTORE_POSITION_MIRROR / Step 6); returns the gap-closed positions."""
+        return self.positions.restore_from_snapshot(snap_orders, writer=WRITER_ID)
+
+    # --- Position Mirror read helpers (the rule:HR-PM-009 read contract) ------
+    def position(self, symbol: str) -> Position | None:
+        """The open position for a symbol (frozen record), or None."""
+        return self.positions.get(symbol)
+
+    def has_position(self, symbol: str) -> bool:
+        return self.positions.has_position(symbol)
+
+    def open_position_symbols(self) -> frozenset[str]:
+        return self.positions.open_symbols()
+
+    def open_positions(self) -> dict[str, Position]:
+        """A copy of the open-position store (records are frozen)."""
+        return self.positions.positions()

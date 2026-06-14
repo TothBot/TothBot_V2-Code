@@ -8,9 +8,12 @@ channels (A-12/HR-WM-006 never-drop), and the paper/live outbound seam gate
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
 from tothbot.config.settings import Mode
+from tothbot.exchange.position_mirror import PositionAction, SoleWriterViolationError
 from tothbot.exchange import connection as conn
 from tothbot.exchange.channels import PrivateChannel, PublicChannel
 from tothbot.exchange.connection import (
@@ -257,3 +260,46 @@ def test_manager_unwired_simulator_raises_in_paper():
     m = WSManager(Mode.PAPER)
     with pytest.raises(NotImplementedError):
         m.seam.add_order({})
+
+
+# -- WS_Manager as the sole writer to Position Mirror (HR-PM-009) --------
+
+def test_manager_records_execution_as_sole_writer():
+    m = WSManager(Mode.PAPER)
+    outcome = m.record_execution(
+        {"exec_type": "trade", "symbol": "BTC/USD", "side": "buy",
+         "cum_qty": "0.5", "avg_price": "60000"}
+    )
+    assert outcome.action is PositionAction.OPENED
+    assert m.has_position("BTC/USD")
+    assert m.position("BTC/USD").avg_entry_price == Decimal("60000")
+    assert m.open_position_symbols() == frozenset({"BTC/USD"})
+
+
+def test_manager_is_only_writer_other_modules_use_read_helpers():
+    # A consumer that bypasses WSManager and forges a write is rejected (HR-PM-009).
+    m = WSManager(Mode.PAPER)
+    with pytest.raises(SoleWriterViolationError):
+        m.positions.apply_execution(
+            {"exec_type": "trade", "symbol": "BTC/USD", "side": "buy", "cum_qty": "1"},
+            writer="Risk_Engine",
+        )
+
+
+def test_manager_restore_position_mirror_returns_gap_closed():
+    m = WSManager(Mode.PAPER)
+    m.record_execution({"exec_type": "trade", "symbol": "BTC/USD", "side": "buy",
+                        "cum_qty": "0.5", "avg_price": "60000"})
+    m.record_execution({"exec_type": "trade", "symbol": "ETH/USD", "side": "sell",
+                        "cum_qty": "2", "avg_price": "3000"})
+    gap = m.restore_position_mirror([{"symbol": "BTC/USD"}])
+    assert [g.symbol for g in gap] == ["ETH/USD"]
+    assert m.open_position_symbols() == frozenset({"BTC/USD"})
+
+
+def test_manager_mirror_events_routed_to_on_event_sink():
+    events: list = []
+    m = WSManager(Mode.PAPER, on_event=events.append)
+    m.record_execution({"exec_type": "trade", "symbol": "BTC/USD", "side": "buy",
+                        "cum_qty": "0.5", "avg_price": "60000"})
+    assert any(getattr(e, "code", None) == "POSITION_STATE_WRITE" for e in events)
