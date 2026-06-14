@@ -1,0 +1,13 @@
+[project]
+name = "tothbot"
+version = "0.0.0"
+description = "TothBot V2 - automated Kraken spot trading organism (Phase 2 Option B build)"
+requires-python = ">=3.12"
+
+# Runtime dependencies are added per build session as each layer needs them
+# (e.g. the Kraken WebSocket client in S2). None required for the S1 config
+# foundation. Authoritative runtime: Python 3.12.3 on the VPS.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
