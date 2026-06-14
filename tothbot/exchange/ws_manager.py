@@ -16,10 +16,15 @@ construction (rule:HR-WM-021, immutable for the process lifetime):
     connected in paper (rule:HR-WM-022 / PA-004 divergence #1);
   - the inbound DispatchTable and the outbound DispatchSeam.
 
-DEFERRED to S2c (per TB00703): PATH-2 connection sharding, subscribe pacing,
-reconnect orchestration, the silent-pair state machine, and the
-contract:Reconciliation_REST fallback. The live transmitter and paper
-simulator are injected here; their real implementations are built later.
+The outbound seam I/O bodies are now WIRED (outbound.py): the live transmitter
+(PrivateTransmitter / ws_private.send over the single private Transport) and the
+paper boundary (PaperDispatchSimulator). The live transmitter's socket is
+late-bound by the private_ws assembler once the private connection opens (startup
+Step 5) and re-bound on each reconnect; WSManager exposes it as self.transmitter.
+
+DEFERRED: the synthetic-capital fill simulator (contract:Synthetic_Capital_Ledger,
+PA-004 div #3, Path B) that plugs into the paper boundary, and the REST
+contract:Reconciliation_REST fallback.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ from collections.abc import Mapping, Sequence
 
 from .connection import ConnectionRole, WSConnection
 from .dispatch import Channel, DispatchTable, Handler
+from .outbound import PaperDispatchSimulator, PrivateTransmitter
 from .position_mirror import (
     WRITER_ID,
     ExecOutcome,
@@ -35,20 +41,8 @@ from .position_mirror import (
     PositionClosedDuringGap,
     PositionMirror,
 )
-from .seam import DispatchSeam, EventSink, LiveSender, OutboundOp, PaperSimulator
+from .seam import DispatchSeam, EventSink, LiveSender, PaperSimulator
 from ..config.settings import Mode
-
-
-def _unwired_live_sender(op: OutboundOp, message: dict) -> None:
-    raise NotImplementedError(
-        f"live transmitter not wired (container:Private_WS_v2 send, S2c): {op.value}"
-    )
-
-
-def _unwired_paper_simulator(op: OutboundOp, message: dict) -> None:
-    raise NotImplementedError(
-        f"paper simulator not wired (contract:Synthetic_Capital_Ledger, S2c): {op.value}"
-    )
 
 
 class WSManager:
@@ -74,11 +68,19 @@ class WSManager:
         # Inbound O(1) routing of the 7 channels.
         self.inbound = DispatchTable()
 
+        # The outbound seam I/O bodies. The live transmitter (ws_private.send) is
+        # late-bound to the private Transport by the private_ws assembler once the
+        # connection opens (startup Step 5) and re-bound on each reconnect; the paper
+        # boundary is the contract:Synthetic_Capital_Ledger plug point. Either may be
+        # overridden by injection (tests / a custom fill simulator).
+        self.transmitter = PrivateTransmitter()
+        self.paper_dispatch = PaperDispatchSimulator()
+
         # Outbound order-dispatch mode gate (contract:WSManager_Dispatch_Seam).
         self.seam = DispatchSeam(
             mode,
-            live_sender=live_sender or _unwired_live_sender,
-            paper_simulator=paper_simulator or _unwired_paper_simulator,
+            live_sender=live_sender or self.transmitter,
+            paper_simulator=paper_simulator or self.paper_dispatch,
             on_event=on_event,
         )
 

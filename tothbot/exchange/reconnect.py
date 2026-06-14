@@ -108,11 +108,23 @@ class RestoreStep(Enum):
 
 @dataclass(frozen=True)
 class RestoreStepSpec:
-    """One restore step plus whether it is private-side (skipped in paper)."""
+    """One restore step plus its connection-side partition.
+
+    The diagram's own public/private channel split (public: instrument, status,
+    ohlc_5m, ticker; private: executions, balances) classifies each step:
+      private_side  - touches the private WS / executions / snap_orders Position
+                      Mirror; skipped in paper mode (PA-004 div #1) AND skipped on a
+                      public shard's restore.
+      public_side   - re-subscribes a public channel / restores the public ticker
+                      event_trigger; skipped on the single private connection's
+                      restore.
+    A step that is NEITHER (RECONNECT_SOCKET, RESUME_KEEPALIVE) is SHARED - every
+    connection has a socket + keepalive, so it runs on both."""
 
     step: RestoreStep
-    private_side: bool  # True -> skipped in paper mode (WM-RECONNECT-019)
+    private_side: bool  # True -> skipped in paper mode (WM-RECONNECT-019) + on public shards
     summary: str
+    public_side: bool = False  # True -> skipped on the single private connection
 
 
 # Canonical restore order (ar:AR-056 / WS-REC-004). Private-side steps touch the
@@ -124,7 +136,7 @@ RESTORE_SEQUENCE: tuple[RestoreStepSpec, ...] = (
     RestoreStepSpec(RestoreStep.RECONNECT_SOCKET, False,
                     "reconnect with WS-LIB params (max_size/open_timeout/max_queue=None/ping_interval=None)"),
     RestoreStepSpec(RestoreStep.RESUBSCRIBE_PUBLIC, False,
-                    "re-subscribe public channels, parsing each ACK warnings[]"),
+                    "re-subscribe public channels, parsing each ACK warnings[]", public_side=True),
     RestoreStepSpec(RestoreStep.RESUBSCRIBE_PRIVATE, True,
                     "re-subscribe private channels (executions/balances), parsing each ACK"),
     RestoreStepSpec(RestoreStep.RESET_RATE_CEILING, True,
@@ -134,7 +146,7 @@ RESTORE_SEQUENCE: tuple[RestoreStepSpec, ...] = (
     RestoreStepSpec(RestoreStep.RESTORE_POSITION_MIRROR, True,
                     "restore the Position Mirror from snap_orders"),
     RestoreStepSpec(RestoreStep.RESTORE_TICKER_TRIGGER, False,
-                    "restore per-pair ticker event_trigger (bbo for open-position pairs)"),
+                    "restore per-pair ticker event_trigger (bbo for open-position pairs)", public_side=True),
 )
 
 
@@ -180,14 +192,27 @@ def reconnect_delay_sec(scenario: ReconnectScenario, attempt: int) -> float:
 
 
 def build_restore_sequence(*, paper_mode: bool) -> list[RestoreStep]:
-    """The ordered ar:AR-056 / WS-REC-004 restore steps for this mode. In paper
+    """The ordered ar:AR-056 / WS-REC-004 restore steps for a PUBLIC shard. In paper
     mode the private-side steps are skipped (WM-RECONNECT-019; there is no private
-    WS - PA-004 divergence point #1)."""
+    WS - PA-004 divergence point #1). A PATH-2 public shard carries only public
+    channels, so the private-side steps never apply to it regardless of mode (the
+    assembler passes paper_mode=True for exactly this reason)."""
     return [
         spec.step
         for spec in RESTORE_SEQUENCE
         if not (paper_mode and spec.private_side)
     ]
+
+
+def build_private_restore_sequence() -> list[RestoreStep]:
+    """The ordered restore steps for the SINGLE private connection (live only).
+
+    The private connection carries only the executions/balances channels, so the
+    public-channel steps (RESUBSCRIBE_PUBLIC, RESTORE_TICKER_TRIGGER) do not apply;
+    its restore is the private-side + shared steps in figure order: fresh token ->
+    reconnect socket -> re-subscribe private -> reset rate ceiling -> resume
+    keepalive -> restore Position Mirror from snap_orders (ar:AR-056 / WS-REC-004)."""
+    return [spec.step for spec in RESTORE_SEQUENCE if not spec.public_side]
 
 
 class ShardReconnectCoordinator:

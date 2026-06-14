@@ -46,6 +46,8 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
+from collections.abc import Sequence
+
 from .reconnect import (
     DisconnectReason,
     RestoreStep,
@@ -105,6 +107,7 @@ class ReconnectDriver:
         run_step: RunStep,
         sleep: Sleep = asyncio.sleep,
         on_event: EventSink | None = None,
+        restore_sequence: Sequence[RestoreStep] | None = None,
     ) -> None:
         self._coordinator = coordinator
         self._paper_mode = paper_mode
@@ -112,6 +115,15 @@ class ReconnectDriver:
         self._run_step = run_step
         self._sleep = sleep
         self._on_event = on_event
+        # The restore-step set this driver sequences. Defaults to the public-shard
+        # set (build_restore_sequence(paper_mode)); the single private connection
+        # injects build_private_restore_sequence() so its RESTORE_POSITION_MIRROR /
+        # token / private-resubscribe steps run and the public-channel steps do not.
+        self._restore_sequence: Sequence[RestoreStep] = (
+            restore_sequence
+            if restore_sequence is not None
+            else build_restore_sequence(paper_mode=paper_mode)
+        )
 
     def _emit(self, event: object) -> None:
         if self._on_event is not None:
@@ -158,7 +170,7 @@ class ReconnectDriver:
         retries the whole sequence."""
         transport: Transport | None = None
         try:
-            for step in build_restore_sequence(paper_mode=self._paper_mode):
+            for step in self._restore_sequence:
                 if step is RestoreStep.RECONNECT_SOCKET:
                     transport = await self._open_socket(shard_index)
                 else:

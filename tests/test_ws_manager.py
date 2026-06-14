@@ -8,6 +8,7 @@ channels (A-12/HR-WM-006 never-drop), and the paper/live outbound seam gate
 
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 
 import pytest
@@ -149,10 +150,17 @@ def _seam(mode, **kw):
     sent: list = []
     simmed: list = []
     events: list = []
+
+    async def _live(op, m):
+        sent.append((op, m))
+
+    async def _paper(op, m):
+        simmed.append((op, m))
+
     seam = DispatchSeam(
         mode,
-        live_sender=lambda op, m: sent.append((op, m)),
-        paper_simulator=lambda op, m: simmed.append((op, m)),
+        live_sender=_live,
+        paper_simulator=_paper,
         on_event=events.append,
         **kw,
     )
@@ -161,7 +169,7 @@ def _seam(mode, **kw):
 
 def test_seam_paper_simulates_never_transmits():
     seam, sent, simmed, events = _seam(Mode.PAPER)
-    result = seam.add_order({"pair": "BTC/USD"})
+    result = asyncio.run(seam.add_order({"pair": "BTC/USD"}))
     assert result.transmitted is False
     assert sent == []  # nothing to Kraken (PA-004 #2 / HR-WM-023)
     assert simmed == [(OutboundOp.ADD_ORDER, {"pair": "BTC/USD"})]
@@ -170,12 +178,16 @@ def test_seam_paper_simulates_never_transmits():
 
 def test_seam_paper_all_six_ops_simulated():
     seam, sent, simmed, events = _seam(Mode.PAPER)
-    seam.add_order({})
-    seam.batch_add({})
-    seam.cancel_order({})
-    seam.amend_order({})
-    seam.batch_cancel({})
-    seam.dispatch_market_sell({})
+
+    async def _drive():
+        await seam.add_order({})
+        await seam.batch_add({})
+        await seam.cancel_order({})
+        await seam.amend_order({})
+        await seam.batch_cancel({})
+        await seam.dispatch_market_sell({})
+
+    asyncio.run(_drive())
     assert sent == []
     assert [op for op, _ in simmed] == list(OutboundOp)
     assert all(isinstance(e, PaperOrderSimulated) for e in events)
@@ -185,7 +197,7 @@ def test_seam_paper_all_six_ops_simulated():
 
 def test_seam_live_transmits_and_emits_entry_submitted():
     seam, sent, simmed, events = _seam(Mode.LIVE)
-    result = seam.add_order({"pair": "ETH/USD"})
+    result = asyncio.run(seam.add_order({"pair": "ETH/USD"}))
     assert result.transmitted is True
     assert simmed == []
     assert sent == [(OutboundOp.ADD_ORDER, {"pair": "ETH/USD"})]
@@ -194,8 +206,12 @@ def test_seam_live_transmits_and_emits_entry_submitted():
 
 def test_seam_live_non_entry_ops_transmit_without_entry_event():
     seam, sent, simmed, events = _seam(Mode.LIVE)
-    seam.cancel_order({})
-    seam.amend_order({})
+
+    async def _drive():
+        await seam.cancel_order({})
+        await seam.amend_order({})
+
+    asyncio.run(_drive())
     assert [op for op, _ in sent] == [OutboundOp.CANCEL_ORDER, OutboundOp.AMEND_ORDER]
     assert events == []  # ENTRY_SUBMITTED only on the entry add_order
 
@@ -204,15 +220,19 @@ def test_seam_live_non_entry_ops_transmit_without_entry_event():
 
 def test_seam_canary_blocks_live_branch_in_paper():
     events: list = []
+
+    async def _noop(op, m):
+        return None
+
     seam = DispatchSeam(
         Mode.PAPER,
-        live_sender=lambda op, m: None,
-        paper_simulator=lambda op, m: None,
+        live_sender=_noop,
+        paper_simulator=_noop,
         on_event=events.append,
     )
     # Reach the defensive live branch directly - must block and emit canary.
     with pytest.raises(PaperDispatchBlockedError):
-        seam._transmit_live(OutboundOp.ADD_ORDER, {})
+        asyncio.run(seam._transmit_live(OutboundOp.ADD_ORDER, {}))
     assert events == [PaperDispatchBlocked(OutboundOp.ADD_ORDER)]
 
 
@@ -250,16 +270,35 @@ def test_manager_inbound_routing():
 
 def test_manager_seam_wired_to_mode():
     sent: list = []
-    m = WSManager(Mode.LIVE, live_sender=lambda op, msg: sent.append(op))
-    m.seam.add_order({})
+
+    async def _live(op, msg):
+        sent.append(op)
+
+    m = WSManager(Mode.LIVE, live_sender=_live)
+    asyncio.run(m.seam.add_order({}))
     assert sent == [OutboundOp.ADD_ORDER]
 
 
-def test_manager_unwired_simulator_raises_in_paper():
-    # The shell ships an unwired paper simulator (real one is S2c).
+def test_manager_paper_dispatch_is_real_noop_boundary():
+    # The shell now ships the real outbound bodies: in paper the boundary records
+    # the dispatch and transmits NOTHING to Kraken (PA-004 div #2); no raise (a
+    # paper order is a valid dispatch). The synthetic fill simulator is Path B.
     m = WSManager(Mode.PAPER)
-    with pytest.raises(NotImplementedError):
-        m.seam.add_order({})
+    result = asyncio.run(m.seam.add_order({"pair": "BTC/USD"}))
+    assert result.transmitted is False
+    assert m.paper_dispatch.simulated == [(OutboundOp.ADD_ORDER, {"pair": "BTC/USD"})]
+    assert m.transmitter.is_connected is False  # live transmitter never bound in paper
+
+
+def test_manager_live_transmitter_unbound_raises_until_private_connected():
+    # In live the seam routes to the transmitter; with no private WS bound yet
+    # (startup Step 5 not run) a dispatch surfaces OutboundNotConnectedError, never
+    # a silent drop.
+    from tothbot.exchange.outbound import OutboundNotConnectedError
+
+    m = WSManager(Mode.LIVE)
+    with pytest.raises(OutboundNotConnectedError):
+        asyncio.run(m.seam.add_order({"pair": "BTC/USD"}))
 
 
 # -- WS_Manager as the sole writer to Position Mirror (HR-PM-009) --------

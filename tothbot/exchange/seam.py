@@ -19,15 +19,20 @@ lifetime). evt:PAPER_DISPATCH_BLOCKED is a defensive canary (rule:HR-WM-023):
 if any code path ever reaches the live transmit branch while in paper mode it
 fires CRITICAL and blocks - it must be unreachable under correct flow.
 
-The live transmitter and the paper simulator are INJECTED: container:Private_WS_v2
-send (live) and contract:Synthetic_Capital_Ledger / _simulate_entry_fill (paper)
-are built in later sessions. This module owns only the gate, the branch, and
-the canary.
+The live transmitter and the paper simulator are INJECTED async I/O bodies
+(outbound.py): container:Private_WS_v2 send (live, ws_private.send) and
+contract:Synthetic_Capital_Ledger / _simulate_entry_fill (paper). This module owns
+only the gate, the branch, the canary, and the events.
+
+The six order methods are ASYNC: the live body awaits the async private
+Transport.send and the paper body may schedule a simulation task, so the
+rule:HR-EE-013 mode-opaque caller awaits ONE coroutine regardless of mode (the
+sec 12.3 caller contract - "Returns after dispatch", EE awaits the seam).
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
 
@@ -49,9 +54,10 @@ class OutboundOp(Enum):
     DISPATCH_MARKET_SELL = "dispatch_market_sell"  # L1a/L2 exit market sell
 
 
-# Injected I/O edges. Each receives the operation + the already-built message.
-LiveSender = Callable[[OutboundOp, dict], None]
-PaperSimulator = Callable[[OutboundOp, dict], None]
+# Injected async I/O edges. Each receives the operation + the already-built message
+# and awaits its side effect (live: ws_private.send; paper: local simulation).
+LiveSender = Callable[[OutboundOp, dict], Awaitable[None]]
+PaperSimulator = Callable[[OutboundOp, dict], Awaitable[None]]
 EventSink = Callable[[object], None]
 
 
@@ -115,14 +121,14 @@ class DispatchSeam:
         if self._on_event is not None:
             self._on_event(event)
 
-    def _dispatch(self, op: OutboundOp, message: dict) -> SeamDispatch:
+    async def _dispatch(self, op: OutboundOp, message: dict) -> SeamDispatch:
         if self._mode is Mode.PAPER:
-            self._paper_simulator(op, message)
+            await self._paper_simulator(op, message)
             self._emit(PaperOrderSimulated(op))
             return SeamDispatch(op=op, mode=self._mode, transmitted=False)
-        return self._transmit_live(op, message)
+        return await self._transmit_live(op, message)
 
-    def _transmit_live(self, op: OutboundOp, message: dict) -> SeamDispatch:
+    async def _transmit_live(self, op: OutboundOp, message: dict) -> SeamDispatch:
         # Defensive canary (rule:HR-WM-023): the outbound branch must be
         # unreachable in paper mode. If it is ever reached, block and alert.
         if self._mode is Mode.PAPER:
@@ -130,26 +136,26 @@ class DispatchSeam:
             raise PaperDispatchBlockedError(
                 f"paper-mode dispatch reached the live transmit branch: {op.value}"
             )
-        self._live_sender(op, message)
+        await self._live_sender(op, message)
         if op is OutboundOp.ADD_ORDER:
             self._emit(EntrySubmitted(op))
         return SeamDispatch(op=op, mode=self._mode, transmitted=True)
 
     # --- the six outbound order methods (the sole order-dispatch surface) -----
-    def add_order(self, message: dict) -> SeamDispatch:
-        return self._dispatch(OutboundOp.ADD_ORDER, message)
+    async def add_order(self, message: dict) -> SeamDispatch:
+        return await self._dispatch(OutboundOp.ADD_ORDER, message)
 
-    def batch_add(self, message: dict) -> SeamDispatch:
-        return self._dispatch(OutboundOp.BATCH_ADD, message)
+    async def batch_add(self, message: dict) -> SeamDispatch:
+        return await self._dispatch(OutboundOp.BATCH_ADD, message)
 
-    def cancel_order(self, message: dict) -> SeamDispatch:
-        return self._dispatch(OutboundOp.CANCEL_ORDER, message)
+    async def cancel_order(self, message: dict) -> SeamDispatch:
+        return await self._dispatch(OutboundOp.CANCEL_ORDER, message)
 
-    def amend_order(self, message: dict) -> SeamDispatch:
-        return self._dispatch(OutboundOp.AMEND_ORDER, message)
+    async def amend_order(self, message: dict) -> SeamDispatch:
+        return await self._dispatch(OutboundOp.AMEND_ORDER, message)
 
-    def batch_cancel(self, message: dict) -> SeamDispatch:
-        return self._dispatch(OutboundOp.BATCH_CANCEL, message)
+    async def batch_cancel(self, message: dict) -> SeamDispatch:
+        return await self._dispatch(OutboundOp.BATCH_CANCEL, message)
 
-    def dispatch_market_sell(self, message: dict) -> SeamDispatch:
-        return self._dispatch(OutboundOp.DISPATCH_MARKET_SELL, message)
+    async def dispatch_market_sell(self, message: dict) -> SeamDispatch:
+        return await self._dispatch(OutboundOp.DISPATCH_MARKET_SELL, message)
