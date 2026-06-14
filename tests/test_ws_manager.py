@@ -279,15 +279,85 @@ def test_manager_seam_wired_to_mode():
     assert sent == [OutboundOp.ADD_ORDER]
 
 
-def test_manager_paper_dispatch_is_real_noop_boundary():
-    # The shell now ships the real outbound bodies: in paper the boundary records
-    # the dispatch and transmits NOTHING to Kraken (PA-004 div #2); no raise (a
-    # paper order is a valid dispatch). The synthetic fill simulator is Path B.
+def test_manager_paper_dispatch_records_and_transmits_nothing():
+    # In paper the boundary records the dispatch and transmits NOTHING to Kraken
+    # (PA-004 div #2); no raise (a paper order is a valid dispatch). A placeholder
+    # message without order fields produces no synthetic fill (no position opened).
     m = WSManager(Mode.PAPER)
     result = asyncio.run(m.seam.add_order({"pair": "BTC/USD"}))
     assert result.transmitted is False
     assert m.paper_dispatch.simulated == [(OutboundOp.ADD_ORDER, {"pair": "BTC/USD"})]
     assert m.transmitter.is_connected is False  # live transmitter never bound in paper
+    assert m.open_position_symbols() == frozenset()  # non-fillable message -> no fill
+
+
+# -- WS_Manager paper capital path: synthetic ledger + fill simulator ----
+
+_PAPER_ENTRY = {
+    "params": {"symbol": "BTC/USD", "side": "buy", "order_qty": "0.05",
+               "limit_price": "60000", "cl_ord_id": "cl-1"}
+}
+_PAPER_EXIT = {
+    "params": {"symbol": "BTC/USD", "side": "sell", "order_qty": "0.05",
+               "limit_price": "66000", "cl_ord_id": "cl-2", "exit_reason": "L1A"}
+}
+
+
+def test_manager_paper_ledger_seeded_at_d05_starting_balance():
+    m = WSManager(Mode.PAPER)
+    assert m.ledger is not None
+    assert m.spot_usd_balance == Decimal("5000.0")  # decision:D-05 $5,000/module
+    assert m.paper_fill is not None
+
+
+def test_manager_live_has_no_synthetic_ledger():
+    m = WSManager(Mode.LIVE)
+    assert m.ledger is None
+    assert m.paper_fill is None
+    assert m.spot_usd_balance is None  # real Kraken balance authoritative
+
+
+def test_manager_paper_starting_balance_override():
+    m = WSManager(Mode.PAPER, paper_starting_balance="7500")
+    assert m.spot_usd_balance == Decimal("7500")
+
+
+def test_manager_paper_full_cycle_entry_opens_mirror_and_debits_ledger():
+    # The whole point of this slice: a paper dispatch runs the full inbound+outbound
+    # cycle - the seam simulates locally, the fill writes the SAME mirror surface the
+    # live executions stream feeds (D-06), and the synthetic ledger is debited.
+    m = WSManager(Mode.PAPER)
+    asyncio.run(m.seam.add_order(_PAPER_ENTRY))
+
+    pos = m.position("BTC/USD")
+    assert pos is not None
+    assert pos.qty == Decimal("0.05")
+    assert pos.avg_entry_price == Decimal("60000")
+    # entry debit: proceeds 3000 + taker fee 7.8 -> 5000 - 3007.8
+    assert m.spot_usd_balance == Decimal("1992.2")
+    assert m.ledger.fees_entry_for("BTC/USD") == Decimal("7.8")
+
+
+def test_manager_paper_full_cycle_exit_closes_mirror_and_credits_ledger():
+    m = WSManager(Mode.PAPER)
+
+    async def _round_trip():
+        await m.seam.add_order(_PAPER_ENTRY)
+        await m.seam.dispatch_market_sell(_PAPER_EXIT)
+
+    asyncio.run(_round_trip())
+    assert not m.has_position("BTC/USD")               # opposite-side fill closed it
+    # exit credit: proceeds 3300 - taker fee 8.58 -> 1992.2 + 3291.42
+    assert m.spot_usd_balance == Decimal("5283.62")
+    assert m.ledger.fees_entry_for("BTC/USD") is None  # cleared on close
+
+
+def test_manager_paper_ledger_is_sole_writer_guarded():
+    from tothbot.exchange.ledger import LedgerSoleWriterViolationError
+
+    m = WSManager(Mode.PAPER)
+    with pytest.raises(LedgerSoleWriterViolationError):
+        m.ledger.entry_fill_debit("BTC/USD", "0.05", "60000", writer="Risk_Engine")
 
 
 def test_manager_live_transmitter_unbound_raises_until_private_connected():

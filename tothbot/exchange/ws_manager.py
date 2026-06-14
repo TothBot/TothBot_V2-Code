@@ -16,24 +16,35 @@ construction (rule:HR-WM-021, immutable for the process lifetime):
     connected in paper (rule:HR-WM-022 / PA-004 divergence #1);
   - the inbound DispatchTable and the outbound DispatchSeam.
 
-The outbound seam I/O bodies are now WIRED (outbound.py): the live transmitter
+The outbound seam I/O bodies are WIRED (outbound.py): the live transmitter
 (PrivateTransmitter / ws_private.send over the single private Transport) and the
 paper boundary (PaperDispatchSimulator). The live transmitter's socket is
 late-bound by the private_ws assembler once the private connection opens (startup
 Step 5) and re-bound on each reconnect; WSManager exposes it as self.transmitter.
 
-DEFERRED: the synthetic-capital fill simulator (contract:Synthetic_Capital_Ledger,
-PA-004 div #3, Path B) that plugs into the paper boundary, and the REST
+The PAPER capital path is now WIRED (PA-004 div #3 / #4, paper side). In paper mode
+WSManager owns the synthetic spot_usd_balance (ledger.py, sec 12.4 single-owner) and
+a PaperFillSimulator (paper_fill.py) is bound into the paper boundary's fill_simulator
+hook: a paper dispatch produces a synthetic fill that writes the Position Mirror via
+the byte-identical record_execution surface (D-06) and debits/credits the synthetic
+ledger through the sole-writer methods below. WSManager is the SOLE writer of BOTH the
+mirror (rule:HR-PM-009) and the ledger (rule:HR-WM-032).
+
+DEFERRED: the _maybe_paper_fill bbo-touch emergSL fill (ticker-driven), the
+Exit Controller TRADE_CLOSE net-P&L close path (sec 12.5), and the REST
 contract:Reconciliation_REST fallback.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from decimal import Decimal
 
 from .connection import ConnectionRole, WSConnection
 from .dispatch import Channel, DispatchTable, Handler
+from .ledger import LedgerUpdate, SyntheticCapitalLedger
 from .outbound import PaperDispatchSimulator, PrivateTransmitter
+from .paper_fill import PaperFillSimulator
 from .position_mirror import (
     WRITER_ID,
     ExecOutcome,
@@ -42,7 +53,13 @@ from .position_mirror import (
     PositionMirror,
 )
 from .seam import DispatchSeam, EventSink, LiveSender, PaperSimulator
+from ..config import registry
 from ..config.settings import Mode
+
+# Default paper wallet seed (decision:D-05): $5,000 each for the Long + Short module
+# wallets. Sourced from the registry (the two seeds are equal); the per-module assembler
+# passes the wallet's own seed explicitly when it constructs each module's WSManager.
+_DEFAULT_PAPER_STARTING_BALANCE: object = registry.value("paper_starting_balance_long_usd")
 
 
 class WSManager:
@@ -55,8 +72,10 @@ class WSManager:
         live_sender: LiveSender | None = None,
         paper_simulator: PaperSimulator | None = None,
         on_event: EventSink | None = None,
+        paper_starting_balance: object | None = None,
     ) -> None:
         self._mode = mode  # frozen for process lifetime (rule:HR-WM-021)
+        self._on_event = on_event
 
         # Public connection always exists; private exists ONLY in live mode
         # (rule:HR-WM-022 - private WS never connected in paper).
@@ -68,13 +87,41 @@ class WSManager:
         # Inbound O(1) routing of the 7 channels.
         self.inbound = DispatchTable()
 
-        # The outbound seam I/O bodies. The live transmitter (ws_private.send) is
-        # late-bound to the private Transport by the private_ws assembler once the
-        # connection opens (startup Step 5) and re-bound on each reconnect; the paper
-        # boundary is the contract:Synthetic_Capital_Ledger plug point. Either may be
-        # overridden by injection (tests / a custom fill simulator).
+        # The live outbound transmitter (ws_private.send) - late-bound to the private
+        # Transport by the private_ws assembler once the connection opens (startup
+        # Step 5) and re-bound on each reconnect. Overridable by injection (tests).
         self.transmitter = PrivateTransmitter()
-        self.paper_dispatch = PaperDispatchSimulator()
+
+        # Sole-writer mirror of all open positions (rule:HR-PM-009). WSManager is the
+        # only writer; the write source diverges by mode upstream (PA-004 div #4:
+        # paper = local sim fills; live = executions) but is byte-identical here.
+        self.positions = PositionMirror(on_event=on_event)
+
+        # PAPER capital path (PA-004 div #3 / #4, paper side). In paper mode WSManager
+        # owns the synthetic spot_usd_balance (sec 12.4 single-owner) and binds a
+        # PaperFillSimulator into the paper boundary's fill_simulator hook so a paper
+        # dispatch produces a synthetic fill -> record_execution (D-06) + ledger
+        # debit/credit. In live mode there is no synthetic ledger (real Kraken balances
+        # are authoritative) and the paper boundary is inert (the seam uses the
+        # transmitter), so both stay None / a no-op boundary.
+        self.ledger: SyntheticCapitalLedger | None = None
+        self.paper_fill: PaperFillSimulator | None = None
+        if mode is Mode.PAPER:
+            seed = (
+                paper_starting_balance
+                if paper_starting_balance is not None
+                else _DEFAULT_PAPER_STARTING_BALANCE
+            )
+            self.ledger = SyntheticCapitalLedger(seed, on_event=on_event)
+            self.paper_fill = PaperFillSimulator(
+                record_execution=self.record_execution,
+                apply_entry_fill=self.apply_paper_entry_fill,
+                apply_exit_fill=self.apply_paper_exit_fill,
+                on_event=on_event,
+            )
+            self.paper_dispatch = PaperDispatchSimulator(fill_simulator=self.paper_fill)
+        else:
+            self.paper_dispatch = PaperDispatchSimulator()
 
         # Outbound order-dispatch mode gate (contract:WSManager_Dispatch_Seam).
         self.seam = DispatchSeam(
@@ -83,12 +130,6 @@ class WSManager:
             paper_simulator=paper_simulator or self.paper_dispatch,
             on_event=on_event,
         )
-
-        # Sole-writer mirror of all open positions (rule:HR-PM-009). WSManager is the
-        # only writer; the write source diverges by mode upstream (PA-004 div #4:
-        # paper = local sim fills; live = executions) but is byte-identical here.
-        self._on_event = on_event
-        self.positions = PositionMirror(on_event=on_event)
 
     @property
     def mode(self) -> Mode:
@@ -141,6 +182,42 @@ class WSManager:
         """Reconcile the mirror against the executions snapshot on reconnect/startup
         (AR-056 RESTORE_POSITION_MIRROR / Step 6); returns the gap-closed positions."""
         return self.positions.restore_from_snapshot(snap_orders, writer=WRITER_ID)
+
+    # --- Synthetic Capital Ledger: WSManager is the SOLE writer (rule:HR-WM-032) --
+    # The mirror image of the Position-Mirror sole-writer pattern: these are the ONLY
+    # callers that tag a ledger write with WRITER_ID (sec 12.4 single-owner). Paper
+    # mode only - in live the ledger is None (real Kraken balances are authoritative).
+    def apply_paper_entry_fill(
+        self, symbol: str, qty: object, entry_fill_price: object
+    ) -> LedgerUpdate:
+        """Debit the synthetic spot_usd_balance for a simulated entry fill (sec 12.4
+        ENTRY-FILL DEBIT, FEE_TAKER_PCT). Paper mode only."""
+        if self.ledger is None:
+            raise RuntimeError(
+                "apply_paper_entry_fill called with no synthetic ledger (live mode - "
+                "real Kraken balances are authoritative; HR-WM-032 paper-only)"
+            )
+        return self.ledger.entry_fill_debit(symbol, qty, entry_fill_price, writer=WRITER_ID)
+
+    def apply_paper_exit_fill(
+        self, symbol: str, qty: object, exit_price: object, *, exit_reason: str | None = None
+    ) -> LedgerUpdate:
+        """Credit the synthetic spot_usd_balance for a simulated exit fill (sec 12.4
+        EXIT-FILL CREDIT, FEE_TAKER_PCT). Paper mode only."""
+        if self.ledger is None:
+            raise RuntimeError(
+                "apply_paper_exit_fill called with no synthetic ledger (live mode - "
+                "real Kraken balances are authoritative; HR-WM-032 paper-only)"
+            )
+        return self.ledger.exit_fill_credit(
+            symbol, qty, exit_price, writer=WRITER_ID, exit_reason=exit_reason
+        )
+
+    @property
+    def spot_usd_balance(self) -> Decimal | None:
+        """The synthetic spot_usd_balance (paper mode), or None in live mode where the
+        real Kraken balance is authoritative (sec 12.4)."""
+        return None if self.ledger is None else self.ledger.balance
 
     # --- Position Mirror read helpers (the rule:HR-PM-009 read contract) ------
     def position(self, symbol: str) -> Position | None:
