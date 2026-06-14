@@ -18,6 +18,10 @@ import pytest
 from tothbot.exchange.reconnect import (
     CLOUDFLARE_RECONNECT_LIMIT,
     CLOUDFLARE_WINDOW_SEC,
+    RECONNECT_BACKOFF_CAP_SEC,
+    RECONNECT_BACKOFF_SEED_SEC,
+    RECONNECT_CUMULATIVE_SLEEP_SEC,
+    RECONNECT_SEEDED_ATTEMPTS,
     RESTORE_SEQUENCE,
     SCENARIO_A_BACKOFF_BASE_SEC,
     SCENARIO_A_IMMEDIATE_ATTEMPTS,
@@ -81,10 +85,33 @@ def test_delay_rejects_below_one() -> None:
         reconnect_delay_sec(ReconnectScenario.SCENARIO_A, 0)
 
 
-# -- reconnect_delay_sec: BLOCKED backoff phase (NSI sec 6) --------------
-def test_scenario_a_backoff_phase_is_blocked() -> None:
-    with pytest.raises(NotImplementedError):
-        reconnect_delay_sec(ReconnectScenario.SCENARIO_A, SCENARIO_A_IMMEDIATE_ATTEMPTS + 1)
+# -- reconnect_delay_sec: Scenario-A seed schedule (TB00712 ruling) ------
+def test_backoff_seed_shape() -> None:
+    # CIATS-owned paper-validated seed: 5 immediate, exp 1-16, then 30s cap.
+    assert RECONNECT_BACKOFF_SEED_SEC == (
+        0.0, 0.0, 0.0, 0.0, 0.0,
+        1.0, 2.0, 4.0, 8.0, 16.0,
+        30.0, 30.0, 30.0, 30.0, 30.0,
+    )
+    assert RECONNECT_SEEDED_ATTEMPTS == 15
+    assert RECONNECT_BACKOFF_CAP_SEC == 30.0
+    assert RECONNECT_CUMULATIVE_SLEEP_SEC == 181.0  # 1+2+4+8+16 + 30x5
+
+
+def test_backoff_per_attempt_matches_seed() -> None:
+    for i, expected in enumerate(RECONNECT_BACKOFF_SEED_SEC, start=1):
+        assert reconnect_delay_sec(ReconnectScenario.SCENARIO_A, i) == expected
+
+
+def test_backoff_immediate_phase_is_zero() -> None:
+    for attempt in range(1, SCENARIO_A_IMMEDIATE_ATTEMPTS + 1):
+        assert reconnect_delay_sec(ReconnectScenario.SCENARIO_A, attempt) == 0.0
+
+
+def test_backoff_beyond_schedule_holds_at_cap() -> None:
+    # never abandons reconnection (loss-min); holds at the 30s cap
+    assert reconnect_delay_sec(ReconnectScenario.SCENARIO_A, 16) == RECONNECT_BACKOFF_CAP_SEC
+    assert reconnect_delay_sec(ReconnectScenario.SCENARIO_A, 999) == RECONNECT_BACKOFF_CAP_SEC
 
 
 # -- WS-REC-004 restore sequence: order + paper gating ------------------

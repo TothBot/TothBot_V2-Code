@@ -25,18 +25,20 @@ TWO disconnect scenarios (WS-REC-003 / A-5):
     not hammer an engine still completing maintenance.
 
 The ar:AR-080 Cloudflare ceiling (CLOUDFLARE_RECONNECT_LIMIT connection
-establishments per CLOUDFLARE_WINDOW_SEC per IP) is the hard bound any backoff
+establishments per CLOUDFLARE_WINDOW_SEC per IP) is the hard bound the backoff
 schedule must respect.
 
-  *** BLOCKED - TB00709 NSI sec 6 / TB00708 housekeeping 8b ***
-  The EXACT Scenario-A exponential backoff schedule - the per-attempt delay
-  growth, the 30 s per-attempt cap, and the "181s max sleep" cumulative cap drawn
-  in the D1 visual annotation - is NOT stated in the WS-REC-003 prose; 181 s is a
-  reconstruction (1+2+4+8+16 then 30 x5 = 181), not a diagram read. Per DIAGRAMS
-  GOVERN (TB00000 sec 4.2) the backoff numbers are NOT invented here:
-  reconnect_delay_sec() raises NotImplementedError for the backoff phase pending
-  Bill pinning the exact schedule INTO the figure. Everything else in this module
-  is read directly from the diagram and is complete.
+BACKOFF SCHEDULE = a CIATS-OWNED, PAPER-VALIDATED SEED (Bill ruling TB00712).
+The Scenario-A per-attempt schedule is NOT a fixed engineering constant - its
+values were derived from paper-trading reconnection experience, so it is a
+CIATS-owned/operator seed refined by paper data (only the net 1:1.5 R:R floor is
+hardcoded). RECONNECT_BACKOFF_SEED_SEC below is the seed; its value home is
+TB00000 sec 8 (reconnect_backoff_schedule_seed) and its canonical mechanism is
+0500000 D1 mod:WS_Manager WS-REC-003 (the figure carries the architecture +
+mechanism + the sec-8 value-home pointer per the seed-value-home rule + DEC-125).
+Beyond the seeded attempts the delay holds at the 30 s cap - reconnection is
+never abandoned (a stopped reconnect leaves positions unmanaged with only the L3
+emergSL; loss-min), and the ar:AR-080 ceiling still bounds the rate.
 """
 
 from __future__ import annotations
@@ -44,12 +46,26 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-# --- stated reconnect constants (WS-REC-003 / ar:AR-080; not CIATS-owned) -----
+# --- reconnect constants (WS-REC-003 / ar:AR-080) -----------------------------
 SCENARIO_A_IMMEDIATE_ATTEMPTS = 5      # WS-REC-003 "up to 5 immediate attempts"
-SCENARIO_A_BACKOFF_BASE_SEC = 1.0      # WS-REC-003 "exponential backoff starting at 1s"
+SCENARIO_A_BACKOFF_BASE_SEC = 1.0      # WS-REC-003 exponential backoff base
 SCENARIO_B_MIN_DELAY_SEC = 5.0         # WS-REC-003 "MINIMUM 5-second delay"
 CLOUDFLARE_RECONNECT_LIMIT = 150       # ar:AR-080 connection establishments / window / IP
 CLOUDFLARE_WINDOW_SEC = 600.0          # ar:AR-080 rolling 10-minute window
+
+# Scenario-A per-attempt delay (seconds) BEFORE each reconnect attempt. A
+# CIATS-OWNED, PAPER-VALIDATED SEED (value home TB00000 sec 8
+# reconnect_backoff_schedule_seed; mechanism 0500000 D1 WS-REC-003): 5 immediate
+# attempts (0 s), then exponential 1->16 s (base 1 s, doubling), then capped at
+# the 30 s ceiling. Cumulative backoff sleep = 1+2+4+8+16 + 30x5 = 181 s.
+RECONNECT_BACKOFF_SEED_SEC: tuple[float, ...] = (
+    0.0, 0.0, 0.0, 0.0, 0.0,        # 1..5  immediate
+    1.0, 2.0, 4.0, 8.0, 16.0,       # 6..10 exponential, base 1 s doubling
+    30.0, 30.0, 30.0, 30.0, 30.0,   # 11..15 capped at 30 s
+)
+RECONNECT_BACKOFF_CAP_SEC = 30.0                            # per-attempt ceiling
+RECONNECT_SEEDED_ATTEMPTS = len(RECONNECT_BACKOFF_SEED_SEC)  # 15
+RECONNECT_CUMULATIVE_SLEEP_SEC = sum(RECONNECT_BACKOFF_SEED_SEC)  # 181.0
 
 # Canonical log key for the reconnect event (the receive loop logs this on every
 # reconnect; evt:WS_RECONNECT in the mod:WS_Manager produces: list).
@@ -143,27 +159,24 @@ def is_immediate_attempt(attempt: int) -> bool:
 def reconnect_delay_sec(scenario: ReconnectScenario, attempt: int) -> float:
     """Seconds to wait before reconnect attempt `attempt` (1-based).
 
-    Code-complete cases (read directly from WS-REC-003):
-      Scenario B, any attempt          -> SCENARIO_B_MIN_DELAY_SEC (5 s floor)
-      Scenario A, immediate phase       -> 0.0 (the first 5 attempts)
+      Scenario B, any attempt     -> SCENARIO_B_MIN_DELAY_SEC (5 s floor)
+      Scenario A, attempt 1..15   -> RECONNECT_BACKOFF_SEED_SEC[attempt-1]
+                                     (5 immediate 0 s, exp 1-16 s, then 30 s cap)
+      Scenario A, attempt > 15    -> RECONNECT_BACKOFF_CAP_SEC (30 s); reconnection
+                                     is never abandoned (loss-min), and ar:AR-080
+                                     still bounds the rate.
 
-    BLOCKED case (TB00709 NSI sec 6 - DIAGRAMS GOVERN, do not invent):
-      Scenario A, backoff phase (attempt > 5) -> raises NotImplementedError; the
-      exact exponential schedule + 30 s cap + 181 s max sleep must be pinned into
-      the figure by Bill first.
+    The Scenario-A schedule is the CIATS-owned paper-validated seed
+    RECONNECT_BACKOFF_SEED_SEC (value home TB00000 sec 8; mechanism WS-REC-003).
     """
     if attempt < 1:
         raise ValueError(f"attempt must be >= 1, got {attempt}")
     if scenario is ReconnectScenario.SCENARIO_B:
         return SCENARIO_B_MIN_DELAY_SEC
-    # Scenario A
-    if is_immediate_attempt(attempt):
-        return 0.0
-    raise NotImplementedError(
-        "Scenario-A exponential backoff schedule is BLOCKED pending Bill's pin "
-        "of the exact per-attempt delays / 30s cap / 181s max sleep into the D1 "
-        "figure (TB00709 NSI sec 6; DIAGRAMS GOVERN - do not invent)."
-    )
+    # Scenario A: read the seed; beyond the seeded attempts hold at the cap.
+    if attempt <= RECONNECT_SEEDED_ATTEMPTS:
+        return RECONNECT_BACKOFF_SEED_SEC[attempt - 1]
+    return RECONNECT_BACKOFF_CAP_SEC
 
 
 def build_restore_sequence(*, paper_mode: bool) -> list[RestoreStep]:
