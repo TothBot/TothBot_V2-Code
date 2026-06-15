@@ -25,6 +25,7 @@ from ..exchange.instrument_cache import base_per_trade_size_usd
 from ..exchange.position_mirror import PositionSide
 from ..exchange.silent_pair import PairDataState, SilentPairMachine
 from ..regime.taxonomy import Regime
+from .parameter_snapshot import CycleParameters, build_cycle_parameters
 from .sweep import LiveProviders, ProviderNotReady
 
 # A-2 / ar:AR-069: the marketable-IOC entry carries a short order deadline (now + 5s).
@@ -99,6 +100,28 @@ def make_mpp_provider(mpp_store) -> Callable[[str, PositionSide], Decimal]:
     return mpp_abs_cap_pct
 
 
+def make_cycle_parameters_provider(
+    conductors: "dict[PositionSide, object]",
+) -> Callable[[PositionSide], CycleParameters]:
+    """The per-module frozen Parameter_Store_Snapshot provider (contract:CI-IF-003) backed by the
+    live per-side CiatsConductor. cycle_parameters(side) takes ONE frozen ParameterStore.snapshot()
+    at the cycle start overlaid on the registry seeds, plus the conductor's protective
+    param:disallowed_regimes (-> gate:G3) - so a CIATS-tuned value AND the disallowed-regime block
+    list genuinely FLOW into the gates this cycle (not seed-only). A side with no conductor wired
+    returns a seed-only view (the pre-CIATS behavior). The sacred 1:1.5 R:R is never served (it is
+    hardcoded in G8)."""
+
+    def cycle_parameters(side: PositionSide) -> CycleParameters:
+        conductor = conductors.get(side)
+        if conductor is None:
+            return build_cycle_parameters()
+        return build_cycle_parameters(
+            conductor.parameter_store, disallowed_regimes=conductor.disallowed_regimes()
+        )
+
+    return cycle_parameters
+
+
 def make_deadline(
     now_utc: UtcClock, *, offset_sec: float = DEFAULT_DEADLINE_OFFSET_SEC
 ) -> Callable[[], str]:
@@ -122,11 +145,15 @@ def make_live_providers(
     now_utc: UtcClock | None = None,
     deadline_offset_sec: float = DEFAULT_DEADLINE_OFFSET_SEC,
     semaphore_locked: Callable[[PositionSide], bool] | None = None,
+    cycle_parameters: "Callable[[PositionSide], object] | None" = None,
 ) -> LiveProviders:
     """Assemble a LiveProviders backed by the runtime caches. The instrument/bbo/liquidity/base
     callables READ the caches (raising ProviderNotReady on a cache miss so the sweep skips that
     tick); expected_reward + mpp_abs_cap_pct + ws_state are injected (the CIATS seeds + the
-    subscription lifecycle). now_utc defaults to the wall clock for the deadline."""
+    subscription lifecycle). now_utc defaults to the wall clock for the deadline. cycle_parameters
+    is the per-module frozen Parameter_Store_Snapshot provider (CI-IF-003) - None leaves the gates
+    on the seed-only path (the sweep passes params=None), the live layer backs it with the per-
+    module store via make_cycle_parameters_provider."""
     clock: UtcClock = now_utc or (lambda: datetime.now(timezone.utc))
 
     def instrument(symbol: str) -> "tuple[str, bool, object]":
@@ -160,4 +187,5 @@ def make_live_providers(
         new_cl_ord_id=new_cl_ord_id,
         new_deadline=make_deadline(clock, offset_sec=deadline_offset_sec),
         semaphore_locked=semaphore_locked or (lambda _side: False),
+        cycle_parameters=cycle_parameters,
     )

@@ -56,6 +56,10 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
+from ..ciats.conductor import CiatsConductor
+from ..ciats.parameter_store import ParameterStore
+from ..ciats.pool import CiatsPool
+from ..ciats.regime_library import RegimeLibrary
 from ..config.settings import Mode
 from ..exchange.assembler import DataLayer, DataLayerAssembler
 from ..exchange.bbo_cache import BboCache
@@ -64,6 +68,7 @@ from ..exchange.dispatch import Channel, Handler
 from ..exchange.instrument_cache import InstrumentCache
 from ..exchange.liquidity_cache import LiquidityCache, LiquidityProbe
 from ..exchange.pacing import SubscribeTokenBucket
+from ..exchange.position_mirror import PositionSide
 from ..exchange.private_ws import PrivateConnection, PrivateConnectionAssembler
 from ..exchange.reconnect import ShardReconnectCoordinator
 from ..exchange.sharding import ShardPlan
@@ -71,8 +76,9 @@ from ..exchange.silent_pair import SilentPairMachine
 from ..exchange.transport import Transport
 from ..exchange.warmup import WarmupOrchestrator
 from ..regime.scheduler import DailyRegimeCompute, RegimeCache
-from .live_driver import LiveSweepDriver
+from .live_driver import LiveSweepDriver, make_ciats_learning_sink
 from .providers import (
+    make_cycle_parameters_provider,
     make_expected_reward_provider,
     make_live_providers,
     make_mpp_provider,
@@ -123,11 +129,41 @@ def make_public_handler_provider(
     return handler_provider
 
 
+def assemble_ciats_modules(
+    logger, *, on_event: EventSink | None = None, on_approval: "Callable | None" = None
+) -> "tuple[dict[PositionSide, CiatsConductor], dict[PositionSide, Callable[[object], None]]]":
+    """Construct the per-MODULE CIATS brain (one CiatsConductor + one TRADE_CLOSE learning sink per
+    wallet, Long + Short - NO cross-module pooling, sec 7). Each conductor composes a fresh CiatsPool
+    + RegimeLibrary + ParameterStore; `on_event` sinks its CIATS events to mod:Logger Stream-1 and
+    `on_approval` is the HR-CI-011 approval surface (the SMTP alert seam, wired in a later slice).
+    The learning sink (make_ciats_learning_sink) is the per-module membrane the exit path emits a
+    TRADE_CLOSE through: it records to mod:Logger (Stream-1 + the module's Stream-2 corpus) AND
+    drives conductor.ingest_close (the learning-loop close). Returns (conductors, sinks) keyed by
+    side."""
+    conductors: dict[PositionSide, CiatsConductor] = {}
+    sinks: dict[PositionSide, "Callable[[object], None]"] = {}
+    for side in (PositionSide.LONG, PositionSide.SHORT):
+        conductor = CiatsConductor(
+            module=side.value,
+            pool=CiatsPool(),
+            regime_library=RegimeLibrary(),
+            parameter_store=ParameterStore(),
+            on_event=on_event,
+            on_approval=on_approval,
+        )
+        conductors[side] = conductor
+        sinks[side] = make_ciats_learning_sink(logger, side.value, conductor)
+    return conductors, sinks
+
+
 @dataclass
 class OperationalSystem:
     """The assembled, runnable organism: call run() to drive the public data layer (and, in LIVE
     mode, the private executions/balances connection) concurrently; stop() halts both. The component
-    handles are exposed for inspection. private_connection is None in paper (PA-004 div #1)."""
+    handles are exposed for inspection. `conductors` + `ciats_sinks` are the per-module CIATS brain
+    (the learning loop + the TRADE_CLOSE learning membrane, per side); the providers' per-cycle
+    Parameter_Store_Snapshot is backed by the conductors' stores. private_connection is None in
+    paper (PA-004 div #1)."""
 
     data_layer: DataLayer
     driver: LiveSweepDriver
@@ -138,6 +174,8 @@ class OperationalSystem:
     instrument_cache: InstrumentCache
     bbo_cache: BboCache
     liquidity_cache: LiquidityCache
+    conductors: dict[PositionSide, CiatsConductor]
+    ciats_sinks: dict[PositionSide, Callable[[object], None]]
     private_connection: PrivateConnection | None = None
 
     async def run(self) -> None:
@@ -221,7 +259,12 @@ async def assemble_operational(
         rest_client, sleep=rest_sleep, on_event=event_sink, now=wall_clock
     ).refresh(universe, liquidity_cache)
 
-    # 4. Assemble the LiveProviders over the caches + the CIATS seed stores + the ws_state lifecycle.
+    # 4. Build the per-module CIATS brain (one CiatsConductor + learning sink per side, sec 7) and
+    #    assemble the LiveProviders over the caches + the CIATS seed stores + the ws_state lifecycle.
+    #    The cycle_parameters provider is BACKED by the per-module Parameter Stores + the conductors'
+    #    disallowed_regimes (CI-IF-003): a CIATS-tuned value + the protective block list now FLOW
+    #    into the gates per cycle (no longer seed-only). The conductors' CIATS events sink to Stream-1.
+    conductors, ciats_sinks = assemble_ciats_modules(logger, on_event=event_sink)
     providers = make_live_providers(
         instrument_cache=instrument_cache,
         bbo_cache=bbo_cache,
@@ -230,6 +273,7 @@ async def assemble_operational(
         mpp_abs_cap_pct=make_mpp_provider(mpp_store),
         ws_state=make_ws_state_provider(silent_pairs.get),
         now_utc=now_utc,
+        cycle_parameters=make_cycle_parameters_provider(conductors),
     )
 
     # 5. The LiveSweepDriver over the warmed pairs (the HR-WM-012 guard reads the shared coordinator).
@@ -296,5 +340,7 @@ async def assemble_operational(
         instrument_cache=instrument_cache,
         bbo_cache=bbo_cache,
         liquidity_cache=liquidity_cache,
+        conductors=conductors,
+        ciats_sinks=ciats_sinks,
         private_connection=private_connection,
     )

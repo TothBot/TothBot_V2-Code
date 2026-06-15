@@ -18,7 +18,14 @@ from types import SimpleNamespace
 from tothbot.ciats.pool import CiatsPool
 from tothbot.exchange.position_mirror import PositionSide
 from tothbot.exchange.warmup import WarmupOrchestrator
-from tothbot.pipeline.live_driver import LiveSweepDriver, make_ciats_sink
+from tothbot.ciats.conductor import CiatsConductor
+from tothbot.ciats.parameter_store import ParameterStore
+from tothbot.ciats.regime_library import RegimeLibrary
+from tothbot.pipeline.live_driver import (
+    LiveSweepDriver,
+    make_ciats_learning_sink,
+    make_ciats_sink,
+)
 from tothbot.pipeline.sweep import LiveProviders
 from tothbot.regime.taxonomy import Regime
 from tothbot.rest.client import OhlcResponse, RestOhlcBar
@@ -149,6 +156,56 @@ def test_sink_ignores_non_trade_close_for_ciats():
 def test_sink_chains_downstream():
     seen = []
     sink = make_ciats_sink(_FakeLogger(), "long", CiatsPool(), downstream=seen.append)
+    evt = SimpleNamespace(code="X")
+    sink(evt)
+    assert seen == [evt]
+
+
+# --------------------------------------------------------------------------- make_ciats_learning_sink
+def _conductor(module="long"):
+    return CiatsConductor(
+        module=module, pool=CiatsPool(), regime_library=RegimeLibrary(),
+        parameter_store=ParameterStore(),
+    )
+
+
+def _tc(net="10", regime="TRENDING_POS_NORMAL"):
+    return SimpleNamespace(event="TRADE_CLOSE", net_pl_usd=Decimal(net), net_gain_usd=Decimal(net),
+                           net_loss_usd=Decimal("0"), asset_regime=regime)
+
+
+def test_learning_sink_drives_conductor_ingest_and_logs():
+    logger, conductor = _FakeLogger(), _conductor()
+    sink = make_ciats_learning_sink(logger, "long", conductor)
+    sink(_tc())
+    # the conductor's full learning loop ingested it (pool + the net-P/L drift series + regime bucket)
+    assert conductor.trade_count == 1
+    assert conductor._net_pl == [Decimal("10")]
+    assert conductor._regimes.bucket_count(Regime.TRENDING_POS_NORMAL) == 1
+    assert logger.records and logger.records[0][0] == "long"
+
+
+def test_learning_sink_ignores_non_trade_close_for_ciats():
+    logger, conductor = _FakeLogger(), _conductor("short")
+    sink = make_ciats_learning_sink(logger, "short", conductor)
+    sink(SimpleNamespace(code="SIGNAL_REJECTED"))
+    assert conductor.trade_count == 0
+    assert len(logger.records) == 1
+
+
+def test_learning_sink_tolerates_an_unknown_or_missing_regime_token():
+    conductor = _conductor()
+    sink = make_ciats_learning_sink(_FakeLogger(), "long", conductor)
+    sink(_tc(regime="NOT_A_REGIME"))         # unparseable token -> bucket skipped, pool still learns
+    sink(SimpleNamespace(event="TRADE_CLOSE", net_pl_usd=Decimal("5"),
+                         net_gain_usd=Decimal("5"), net_loss_usd=Decimal("0")))  # no asset_regime
+    assert conductor.trade_count == 2
+    assert conductor._regimes.total_count == 0
+
+
+def test_learning_sink_chains_downstream():
+    seen = []
+    sink = make_ciats_learning_sink(_FakeLogger(), "long", _conductor(), downstream=seen.append)
     evt = SimpleNamespace(code="X")
     sink(evt)
     assert seen == [evt]

@@ -19,6 +19,9 @@ async sweep on the running loop; on_ohlc_5m itself is the testable async core.
 make_ciats_sink wires mod:Logger as a per-MODULE on_event sink: every event -> Stream-1, and a
 TRADE_CLOSE additionally -> that module's CiatsPool.ingest (the side is the emitting module's, the
 record carries no side field - per-module exit controllers, one per wallet, sec 7). Decimal-only.
+make_ciats_learning_sink is the same membrane wired to the whole CiatsConductor (the learning loop)
+instead of a bare pool, so a closed trade drives conductor.ingest_close (pool + drift series + the
+asset_regime bucket) per module - the operational assembly's TRADE_CLOSE -> CIATS learning seam.
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ from ..exchange.candle_close import (
 from ..exchange.position_mirror import PositionSide
 from ..exchange.warmup import HTF_EMA_LONG, HTF_EMA_SHORT, HtfCache
 from ..regime.live_indicators import OhlcCandle
+from ..regime.taxonomy import Regime
 from .sweep import LiveProviders, sweep_pair
 
 
@@ -44,6 +48,19 @@ def _is_trade_close(event: object) -> bool:
         getattr(event, "event", None) == "TRADE_CLOSE"
         or getattr(event, "code", None) == "TRADE_CLOSE"
     )
+
+
+def _regime_of(record: object) -> Regime | None:
+    """The Regime enum carried on a TRADE_CLOSE record's asset_regime token (sec 7 Image6), or
+    None when the field is absent / not a known six-cell taxonomy value (the regime bucket is then
+    skipped - the module pool + drift series still learn the close)."""
+    token = getattr(record, "asset_regime", None)
+    if token is None:
+        return None
+    try:
+        return Regime(token)
+    except ValueError:
+        return None
 
 
 def make_ciats_sink(logger, module: str, pool, *, downstream: Callable[[object], None] | None = None):
@@ -56,6 +73,29 @@ def make_ciats_sink(logger, module: str, pool, *, downstream: Callable[[object],
         logger.record(event, module=module)
         if _is_trade_close(event):
             pool.ingest(event)
+        if downstream is not None:
+            downstream(event)
+
+    return sink
+
+
+def make_ciats_learning_sink(
+    logger, module: str, conductor, *, downstream: Callable[[object], None] | None = None
+):
+    """The per-module CIATS LEARNING sink: record every event to mod:Logger (Stream-1, tagged
+    `module`, and a schema-valid TRADE_CLOSE additionally into that module's Stream-2 corpus), and
+    drive a TRADE_CLOSE into the module's CiatsConductor.ingest_close - the full learning-loop close
+    (sec 7): the conductor's pool + the per-trade net-P/L drift series + (when the record carries a
+    known asset_regime) the Regime Library bucket. This is the same membrane make_ciats_sink wires,
+    but the CIATS target is the whole conductor (the learning loop), not a bare pool - so a closed
+    trade reaches conductor.ingest_close, per module. `module` is the side name (the TRADE_CLOSE
+    record carries no side field; the partition IS the emitting wallet). An optional `downstream`
+    sink chains (e.g. alerting)."""
+
+    def sink(event: object) -> None:
+        logger.record(event, module=module)
+        if _is_trade_close(event):
+            conductor.ingest_close(event, regime=_regime_of(event))
         if downstream is not None:
             downstream(event)
 

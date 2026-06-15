@@ -156,6 +156,13 @@ class CiatsConductor:
         return self._module
 
     @property
+    def parameter_store(self):
+        """The module's CIATS Parameter Store (the owned-value write destination + the frozen
+        per-cycle read source). Exposed so the live layer can take the per-cycle Parameter_Store_
+        Snapshot (CI-IF-003) the gates read - build_cycle_parameters(conductor.parameter_store, ...)."""
+        return self._store
+
+    @property
     def trade_count(self) -> int:
         """The module's closed-trade count - the inter-trade-boundary anchor + the cadence clock."""
         return self._pool.trade_count
