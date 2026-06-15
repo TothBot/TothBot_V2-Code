@@ -40,13 +40,11 @@ from decimal import Decimal
 from enum import Enum
 
 from .pool import CIATS_TRADE_FLOOR
-from .statistical_engine import mann_whitney_u, sharpe_ratio, spearman_rho
+from .statistical_engine import mann_whitney_u, sharpe_ratio, spearman_significant
 
 # --- diagram-named rule constants (transcribed; not CIATS-owned seeds) --------------------------
 CHECK_MW_ALPHA_ONE_SIDED = Decimal("0.01")     # HR-CI-007 absolute gate
 MIN_TRADES_BETWEEN_CHANGES = 50                # HR-CI-005
-SPEARMAN_RHO_MIN = Decimal("0.3")              # |rho| threshold
-SPEARMAN_T_CRIT = Decimal("1.96")              # p < 0.05 two-sided, large-sample (n >= 200)
 SACRED_RR_PARAM = "rr_floor"                   # the 1:1.5 R:R - NEVER a PDCA candidate
 
 # One-sided normal critical z for the Mann-Whitney CHECK gate (method constants, not CIATS seeds).
@@ -140,18 +138,7 @@ def check_phase(
 
     spearman_ev: SpearmanEvidence | None = None
     if spearman_xy is not None:
-        x, y = spearman_xy
-        rho = spearman_rho(x, y)
-        n = len(list(x))
-        # t = rho * sqrt((n-2)/(1-rho^2)); |t| > 1.96 ~ p < 0.05 two-sided (large-sample, n >= 200).
-        # A perfect |rho| == 1 is t -> infinity (maximally significant); guard the zero denominator.
-        sig = False
-        if abs(rho) > SPEARMAN_RHO_MIN and n > 2:
-            if abs(rho) >= Decimal("1"):
-                sig = True
-            else:
-                t = abs(rho) * (Decimal(n - 2) / (Decimal("1") - rho * rho)).sqrt()
-                sig = t > SPEARMAN_T_CRIT
+        rho, sig = spearman_significant(spearman_xy[0], spearman_xy[1])
         spearman_ev = SpearmanEvidence(rho=rho, significant=sig)
 
     return CheckResult(

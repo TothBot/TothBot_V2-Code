@@ -194,6 +194,40 @@ def spearman_rho(x: Sequence[object], y: Sequence[object]) -> Decimal:
     return cov / (vx.sqrt() * vy.sqrt())
 
 
+# The CIATS Spearman significance gate (diagram-named: |rho| > 0.3 AND p < 0.05). The p < 0.05 uses
+# the large-sample t -> normal approximation (|t| > 1.96), valid because CIATS runs it only at the
+# >= 200-trade floor. These are the diagram-named thresholds (transcribed; not CIATS-owned seeds).
+SPEARMAN_RHO_MIN = Decimal("0.3")
+SPEARMAN_T_CRIT = Decimal("1.96")
+
+
+def spearman_significant(
+    x: Sequence[object],
+    y: Sequence[object],
+    *,
+    rho_min: object = SPEARMAN_RHO_MIN,
+    t_crit: object = SPEARMAN_T_CRIT,
+) -> tuple[Decimal, bool]:
+    """The CIATS Spearman gate: returns (rho, significant) where significant == |rho| > rho_min AND
+    p < 0.05 (the large-sample t = rho*sqrt((n-2)/(1-rho^2)) vs |t| > t_crit). A perfect |rho| == 1
+    is maximally significant (t -> infinity; the zero denominator is guarded). Used by both the PDCA
+    CHECK corroboration and the Proposal Engine PLAN-candidate qualification. A constant (zero-
+    variance) series has no rank variance, so no monotone association is detectable -> (0, False);
+    a length mismatch / too-few-points still raises (a caller error, not a no-association result)."""
+    xs, ys = _coerce(x), _coerce(y)
+    if len(set(xs)) <= 1 or len(set(ys)) <= 1:
+        return Decimal(0), False
+    rho = spearman_rho(xs, ys)
+    n = len(xs)
+    rmin = _dec(rho_min)
+    if abs(rho) <= rmin or n <= 2:
+        return rho, False
+    if abs(rho) >= Decimal("1"):
+        return rho, True
+    t = abs(rho) * (Decimal(n - 2) / (Decimal("1") - rho * rho)).sqrt()
+    return rho, t > _dec(t_crit)
+
+
 @dataclass(frozen=True)
 class CusumResult:
     """The one-sided LOWER-arm CUSUM run (loss-prevention direction). c_lower is the cumulative-sum
