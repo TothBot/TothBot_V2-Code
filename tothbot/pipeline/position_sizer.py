@@ -132,6 +132,8 @@ def size_candidate(
     expected_reward: object,
     *,
     margin_borrow_fee: object | None = None,
+    mae_mult: object | None = None,
+    emergency_sl_mult: object | None = None,
 ) -> SizeOutcome:
     """Evaluate one G7-passed candidate at gate:G8_Position_Sizer (Image9).
 
@@ -142,7 +144,9 @@ def size_candidate(
     expected_reward is the CIATS run-to-reversal estimate (a FRACTION of entry_fill_price,
     the same unit as net_loss so the ratio is dimensionless). margin_borrow_fee overrides the
     SHORT borrow component of net_loss (default: the at-entry margin OPEN fee); it is ignored
-    for a LONG (a spot long pays no borrow). PURE - emits nothing; the caller logs the event."""
+    for a LONG (a spot long pays no borrow). mae_mult / emergency_sl_mult are the CIATS-owned
+    ATR(14) multipliers read from the tick-start Parameter_Store_Snapshot (default: the registry
+    seeds); the sacred 1:1.5 R:R is NEVER one of them. PURE - emits nothing; the caller logs."""
     is_short = side is PositionSide.SHORT
     entry = _dec(entry_fill_price)
     if entry <= 0:
@@ -151,9 +155,11 @@ def size_candidate(
         raise ValueError(f"entry_fill_price must be > 0 (ar:AR-008); got {entry}")
     atr = _dec(atr_14)
     exp_reward = _dec(expected_reward)
+    mae_m = _MAE_MULT if mae_mult is None else _dec(mae_mult)
+    emerg_m = _EMERG_SL_MULT if emergency_sl_mult is None else _dec(emergency_sl_mult)
 
     # --- risk leg (Image9 g8d_mae -> g8d_net_loss), direction-symmetric magnitude ----------
-    mae_pct = atr * _MAE_MULT / entry
+    mae_pct = atr * mae_m / entry
     if is_short:
         borrow = _MARGIN_OPEN_FEE if margin_borrow_fee is None else _dec(margin_borrow_fee)
     else:
@@ -177,7 +183,7 @@ def size_candidate(
         )
 
     # --- ACCEPT: emergSL crash brake (Image9 g8d_emergsl; NEVER in the R:R ratio) ----------
-    emergsl_dist = atr * _EMERG_SL_MULT / entry
+    emergsl_dist = atr * emerg_m / entry
     # LONG: SELL stop BELOW entry. SHORT: BUY-to-cover stop ABOVE entry (reduce_only, AR-009).
     emergsl_price = entry * (_ONE + emergsl_dist) if is_short else entry * (_ONE - emergsl_dist)
     order_type = _SHORT_ORDER if is_short else _LONG_ORDER

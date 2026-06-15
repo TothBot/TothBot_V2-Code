@@ -36,6 +36,7 @@ from ..regime.sss import SignalSide, SssComputeError, evaluate_sss
 from ..regime.taxonomy import Regime, profile
 from .entry_eligibility import check_liquidity, check_pair_status, check_state_machine
 from .htf_confirmation import confirm_htf
+from .parameter_snapshot import CycleParameters, build_cycle_parameters
 from .position_sizer import size_candidate
 from .regime_sizer import size_regime
 from .risk_guard import evaluate_risk_guard
@@ -111,11 +112,19 @@ def run_pipeline(
     inputs: PipelineInputs,
     *,
     sss_evaluator=evaluate_sss,
+    params: CycleParameters | None = None,
 ) -> PipelineOutcome:
     """Run one (pair, side) candidate through the 8-gate chain (Image2), short-circuiting on the
     first failure. Returns the terminal PipelineOutcome - either ACCEPTED (the G8 sized order) or
-    the first stop with its gate event. Threads `side` so a SHORT takes the short test everywhere."""
+    the first stop with its gate event. Threads `side` so a SHORT takes the short test everywhere.
+
+    `params` is the FROZEN per-cycle Parameter_Store_Snapshot (contract:CI-IF-003): every CIATS-owned
+    gate tunable is read ONCE from it at the start of the cycle, so a mid-cycle CIATS write never
+    drifts an in-flight evaluation. None -> a seed-only snapshot (identical to the pre-CIATS behavior:
+    each gate reads its registry seed). The sacred 1:1.5 R:R is never in the snapshot - G8 hardcodes it."""
     is_long = side is PositionSide.LONG
+    # contract:Parameter_Store_Snapshot - take ONE frozen read for the whole cycle (CI-IF-003).
+    params = params or build_cycle_parameters()
 
     # Pre-Gate-1: instrument status + per-side universe partition (SHORT = marginable subset).
     pre = check_pair_status(side, inputs.instrument_status, marginable=inputs.marginable)
@@ -127,12 +136,15 @@ def run_pipeline(
     if not g1.passed:
         return _reject(side, "G1", g1.rejection_code, g1)
 
-    # Gate 2: 24h USD liquidity floor.
-    g2 = check_liquidity(inputs.vol_24h_usd)
+    # Gate 2: 24h USD liquidity floor (CIATS-owned min_volume_usd_daily from the snapshot).
+    g2 = check_liquidity(inputs.vol_24h_usd, min_volume_usd_daily=params.get("min_volume_usd_daily"))
     if not g2.passed:
         return _reject(side, "G2", "LIQUIDITY_REJECTED", g2)
 
-    # Gate 3: regime filter - is this side permitted in the pair's daily regime?
+    # Gate 3: regime filter - the pair's daily regime must permit this side AND not be on the CIATS
+    # Regime Library's param:disallowed_regimes block list (a proven non-positive-edge regime).
+    if params.regime_disallowed(inputs.regime):
+        return _reject(side, "G3", "REGIME_BLOCKED", None)
     if not profile(inputs.regime).entry_permitted(is_long=is_long):
         return _reject(side, "G3", "REGIME_BLOCKED", None)
 
@@ -163,6 +175,9 @@ def run_pipeline(
         seconds_since_last_exit=inputs.seconds_since_last_exit,
         consecutive_loss_count=inputs.consecutive_loss_count,
         has_active_same_side_position=inputs.has_active_same_side_position,
+        sc_body_threshold=params.get("sc_body_threshold"),
+        sc_cooldown_seconds=params.get("sc_cooldown_seconds"),
+        sc_consecutive_limit=params.get("sc_consecutive_limit"),
     )
     if not g5.passed:
         return _reject(side, "G5", "SELECTION_REJECTED", g5.event)
@@ -177,13 +192,18 @@ def run_pipeline(
         candidate_committed_usd=inputs.candidate_committed_usd,
         total_committed_usd=inputs.total_committed_usd,
         semaphore_locked=inputs.semaphore_locked,
+        full_halt_drawdown_pct=params.get("full_halt_drawdown_pct"),
+        session_pause_drawdown_pct=params.get("session_pause_drawdown_pct"),
+        concentration_limit=params.get("concentration_limit_per_module"),
+        exposure_limit_pct=params.get("exposure_limit_pct"),
     )
     if not g7.passed:
         return _reject(side, "G7", g7.disposition.value, g7.event)
 
-    # Gate 8: position sizer + the SACRED 1:1.5 R:R acceptance floor.
+    # Gate 8: position sizer + the SACRED 1:1.5 R:R acceptance floor (hardcoded, never the snapshot).
     g8 = size_candidate(
         symbol, side, inputs.entry_fill_price, inputs.atr_14, inputs.expected_reward,
+        mae_mult=params.get("mae_mult"), emergency_sl_mult=params.get("emergency_sl_mult"),
     )
     if not g8.accepted:
         return _reject(side, "G8", "G8_A1_REJECT", g8.event)

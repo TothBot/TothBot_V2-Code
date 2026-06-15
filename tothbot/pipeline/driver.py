@@ -60,11 +60,13 @@ async def process_candidate(
     exec_ctx: ExecutionContext,
     *,
     sss_evaluator=evaluate_sss,
+    params=None,
 ) -> CandidateResult:
     """Run one (pair, side) candidate through the pipeline; log the outcome; on ACCEPTED, size +
     dispatch the entry into THIS side's wallet. Returns the pipeline outcome + dispatch/fill
-    flags. The CIATS learning side closes OFF this path (via the Logger Stream-2 corpus)."""
-    outcome = run_pipeline(symbol, side, pipeline_inputs, sss_evaluator=sss_evaluator)
+    flags. `params` is the frozen per-cycle Parameter_Store_Snapshot (CI-IF-003; None -> seeds).
+    The CIATS learning side closes OFF this path (via the Logger Stream-2 corpus)."""
+    outcome = run_pipeline(symbol, side, pipeline_inputs, sss_evaluator=sss_evaluator, params=params)
     # mod:Logger sees every pipeline tick (Stream-1); the module tag is the side (sec 7).
     logger.record(outcome, module=side.value)
 

@@ -87,6 +87,10 @@ class LiveProviders:
     new_cl_ord_id: Callable[[], str]
     new_deadline: Callable[[], str]
     semaphore_locked: Callable[[PositionSide], bool] = staticmethod(lambda _side: False)
+    # The per-module frozen Parameter_Store_Snapshot read (CI-IF-003): cycle_parameters(side) returns
+    # ONE frozen CycleParameters for this cycle (the CIATS-owned values overlaid on the seeds). None ->
+    # a seed-only snapshot (the pre-CIATS behavior; the live layer backs it with the per-module store).
+    cycle_parameters: "Callable[[PositionSide], object] | None" = None
 
 
 def permitted_sides(regime: Regime) -> list[PositionSide]:
@@ -249,8 +253,10 @@ async def sweep_pair(
             )
         except ProviderNotReady:
             continue  # the pair's live caches are not populated yet - skip this (pair, side) tick
+        # contract:Parameter_Store_Snapshot - take ONE frozen per-module snapshot at the cycle start.
+        params = providers.cycle_parameters(side) if providers.cycle_parameters is not None else None
         result = await process_candidate(
-            wm, logger, side, candle.symbol, inputs, ctx, sss_evaluator=evaluator
+            wm, logger, side, candle.symbol, inputs, ctx, sss_evaluator=evaluator, params=params
         )
         results.append(result)
     return results
