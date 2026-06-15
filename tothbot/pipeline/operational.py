@@ -180,7 +180,10 @@ class OperationalSystem:
     (the learning loop + the TRADE_CLOSE learning membrane, per side); `approval_inboxes` are the
     per-module operator HR-CI-011 inboxes (Bill submits a yes/no, the conductor applies it at the
     next inter-trade boundary); the providers' per-cycle Parameter_Store_Snapshot is backed by the
-    conductors' stores. private_connection is None in paper (PA-004 div #1)."""
+    conductors' stores. The assembly has ALSO wired each side's ciats_sink into the wm's per-module
+    Exit_Controller (wm.set_ciats_exit_sinks), so a running paper close emits its TRADE_CLOSE THROUGH
+    the emitting side's sink (the learning close + the HR-CI-003 boundary poll) with no manual call.
+    private_connection is None in paper (PA-004 div #1)."""
 
     data_layer: DataLayer
     driver: LiveSweepDriver
@@ -283,6 +286,16 @@ async def assemble_operational(
     #    disallowed_regimes (CI-IF-003): a CIATS-tuned value + the protective block list now FLOW
     #    into the gates per cycle (no longer seed-only). The conductors' CIATS events sink to Stream-1.
     conductors, ciats_sinks, approval_inboxes = assemble_ciats_modules(logger, on_event=event_sink)
+    # THE ASSEMBLY TIE-IN (TB00748 (b)): wire each side's CIATS learning sink into the injected wm's
+    # per-module Exit_Controller, so a paper close emits its evt:TRADE_CLOSE THROUGH the emitting
+    # side's ciats_sink in the running organism (the learning close + the HR-CI-003 inbox boundary
+    # poll, no manual sink call). This resolves the construction-order seam cleanly: the wm is
+    # injected (built before this assembly), the conductors/sinks are built here - so the assembly
+    # hands the freshly-built sinks to the wm. Guarded: a wm without the surface (a lightweight test
+    # stand-in / a non-paper wm) is left untouched. operational.py still owns construction order only.
+    set_exit_sinks = getattr(wm, "set_ciats_exit_sinks", None)
+    if callable(set_exit_sinks):
+        set_exit_sinks(ciats_sinks)
     providers = make_live_providers(
         instrument_cache=instrument_cache,
         bbo_cache=bbo_cache,

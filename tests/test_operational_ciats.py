@@ -181,6 +181,48 @@ def test_assemble_operational_exposes_the_per_module_conductors():
     assert set(system.approval_inboxes) == {PositionSide.LONG, PositionSide.SHORT}
 
 
+def _assemble_with(wm, logger=None):
+    async def no_sleep(_s):
+        return None
+
+    async def opener(_k):
+        return _Transport()
+
+    from tothbot.ciats.expected_reward import ExpectedRewardStore
+    from tothbot.ciats.seed_estimators import MppCapStore
+    logger = logger or Logger()
+    system = asyncio.run(assemble_operational(
+        universe=["BTC/USD"], rest_client=_FakeRest(), open_socket=opener,
+        bucket=SubscribeTokenBucket(rate_per_sec=1000.0, burst_capacity=100000.0),
+        wm=wm, logger=logger, mpp_store=MppCapStore(), reward_store=ExpectedRewardStore(),
+        mode=Mode.PAPER, now_utc=lambda: datetime(2026, 6, 15, 7, 30, tzinfo=timezone.utc),
+        rest_sleep=no_sleep, pace_sleep=no_sleep,
+    ))
+    return system, logger
+
+
+def test_assemble_operational_hands_the_exit_sinks_to_the_wm():
+    # TB00748 (b): the assembly wires each side's ciats_sink into the wm's per-module Exit
+    # Controller (wm.set_ciats_exit_sinks), resolving the construction-order seam - the wm is
+    # injected, the sinks are built here, the assembly hands them over.
+    captured: dict = {}
+
+    class _SinkWM(_WM):
+        def set_ciats_exit_sinks(self, sinks):
+            captured.update(sinks)
+
+    system, _ = _assemble_with(_SinkWM())
+    assert captured == dict(system.ciats_sinks)            # exactly the per-side assembled sinks
+    assert set(captured) == {PositionSide.LONG, PositionSide.SHORT}
+
+
+def test_assemble_operational_leaves_a_wm_without_the_surface_untouched():
+    # the guard: a wm that does NOT expose set_ciats_exit_sinks (a lightweight stand-in) assembles
+    # cleanly - the tie-in is skipped, not an error (operational.py owns construction order only).
+    system, _ = _assemble_with(_WM())                      # _WM has no set_ciats_exit_sinks
+    assert set(system.ciats_sinks) == {PositionSide.LONG, PositionSide.SHORT}
+
+
 def test_assemble_operational_backs_the_cycle_parameters_provider_with_the_store():
     system, _ = _assemble()
     # the providers' per-cycle snapshot is LIVE (not None / seed-only-by-default): an owned store
