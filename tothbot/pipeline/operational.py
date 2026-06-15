@@ -17,8 +17,10 @@ TWO deliverables:
    The same shared caches/driver back every shard, so the provider maps by channel (shard_index is
    accepted for the HandlerProvider contract but does not change the binding).
 
- assemble_operational:  the ar:AR-049 startup sequence end state (the PUBLIC data layer; the private
-   executions/balances connection is the SEPARATE live-only assembly, PA-004 div #1). The phases:
+ assemble_operational:  the ar:AR-049 startup sequence end state. In PAPER it is the public data
+   layer alone; in LIVE it ALSO builds the separate private executions/balances connection (PA-004
+   div #1 / HR-WM-022 - paper never connects the private WS), so OperationalSystem.run() drives both.
+   The phases:
      1. REST WARM-UP (warmup.py)        - GetOHLCData(5)/(60) seed the LiveIndicators + HtfCache.
      2. REST DAILY REGIME (scheduler.py) - GetOHLCData(1440) per pair + the BTC/USD anchor -> the
         RegimeCache (also drives EC-L1A-002 for any open position via wm.on_regime_classified).
@@ -62,6 +64,7 @@ from ..exchange.dispatch import Channel, Handler
 from ..exchange.instrument_cache import InstrumentCache
 from ..exchange.liquidity_cache import LiquidityCache, LiquidityProbe
 from ..exchange.pacing import SubscribeTokenBucket
+from ..exchange.private_ws import PrivateConnection, PrivateConnectionAssembler
 from ..exchange.reconnect import ShardReconnectCoordinator
 from ..exchange.sharding import ShardPlan
 from ..exchange.silent_pair import SilentPairMachine
@@ -122,8 +125,9 @@ def make_public_handler_provider(
 
 @dataclass
 class OperationalSystem:
-    """The assembled, runnable public organism: call data_layer.run() to drive it. The component
-    handles are exposed for inspection / a controlled shutdown (data_layer.stop())."""
+    """The assembled, runnable organism: call run() to drive the public data layer (and, in LIVE
+    mode, the private executions/balances connection) concurrently; stop() halts both. The component
+    handles are exposed for inspection. private_connection is None in paper (PA-004 div #1)."""
 
     data_layer: DataLayer
     driver: LiveSweepDriver
@@ -134,6 +138,19 @@ class OperationalSystem:
     instrument_cache: InstrumentCache
     bbo_cache: BboCache
     liquidity_cache: LiquidityCache
+    private_connection: PrivateConnection | None = None
+
+    async def run(self) -> None:
+        """Drive the public data layer (and the live private connection, if present) concurrently."""
+        runners = [self.data_layer.run()]
+        if self.private_connection is not None:
+            runners.append(self.private_connection.run())
+        await asyncio.gather(*runners)
+
+    def stop(self) -> None:
+        self.data_layer.stop()
+        if self.private_connection is not None:
+            self.private_connection.stop()
 
 
 async def assemble_operational(
@@ -157,6 +174,10 @@ async def assemble_operational(
     now_utc: UtcClock | None = None,
     rest_sleep: Sleep = asyncio.sleep,
     pace_sleep: Sleep = asyncio.sleep,
+    open_private_socket: "Callable | None" = None,
+    acquire_token: "Callable | None" = None,
+    fetch_snap_orders: "Callable | None" = None,
+    balances_handler: Handler | None = None,
 ) -> OperationalSystem:
     """Run the ar:AR-049 cold-start sequence and return the runnable public organism (see module
     docstring). `on_event` (defaulting to logger.record) sinks the warm-up / regime / liquidity /
@@ -244,6 +265,27 @@ async def assemble_operational(
     )
     data_layer = await assembler.build()
 
+    # 7. LIVE only (PA-004 div #1 / HR-WM-022): the SEPARATE private executions/balances connection
+    #    (AR-049 steps 5/6 - token -> private connect -> subscribe -> snap_orders mirror reconcile).
+    #    Paper keeps it None (never connects the private WS). The live fill -> mirror loop is the
+    #    already-built PrivateConnectionAssembler; this is the startup-sequencing tie-in.
+    private_connection: PrivateConnection | None = None
+    if mode is Mode.LIVE:
+        if open_private_socket is None or acquire_token is None:
+            raise ValueError(
+                "live mode requires open_private_socket + acquire_token for the private WS connection"
+            )
+        private_connection = await PrivateConnectionAssembler(
+            wm,
+            open_socket=open_private_socket,
+            acquire_token=acquire_token,
+            fetch_snap_orders=fetch_snap_orders,
+            balances_handler=balances_handler,
+            on_event=event_sink,
+            clock=mono_clock,
+            sleep=pace_sleep,
+        ).build()
+
     return OperationalSystem(
         data_layer=data_layer,
         driver=driver,
@@ -254,4 +296,5 @@ async def assemble_operational(
         instrument_cache=instrument_cache,
         bbo_cache=bbo_cache,
         liquidity_cache=liquidity_cache,
+        private_connection=private_connection,
     )

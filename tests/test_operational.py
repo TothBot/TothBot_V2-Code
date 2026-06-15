@@ -129,6 +129,34 @@ class _FakeWM:
         return None  # no module wired -> sweep_pair skips each side (no deep wm interface needed)
 
 
+class _LiveWM(_FakeWM):
+    """A live WSManager stand-in: carries is_live + the mirror sole-writer surface the private
+    connection binds/feeds (PA-004 div #1)."""
+
+    is_live = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.transmitter = SimpleNamespace(bind=lambda _t: None)
+
+    def restore_position_mirror(self, _snap):  # pragma: no cover - not driven in the build test
+        return []
+
+    def record_execution(self, _event):  # pragma: no cover - not driven in the build test
+        pass
+
+
+def _private_opener():
+    sockets: list = []
+
+    async def open_private():
+        t = _FakeTransport()
+        sockets.append(t)
+        return t
+
+    return open_private, sockets
+
+
 def _stores():
     # OPS-1: the stores are passed in EMPTY - assemble_operational seeds them from the historical
     # bars the warm-up (5m -> mpp) + daily-regime (1440 -> expected_reward) phases fetch.
@@ -230,6 +258,68 @@ def test_assemble_seeds_ciats_stores_at_load():
     assert mpp.get("ETH/USD", PositionSide.SHORT) is not None
     # DEC-124 run-to-reversal seeds for at least one regime (the reversing daily series reverses).
     assert any(reward.get("BTC/USD", r) is not None for r in Regime)
+
+
+def test_paper_mode_has_no_private_connection():
+    # PA-004 div #1: paper NEVER connects the private WS.
+    system, *_ = _assemble()
+    assert system.private_connection is None
+
+
+def test_live_mode_builds_private_connection():
+    # OPS-2: live mode ALSO assembles the private executions/balances connection (AR-049 steps 5/6).
+    rest = _FakeRest()
+    open_socket, _opened = _opener()
+    open_private, priv_sockets = _private_opener()
+    wm, logger = _LiveWM(), _FakeLogger()
+    mpp, reward = _stores()
+
+    async def no_sleep(_s):
+        return None
+
+    async def acquire_token():
+        return "tok-abc"
+
+    system = asyncio.run(assemble_operational(
+        universe=["BTC/USD"],
+        rest_client=rest,
+        open_socket=open_socket,
+        bucket=SubscribeTokenBucket(rate_per_sec=1000.0, burst_capacity=100000.0),
+        wm=wm,
+        logger=logger,
+        mpp_store=mpp,
+        reward_store=reward,
+        mode=Mode.LIVE,
+        open_private_socket=open_private,
+        acquire_token=acquire_token,
+        now_utc=lambda: datetime(2026, 6, 15, 7, 30, tzinfo=timezone.utc),
+        rest_sleep=no_sleep,
+        pace_sleep=no_sleep,
+    ))
+    assert system.private_connection is not None
+    # The private socket opened and issued the executions subscribe (order_status/snap_orders).
+    assert len(priv_sockets) == 1
+    first = priv_sockets[0].sent[0]
+    assert first["params"]["channel"] == "executions"
+    assert first["params"]["token"] == "tok-abc"
+
+
+def test_live_mode_requires_private_edges():
+    # Live mode without the private socket opener / token acquire is a wiring error, surfaced.
+    rest = _FakeRest()
+    open_socket, _ = _opener()
+    mpp, reward = _stores()
+
+    async def no_sleep(_s):
+        return None
+
+    with pytest.raises(ValueError):
+        asyncio.run(assemble_operational(
+            universe=["BTC/USD"], rest_client=rest, open_socket=open_socket,
+            bucket=SubscribeTokenBucket(rate_per_sec=1000.0, burst_capacity=100000.0),
+            wm=_LiveWM(), logger=_FakeLogger(), mpp_store=mpp, reward_store=reward,
+            mode=Mode.LIVE, rest_sleep=no_sleep, pace_sleep=no_sleep,
+        ))
 
 
 def test_assemble_binds_handlers_into_dispatch():
