@@ -519,6 +519,82 @@ def test_paper_exit_win_resets_consecutive_loss_count():
     assert m.consecutive_loss_count("BTC/USD") == 0
 
 
+# -- per-MODULE Exit Controllers + the CIATS learning-sink emission (sec 7, TB00748 (a)) -------
+
+def _open_paper_short(m, *, atr="2000", emergsl="66000"):
+    """Open a BTC/USD short paper position (sell-to-open) carrying the entry-time snapshot +
+    the synthetic short entry-fill credit. A short's adverse move is a RISE (ar:AR-048 ask)."""
+    m.record_execution(
+        {"exec_type": "filled", "symbol": "BTC/USD", "side": "sell",
+         "cum_qty": "0.05", "avg_price": "60000", "cl_ord_id": "cl-s1"},
+        regime_at_entry="TRENDING_NEG_NORMAL", atr_14_entry=atr, emergsl_price=emergsl,
+    )
+    m.apply_paper_entry_fill("BTC/USD", "0.05", "60000", is_short=True)
+
+
+def test_exit_controllers_are_per_module_wallet():
+    m = WSManager(Mode.PAPER)
+    assert set(m.exit_controllers) == {PositionSide.LONG, PositionSide.SHORT}
+    assert m.exit_controllers[PositionSide.LONG] is not m.exit_controllers[PositionSide.SHORT]
+    # the back-compat accessor is the LONG/default controller (mirrors ledger/spot_usd_balance).
+    assert m.exit_controller is m.exit_controllers[PositionSide.LONG]
+
+
+def test_exit_controllers_are_none_in_live():
+    m = WSManager(Mode.LIVE)
+    assert m.exit_controllers is None
+    assert m.exit_controller is None
+
+
+def test_set_ciats_exit_sinks_is_a_safe_noop_in_live():
+    m = WSManager(Mode.LIVE)
+    m.set_ciats_exit_sinks({PositionSide.LONG: lambda e: None})  # must not raise (no controllers)
+    assert m.exit_controllers is None
+
+
+def test_long_close_emits_through_the_long_ciats_sink_only():
+    # TB00748 (a): with the per-side ciats_sinks wired, a LONG paper close emits its TRADE_CLOSE
+    # THROUGH the LONG module's sink (the learning membrane) - never the short sink, never the
+    # general telemetry on_event (which now carries only the non-close events).
+    general: list = []
+    long_sink: list = []
+    short_sink: list = []
+    m = WSManager(Mode.PAPER, on_event=general.append, now_monotonic=lambda: 1.0)
+    m.set_ciats_exit_sinks({PositionSide.LONG: long_sink.append, PositionSide.SHORT: short_sink.append})
+    _open_paper_long(m)
+    m.handle_ticker(_ticker("BTC/USD", "57000", "57100"))   # L2 MAE breach -> long close
+    assert not m.has_position("BTC/USD")
+    assert len([e for e in long_sink if isinstance(e, TradeClose)]) == 1   # through the long sink
+    assert not any(isinstance(e, TradeClose) for e in short_sink)          # never the short sink
+    assert not any(isinstance(e, TradeClose) for e in general)             # not the general sink
+    # the non-close detection telemetry still flows to the general on_event (unchanged partition).
+    assert any(isinstance(e, PaperMaeDetected) for e in general)
+
+
+def test_short_close_emits_through_the_short_ciats_sink_only():
+    # the Long/Short mirror: a SHORT paper close routes to the SHORT module's sink (sec 7).
+    long_sink: list = []
+    short_sink: list = []
+    m = WSManager(Mode.PAPER, on_event=lambda e: None, now_monotonic=lambda: 1.0)
+    m.set_ciats_exit_sinks({PositionSide.LONG: long_sink.append, PositionSide.SHORT: short_sink.append})
+    _open_paper_short(m)                                    # short entry at 60000, atr 2000
+    m.handle_ticker(_ticker("BTC/USD", "62900", "63000"))   # ask 63000 -> short MAE 3000 >= 3000
+    assert not m.has_position("BTC/USD")
+    closes = [e for e in short_sink if isinstance(e, TradeClose)]
+    assert len(closes) == 1 and closes[0].exit_reason is ExitReason.MAE_THRESHOLD_BREACH
+    assert not any(isinstance(e, TradeClose) for e in long_sink)
+
+
+def test_unwired_side_keeps_emitting_to_the_general_on_event():
+    # before set_ciats_exit_sinks (or for a side with no sink) the close path is unchanged: the
+    # controller's general on_event still sees the TRADE_CLOSE (back-compat / the default path).
+    general: list = []
+    m = WSManager(Mode.PAPER, on_event=general.append, now_monotonic=lambda: 1.0)
+    _open_paper_long(m)
+    m.handle_ticker(_ticker("BTC/USD", "57000", "57100"))
+    assert len([e for e in general if isinstance(e, TradeClose)]) == 1
+
+
 def test_non_adverse_ticker_leaves_position_open():
     m = WSManager(Mode.PAPER)
     _open_paper_long(m)

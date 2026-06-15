@@ -157,6 +157,14 @@ class ExitController:
         self._clock = clock
         self._mae_mult = _dec(mae_mult) if mae_mult is not None else _MAE_MULT
 
+    def set_event_sink(self, on_event: EventSink | None) -> None:
+        """Rebind the close-path event sink. The operational assembly calls this (via
+        wm.set_ciats_exit_sinks) to make THIS module's TRADE_CLOSE emit THROUGH the side's
+        CIATS learning sink (sec 7): the conductor's learning close + the HR-CI-003 inbox
+        boundary poll, plus mod:Logger Stream-1/Stream-2 with the module tag. One per module
+        wallet; until wired the sink is the WSManager's general on_event (telemetry only)."""
+        self._on_event = on_event
+
     def _emit(self, event: object) -> None:
         if self._on_event is not None:
             self._on_event(event)

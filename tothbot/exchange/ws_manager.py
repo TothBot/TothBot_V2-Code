@@ -231,13 +231,20 @@ class WSManager:
             self.paper_dispatch = PaperDispatchSimulator(fill_simulator=self.paper_fill)
             # mod:Exit_Controller owns the sec-12.5 close path; in paper mode WSManager
             # detects the exit on the ticker bbo and routes it here. Live exit handling is
-            # executions-driven (a later slice), so the controller is paper-only for now.
-            self.exit_controller: ExitController | None = ExitController(
-                on_event=on_event, clock=self._now_utc
-            )
+            # executions-driven (a later slice), so the controllers are paper-only for now.
+            # ONE controller PER MODULE WALLET (sec 7 - the exit_controller is documented "one
+            # per module wallet"; the TRADE_CLOSE record carries no side field, so the partition
+            # IS the emitting wallet). Each side's controller routes its close to that side - the
+            # close path selects by the closing position's side (_exit_controller_for). Each is
+            # constructed with the general on_event (telemetry); set_ciats_exit_sinks rebinds it
+            # to the side's CIATS learning sink so a close emits THROUGH the per-module membrane.
+            self.exit_controllers: dict[PositionSide, ExitController] | None = {
+                side: ExitController(on_event=on_event, clock=self._now_utc)
+                for side in (PositionSide.LONG, PositionSide.SHORT)
+            }
         else:
             self.paper_dispatch = PaperDispatchSimulator()
-            self.exit_controller = None
+            self.exit_controllers = None
 
         # Outbound order-dispatch mode gate (contract:WSManager_Dispatch_Seam).
         self.seam = DispatchSeam(
@@ -263,6 +270,38 @@ class WSManager:
     def has_private_connection(self) -> bool:
         """False in paper (rule:HR-WM-022); True in live."""
         return self.private is not None
+
+    @property
+    def exit_controller(self) -> ExitController | None:
+        """Back-compat accessor - the LONG/default module's Exit Controller (paper), or None in
+        live. The mirror of the ledger/spot_usd_balance default-wallet accessors; use
+        exit_controllers[side] for the short module's controller (sec 7 per-module)."""
+        return None if self.exit_controllers is None else self.exit_controllers[PositionSide.LONG]
+
+    def _exit_controller_for(self, side: PositionSide) -> ExitController:
+        """The mod:Exit_Controller for the closing position's side (sec 7 per-module wallet).
+        Paper-mode only - raises in live (exit handling is executions-driven, a later slice)."""
+        if self.exit_controllers is None:
+            raise RuntimeError(
+                "no Exit Controller (live mode - exit handling is executions-driven, a later slice)"
+            )
+        return self.exit_controllers[side]
+
+    def set_ciats_exit_sinks(self, sinks: Mapping[PositionSide, EventSink]) -> None:
+        """Wire each side's CIATS learning sink as that side's Exit_Controller event sink, so a
+        paper close emits its evt:TRADE_CLOSE THROUGH the EMITTING module's ciats_sink (sec 7):
+        the conductor's learning close + the HR-CI-003 inter-trade-boundary inbox poll, plus
+        mod:Logger Stream-1/Stream-2 with the module tag - all in the running organism, no manual
+        sink call. The operational assembly calls this after it builds the per-side sinks (the
+        construction-order tie-in: the wm is injected, the conductors are built inside assemble_
+        operational). Paper-mode only; a no-op in live (no controllers) and for any side without a
+        sink. Idempotent - a later call rebinds (e.g. a re-assembly)."""
+        if self.exit_controllers is None:
+            return
+        for side, controller in self.exit_controllers.items():
+            sink = sinks.get(side)
+            if sink is not None:
+                controller.set_event_sink(sink)
 
     # --- inbound (read side) -------------------------------------------------
     def register_handler(self, channel: Channel, handler: Handler) -> None:
@@ -559,8 +598,9 @@ class WSManager:
             self._emit_event(PaperEmergSlTriggered(symbol, signal.exit_price, signal.mae_pct))
         else:
             self._emit_event(PaperMaeDetected(symbol, signal.exit_price, signal.mae_pct))
-        # 4-9. the Exit Controller close path (TRADE_CLOSE + clear mirror + AR-073 + sem).
-        self.exit_controller.on_paper_close(
+        # 4-9. the EMITTING module's Exit Controller close path (TRADE_CLOSE through the side's
+        # ciats_sink + clear mirror + AR-073 + sem). The side is known at close (position.side).
+        self._exit_controller_for(position.side).on_paper_close(
             symbol, signal.exit_price, ExitReason(signal.exit_reason), update.fee_usd, self
         )
         # 10. switch the symbol's ticker event_trigger to trades-mode (position closed).
@@ -655,9 +695,10 @@ class WSManager:
         self._emit_event(
             PaperRegimeExitDetected(symbol, exit_price, signal.exit_reason, signal.trigger)
         )
-        # 4-9. the Exit Controller close path (the SAME on_paper_close - no double-close: a
-        # cleared mirror makes any follow-on ticker detection a surfaced PAPER_CLOSE_SKIPPED).
-        self.exit_controller.on_paper_close(
+        # 4-9. the EMITTING module's Exit Controller close path (the SAME on_paper_close, routed by
+        # position.side - no double-close: a cleared mirror makes any follow-on ticker detection a
+        # surfaced PAPER_CLOSE_SKIPPED).
+        self._exit_controller_for(position.side).on_paper_close(
             symbol, exit_price, ExitReason(signal.exit_reason), update.fee_usd, self
         )
         # 10. switch the symbol's ticker event_trigger to trades-mode (position closed).
