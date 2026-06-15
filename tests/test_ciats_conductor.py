@@ -27,7 +27,7 @@ from tothbot.ciats.conductor import (
 from tothbot.ciats.parameter_store import ParameterStore, ParameterWritten
 from tothbot.ciats.pdca_engine import CheckResult, PlanBlocked
 from tothbot.ciats.pool import CiatsPool
-from tothbot.ciats.proposal_engine import KellyNegative, KellyUpdate
+from tothbot.ciats.proposal_engine import IdentifiedCandidate, KellyNegative, KellyUpdate
 from tothbot.ciats.regime_library import RegimeLibrary
 from tothbot.regime.taxonomy import Regime
 
@@ -183,19 +183,64 @@ def test_on_close_stages_kelly_at_the_cadence_then_applies_at_the_next_boundary(
     assert applied2 and isinstance(applied2[0], ParameterWritten)
 
 
+class _SustainedMon:
+    """A drift monitor whose EWMA divergence is permanently sustained (forces a DriftSignal)."""
+
+    sustained = True
+
+    def update(self, _x):
+        pass
+
+
+def _close_sp(net_pl, *, rsi, vol=1):
+    """A Stream-2 close carrying a signal_params dict (the TB00750 producer shape) - rsi_14 + a flat
+    volume_ratio - plus the realized net-P/L the Spearman gate ranks the levels against."""
+    rec = _close(net_pl=str(net_pl), net_gain=str(net_pl) if net_pl > 0 else "0",
+                 net_loss="0" if net_pl > 0 else str(-net_pl))
+    rec.signal_params = {"rsi_14": Decimal(str(rsi)), "volume_ratio": Decimal(str(vol))}
+    return rec
+
+
 def test_on_close_drives_the_drift_scan():
     # on_close runs scan_drift (the HR-CI-007 out-of-cycle PLAN trigger) at each close and surfaces
-    # the DriftSignal. (The drift-triggered candidate PLAN awaits the per-trade param-level producer.)
-    class _Mon:
-        sustained = True
-
-        def update(self, _x):
-            pass
-
-    conductor, events, _ = _make(drift_monitor=_Mon())
+    # the DriftSignal. With no signal_params in the corpus no candidate is identified (nothing fabricated).
+    conductor, events, _ = _make(drift_monitor=_SustainedMon())
     _k, drift, _a = conductor.on_close(_win())
     assert isinstance(drift, DriftSignal) and drift.kind == "ewma_sustained"
     assert drift in events
+    assert not any(isinstance(e, IdentifiedCandidate) for e in events)   # no level series -> no candidate
+
+
+# --------------------------------------------------- the drift-triggered PLAN candidate (TB00750 c)
+def test_identify_drift_candidate_reads_the_per_trade_signal_params_levels():
+    conductor, _, _ = _make()
+    # a corpus whose per-trade rsi_14 level tracks the realized outcome (volume_ratio is flat).
+    for i in range(10):
+        conductor.ingest_close(_close_sp(net_pl=i, rsi=i))
+    cand = conductor.identify_drift_candidate()
+    assert isinstance(cand, IdentifiedCandidate)
+    assert cand.level_key == "rsi_14"        # the strongest-|rho| qualifying level (volume_ratio is flat)
+    assert cand.n == 10
+
+
+def test_identify_drift_candidate_none_without_levels():
+    conductor, _, _ = _make()
+    for _ in range(10):
+        conductor.ingest_close(_win())       # no signal_params on the records
+    assert conductor.identify_drift_candidate() is None
+
+
+def test_on_close_surfaces_a_plan_candidate_on_drift():
+    # the full drift-triggered PLAN identification off the running close: drift fires + the corpus
+    # carries a Spearman-qualified per-trade level -> the candidate is SURFACED (CIATS_PLAN_CANDIDATE).
+    conductor, events, _ = _make(drift_monitor=_SustainedMon())
+    for i in range(8):
+        conductor.ingest_close(_close_sp(net_pl=i, rsi=i))
+    conductor.on_close(_close_sp(net_pl=8, rsi=8))     # this close fires drift -> identify + surface
+    cands = [e for e in events if isinstance(e, IdentifiedCandidate)]
+    assert len(cands) == 1
+    assert cands[0].level_key == "rsi_14"
+    assert cands[0].code == "CIATS_PLAN_CANDIDATE"
 
 
 # --------------------------------------------------------------------------- the PDCA cycle (open_pdca)

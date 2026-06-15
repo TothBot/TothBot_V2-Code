@@ -15,7 +15,12 @@ THE LOOP (one CiatsConductor per wallet, like every other CIATS unit - NO cross-
                       surface (HR-CI-008: a negative edge makes NO positive sizing proposal).
   scan_drift        - the PDCA PLAN trigger: a cusum_lower lower-arm breach on the net-P/L series
                       (HR-CI-007, forces an OUT-OF-CYCLE PLAN) or an optional EWMA sustained divergence.
-  open_pdca         - on a drift signal: PLAN a candidate (200-trade floor / sacred-R:R gated) -> DO
+  identify_drift_candidate - the diagram's PLAN-candidate identification: rank each per-trade
+                      signal_params LEVEL against the realized outcome (the Spearman gate, strongest
+                      |rho|) over the corpus + surface the candidate the data supports. Drives off the
+                      producer wired TB00750 a/b; the owned-threshold mapping + proposed value it would
+                      need to advance to a write are an unspecified design decision (surfaced, not made).
+  open_pdca         - on a constructed candidate proposal: PLAN (200-trade floor / sacred-R:R gated) -> DO
                       (shadow-replay the candidate over THIS corpus -> a candidate vs baseline cohort)
                       -> CHECK (the absolute Mann-Whitney gate) -> on a pass STAGE the proposal for
                       approval. NEVER auto-applies.
@@ -48,10 +53,12 @@ from decimal import Decimal
 from .pdca_engine import PdcaEngine, PlanBlocked
 from .proposal_engine import (
     PER_TRADE_SIZE_PARAM,
+    IdentifiedCandidate,
     KellyNegative,
     KellyUpdate,
     ParameterChangeProposal,
     ProposalEngine,
+    identify_spearman_candidate,
 )
 from .shadow_replay import build_shadow_evaluator
 from .statistical_engine import cusum_lower
@@ -241,13 +248,14 @@ class CiatsConductor:
                                   STAGE the per_trade_size_usd proposal to Bill; SKIPPED when
                                   wallet_balance is None (live mode has no synthetic wallet; the seed
                                   sizing stands). current_size is read from THIS module's store.
-          3. scan_drift         - the HR-CI-007 net-P/L CUSUM out-of-cycle PLAN trigger (DETECT/emit
-                                  only). The drift-triggered open_pdca CANDIDATE-parameter PLAN is NOT
-                                  run here: the diagram identifies the candidate via the Spearman gate
-                                  over the per-trade parameter levels, and that series awaits the
-                                  contract:TRADE_CLOSE signal_params producer (carry-forward) - so the
-                                  trigger fires + is logged, and the candidate PLAN lands when the
-                                  producer does (never a fabricated candidate).
+          3. scan_drift         - the HR-CI-007 net-P/L CUSUM out-of-cycle PLAN trigger (DETECT/emit).
+                                  On a drift signal the PLAN candidate is IDENTIFIED via the Spearman gate
+                                  over the per-trade signal_params level series (now in the corpus, wired
+                                  TB00750 a/b) and SURFACED (evt:CIATS_PLAN_CANDIDATE). Constructing the
+                                  owned-parameter proposal open_pdca writes - mapping the identified
+                                  signal_params level to its owned threshold + deriving the proposed value
+                                  (magnitude/direction) - is an unspecified design decision the diagram
+                                  does not derive: surfaced for a ruling, never fabricated into a write.
           4. on_inter_trade_boundary - poll the operator inbox + APPLY any Bill-approved change at this
                                   confirmed boundary (never auto-applied).
 
@@ -261,6 +269,14 @@ class CiatsConductor:
                 current_size=self._store.get(PER_TRADE_SIZE_PARAM),
             )
         drift = self.scan_drift()
+        if drift is not None:
+            # The drift-triggered PLAN: identify the Spearman candidate over the per-trade signal_params
+            # level series (now in the corpus) and SURFACE it (evt:CIATS_PLAN_CANDIDATE). The open_pdca
+            # construction - the owned-threshold mapping + the proposed value - awaits a design ruling, so
+            # the candidate is surfaced to Bill, never fabricated into a write.
+            candidate = self.identify_drift_candidate()
+            if candidate is not None:
+                self._emit(candidate)
         applied = self.on_inter_trade_boundary(inbox) if inbox is not None else []
         return kelly, drift, applied
 
@@ -309,6 +325,16 @@ class CiatsConductor:
             self._emit(signal)
             return signal
         return None
+
+    def identify_drift_candidate(self) -> "IdentifiedCandidate | None":
+        """The diagram's PLAN-candidate IDENTIFICATION over THIS module's Stream-2 corpus: rank each
+        continuous per-trade signal_params LEVEL against the realized net-P/L via the CIATS Spearman gate
+        (|rho| > 0.3 AND p < 0.05) and return the strongest-|rho| qualifying candidate, or None. The
+        producer wired in TB00750 (a/b) put the per-trade signal_params levels into the corpus, so this
+        runs faithfully off the running close. It IDENTIFIES the parameter the data supports; it does NOT
+        construct an owned-parameter proposal or a proposed value (the level-to-owned-threshold mapping +
+        the magnitude/direction are an unspecified design decision, surfaced - never fabricated)."""
+        return identify_spearman_candidate(self._records)
 
     def _current_value(self, proposal: object) -> object:
         """The candidate parameter's current (pre-change) value the DO replay's scale ratio needs:

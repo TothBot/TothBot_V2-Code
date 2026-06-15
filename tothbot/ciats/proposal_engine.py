@@ -22,7 +22,7 @@ a parameter. PER-MODULE (one per wallet, like the pool). PURE, Decimal-only (ar:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 
@@ -33,6 +33,11 @@ from .statistical_engine import spearman_significant
 # Kelly is recomputed every 50 closed trades after the 200-trade activation (HR-CI-004 / CI-KE-007).
 KELLY_RECOMPUTE_INTERVAL = 50
 PER_TRADE_SIZE_PARAM = "per_trade_size_usd"
+
+# The CONTINUOUS per-trade signal_params LEVEL keys the Spearman PLAN-candidate gate ranks against the
+# realized outcome (the SSS indicator levels the entry was taken under, contract:TRADE_CLOSE field 19).
+# sss_pass (bool) + side (categorical) are NOT continuous levels and are excluded from the rank gate.
+SPEARMAN_CANDIDATE_LEVELS: tuple[str, ...] = ("rsi_14", "ema_9", "ema_21", "volume_ratio")
 
 _ZERO = Decimal("0")
 _ONE = Decimal("1")
@@ -55,6 +60,78 @@ class ParameterChangeProposal:
     rationale: str
     regime: str | None = None
     code: str = field(default="PARAMETER_CHANGE_PROPOSAL", init=False)
+
+
+@dataclass(frozen=True)
+class IdentifiedCandidate:
+    """evt:CIATS_PLAN_CANDIDATE [HIGH] - the PLAN candidate the diagram's Spearman gate IDENTIFIES over
+    the Stream-2 corpus (0500000 sec 6/7 + lines 4111/4187): the per-trade signal_params LEVEL key whose
+    level series has the STRONGEST qualifying monotone association (|rho| > 0.3 AND p < 0.05) with the
+    realized outcome - the single parameter the diagram advances (one candidate per cycle, strongest
+    |rho|). level_key is the signal_params field; rho the rank correlation; n the paired-sample count;
+    (levels, outcomes) the qualifying series (the open_pdca CHECK Spearman-corroboration input).
+
+    This NAMES the candidate the data supports - the diagram-specified PLAN identification. It does NOT
+    carry an owned-parameter name or a proposed value: mapping a signal_params indicator level to the
+    owned threshold it informs (e.g. rsi_14 -> which rsi bound) + deriving the proposed value (magnitude
+    + direction) is a downstream construction the diagram does not specify (surfaced for a design ruling,
+    never fabricated). Until that mapping is ruled, the candidate is surfaced, not advanced to a write."""
+
+    level_key: str
+    rho: Decimal
+    n: int
+    levels: tuple
+    outcomes: tuple
+    code: str = field(default="CIATS_PLAN_CANDIDATE", init=False)
+
+
+def _record_net_pl(record: object) -> Decimal | None:
+    """The realized net P/L of a TRADE_CLOSE record (ar:AR-065), or None if the field is absent."""
+    value = getattr(record, "net_pl_usd", None)
+    return None if value is None else _dec(value)
+
+
+def identify_spearman_candidate(
+    records: Sequence[object],
+    *,
+    level_keys: Sequence[str] = SPEARMAN_CANDIDATE_LEVELS,
+    outcome: Callable[[object], object | None] = _record_net_pl,
+    min_pairs: int = 3,
+) -> "IdentifiedCandidate | None":
+    """The diagram's PLAN-candidate IDENTIFICATION (PURE): over the Stream-2 corpus, for each continuous
+    signal_params LEVEL key build the aligned (level, outcome) pairs and run the CIATS Spearman gate
+    (|rho| > 0.3 AND p < 0.05); return the qualifying key with the STRONGEST |rho| (one candidate per
+    cycle, the diagram's tie-break) or None when none qualifies. A record without signal_params, without
+    the key, or without an outcome is skipped; a key with < min_pairs paired samples is skipped (a
+    degenerate series). NEVER proposes a value - it identifies the parameter the data supports; the
+    owned-threshold mapping + the proposed value are surfaced downstream (not derived here)."""
+    best: IdentifiedCandidate | None = None
+    for key in level_keys:
+        levels: list = []
+        outcomes: list = []
+        for record in records:
+            sp = getattr(record, "signal_params", None)
+            if not isinstance(sp, dict):
+                continue
+            level = sp.get(key)
+            if level is None:
+                continue
+            out = outcome(record)
+            if out is None:
+                continue
+            levels.append(level)
+            outcomes.append(out)
+        if len(levels) < min_pairs:
+            continue
+        rho, qualifies = spearman_significant(levels, outcomes)
+        if not qualifies:
+            continue
+        if best is None or abs(rho) > abs(best.rho):
+            best = IdentifiedCandidate(
+                level_key=key, rho=rho, n=len(levels),
+                levels=tuple(levels), outcomes=tuple(outcomes),
+            )
+    return best
 
 
 @dataclass(frozen=True)

@@ -13,10 +13,12 @@ from decimal import Decimal
 from tothbot.ciats.pool import CiatsPool
 from tothbot.ciats.proposal_engine import (
     KELLY_RECOMPUTE_INTERVAL,
+    IdentifiedCandidate,
     KellyNegative,
     KellyUpdate,
     ParameterChangeProposal,
     ProposalEngine,
+    identify_spearman_candidate,
 )
 
 
@@ -125,3 +127,62 @@ def test_candidate_carries_regime_tag():
     )
     assert prop is not None
     assert prop.regime == "TRENDING_POS_NORMAL"
+
+
+# --------------------------------------------------------------------------- PLAN identification
+class _Rec:
+    """A minimal Stream-2 TRADE_CLOSE-shaped record: signal_params dict + net_pl_usd outcome."""
+
+    def __init__(self, signal_params, net_pl):
+        self.signal_params = signal_params
+        self.net_pl_usd = Decimal(str(net_pl))
+
+
+def _corpus(levels_by_key, outcomes):
+    """Build N records: each carries a signal_params dict {key: levels_by_key[key][i]} + outcomes[i]."""
+    n = len(outcomes)
+    out = []
+    for i in range(n):
+        sp = {key: Decimal(str(levels[i])) for key, levels in levels_by_key.items()}
+        out.append(_Rec(sp, outcomes[i]))
+    return out
+
+
+def test_identify_picks_the_strongest_qualifying_level():
+    # rsi_14 is perfectly monotone with the outcome (|rho|=1); volume_ratio is flat (no association).
+    n = 60
+    records = _corpus(
+        {"rsi_14": list(range(n)), "volume_ratio": [1] * n},
+        outcomes=list(range(n)),
+    )
+    cand = identify_spearman_candidate(records)
+    assert isinstance(cand, IdentifiedCandidate)
+    assert cand.level_key == "rsi_14"
+    assert cand.n == n
+    assert abs(cand.rho) == Decimal(1)
+    assert cand.code == "CIATS_PLAN_CANDIDATE"
+    # it surfaces the qualifying series (the open_pdca CHECK Spearman-corroboration input)
+    assert len(cand.levels) == n and len(cand.outcomes) == n
+
+
+def test_identify_returns_none_when_no_level_qualifies():
+    n = 40
+    records = _corpus({"rsi_14": [5] * n, "ema_9": list(range(n))}, outcomes=[7] * n)
+    # rsi_14 constant + the outcome constant -> no monotone association on any key.
+    assert identify_spearman_candidate(records) is None
+
+
+def test_identify_skips_records_without_signal_params():
+    # records with signal_params None / missing the key are skipped, never crash the rank.
+    n = 50
+    good = _corpus({"rsi_14": list(range(n))}, outcomes=list(range(n)))
+    noisy = good + [_Rec(None, 5), _Rec({"sss_pass": True}, 9)]
+    cand = identify_spearman_candidate(noisy)
+    assert cand is not None and cand.level_key == "rsi_14"
+    assert cand.n == n          # only the n records carrying rsi_14 were paired
+
+
+def test_identify_skips_a_degenerate_key_under_min_pairs():
+    # only 2 records carry the key -> below min_pairs -> skipped (no spurious candidate).
+    records = [_Rec({"rsi_14": Decimal(1)}, 1), _Rec({"rsi_14": Decimal(2)}, 2)]
+    assert identify_spearman_candidate(records) is None
