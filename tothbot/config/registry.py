@@ -159,6 +159,24 @@ REGISTRY: tuple[Param, ...] = (
     # -- CIATS: short-side specific (Short only) -----------------------
     Param("leverage_cap_short", 3, _C, _M, "x", "Kraken max 10x; held low for loss-min. Short only."),
 
+    # -- CIATS: short-side margin fees (Short only; Kraken spot-margin, ar:AR-009) --
+    Param(
+        "margin_open_fee_pct", 0.0002, _C, _PS, "fraction",
+        "0.02% Kraken spot-margin OPENING fee on a short sell-to-open (Bill ruling "
+        "TB00728 DEC-A; TB00000 v2_100 sec 8). Short only - a spot long pays neither. "
+        "Kraken's published spot-margin rate for major pairs (0.01-0.05% per pair); "
+        "CIATS-owned seed, per-pair/side, refined from paper from the 200-trade floor. "
+        "Canonical at 0500000 D1 FEE block.",
+    ),
+    Param(
+        "margin_rollover_fee_pct", 0.0002, _C, _PS, "fraction per 4h",
+        "0.02% per 4h Kraken spot-margin ROLLOVER fee charged every 4 hours a short "
+        "position stays open (Bill ruling TB00728 DEC-A; TB00000 v2_100 sec 8). Short "
+        "only. The 0500000 token param:margin_borrow_fee = open + rollover x held-4h-"
+        "blocks, added to short net_loss / net P&L and the sacred 1:1.5 R:R floor "
+        "(D9 net_loss / D3 R:R). CIATS-owned seed, refined from paper.",
+    ),
+
     # -- CIATS: VPS deployment (single process, universal) -------------
     Param("StartLimitBurst", 3, _C, _U, "count", "systemd restart cap."),
     Param("StartLimitIntervalSec", 600, _C, _U, "s", "systemd restart window."),
