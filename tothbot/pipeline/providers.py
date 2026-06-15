@@ -36,6 +36,20 @@ def new_cl_ord_id() -> str:
     return uuid.uuid4().hex
 
 
+def make_mpp_provider(mpp_store) -> Callable[[str, PositionSide], Decimal]:
+    """The mpp_abs_cap_pct provider backed by the DEC-128 MppCapStore (the historical Q95 seed
+    per pair/side). Raises ProviderNotReady if the pair/side has no seed yet (the universe-load
+    historical probe has not populated it) so the sweep skips that candidate."""
+
+    def mpp_abs_cap_pct(symbol: str, side: PositionSide) -> Decimal:
+        value = mpp_store.get(symbol, side)
+        if value is None:
+            raise ProviderNotReady(symbol, "mpp_abs_cap_pct")
+        return value
+
+    return mpp_abs_cap_pct
+
+
 def make_deadline(
     now_utc: UtcClock, *, offset_sec: float = DEFAULT_DEADLINE_OFFSET_SEC
 ) -> Callable[[], str]:
