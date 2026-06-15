@@ -21,6 +21,7 @@ from tothbot.ciats.proposal_engine import (
     ProposalEngine,
     StopWidthTheory,
     identify_spearman_candidate,
+    plan_entry_filter_proposal,
     plan_stop_width_proposal,
 )
 
@@ -244,3 +245,63 @@ def test_stop_width_honours_an_overridden_nudge():
         records, current_mae_mult=Decimal("2.0"), nudge_pct=Decimal("0.25")
     )
     assert theory.proposal.proposed_value == Decimal("2.0") * Decimal("0.75")
+
+
+# ------------------------------------------------ entry-filter proposal construction (TB00751 c)
+def _cand(level_key, rho):
+    return IdentifiedCandidate(level_key=level_key, rho=Decimal(str(rho)), n=0, levels=(), outcomes=())
+
+
+def _filter_records(key, *, loser_levels, winner_levels):
+    """Records carrying signal_params[key]: losers (net<0) at loser_levels, winners (net>0) at winner_levels."""
+    out = [_Rec({key: Decimal(str(v))}, -1) for v in loser_levels]
+    out += [_Rec({key: Decimal(str(v))}, 2) for v in winner_levels]
+    return out
+
+
+def test_entry_filter_volume_raises_the_floor_to_the_loser_median():
+    # volume_ratio rho > 0 (low volume loses) -> raise volume_sss_threshold to the loser-median level.
+    records = _filter_records("volume_ratio", loser_levels=[1.2, 1.4, 1.6], winner_levels=[2.0, 2.5])
+    prop = plan_entry_filter_proposal(records, _cand("volume_ratio", "0.8"))
+    assert prop.param_name == "volume_sss_threshold"
+    assert prop.proposed_value == Decimal("1.4")          # median of the losers' volume_ratio
+
+
+def test_entry_filter_volume_defers_a_high_volume_loses_theory():
+    # rho < 0 (high volume loses) cannot be expressed by a single floor -> DEFER (None).
+    records = _filter_records("volume_ratio", loser_levels=[2.0, 2.4, 2.8], winner_levels=[1.1, 1.2])
+    assert plan_entry_filter_proposal(records, _cand("volume_ratio", "-0.8")) is None
+
+
+def test_entry_filter_rsi_high_rho_raises_the_low_bound():
+    # rsi_14 rho > 0 (low rsi loses) -> raise rsi_long_low to the loser-median.
+    records = _filter_records("rsi_14", loser_levels=[32, 34, 38], winner_levels=[45, 48])
+    prop = plan_entry_filter_proposal(records, _cand("rsi_14", "0.7"))
+    assert prop.param_name == "rsi_long_low"
+    assert prop.proposed_value == Decimal("34")
+
+
+def test_entry_filter_rsi_low_rho_lowers_the_high_bound():
+    # rsi_14 rho < 0 (high rsi loses) -> lower rsi_long_high to the loser-median.
+    records = _filter_records("rsi_14", loser_levels=[44, 46, 48], winner_levels=[33, 35])
+    prop = plan_entry_filter_proposal(records, _cand("rsi_14", "-0.7"))
+    assert prop.param_name == "rsi_long_high"
+    assert prop.proposed_value == Decimal("46")
+
+
+def test_entry_filter_rsi_short_side_moves_the_mirror_bound():
+    # the short module moves the mirror bound: rho > 0 -> rsi_short_high (the short zone low edge).
+    records = _filter_records("rsi_14", loser_levels=[55, 58, 60], winner_levels=[65, 68])
+    prop = plan_entry_filter_proposal(records, _cand("rsi_14", "0.7"), side="short")
+    assert prop.param_name == "rsi_short_high"
+
+
+def test_entry_filter_defers_ema_period_candidate():
+    # ema_9/ema_21 map to PERIODS, not levels -> not re-simulatable -> DEFER (None).
+    records = _filter_records("ema_9", loser_levels=[100, 101, 102], winner_levels=[103, 104])
+    assert plan_entry_filter_proposal(records, _cand("ema_9", "0.9")) is None
+
+
+def test_entry_filter_defers_when_too_few_losers():
+    records = _filter_records("volume_ratio", loser_levels=[1.5], winner_levels=[2.0, 2.5, 3.0])
+    assert plan_entry_filter_proposal(records, _cand("volume_ratio", "0.8")) is None

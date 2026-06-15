@@ -24,6 +24,14 @@ def _rec(net, *, regime=None):
     )
 
 
+def _rec_sp(net, **levels):
+    """A record carrying a signal_params dict (the entry re-simulation input) + net P/L."""
+    return SimpleNamespace(
+        net_pl_usd=Decimal(net),
+        signal_params={k: Decimal(str(v)) for k, v in levels.items()},
+    )
+
+
 def _proposal(param, proposed, *, current=None):
     return SimpleNamespace(param_name=param, current_value=current, proposed_value=proposed)
 
@@ -73,11 +81,49 @@ def test_emergency_sl_mult_is_an_exit_stop_param():
     assert ev(_rec("4")) == Decimal("4")
 
 
+# ------------------------------------------------------ entry-filter re-simulation (TB00751 c)
+def test_volume_threshold_excludes_a_trade_below_the_raised_floor():
+    # SC-SSS-3: pass iff volume_ratio > threshold. Raising the floor to 1.5 EXCLUDES the low-volume
+    # trade (it would not have been entered) and keeps the high-volume one.
+    ev = build_shadow_evaluator(_proposal("volume_sss_threshold", Decimal("1.5")))
+    assert ev(_rec_sp("-2", volume_ratio="1.1")) is None      # 1.1 !> 1.5 -> excluded
+    assert ev(_rec_sp("4", volume_ratio="2.0")) == Decimal("4")  # 2.0 > 1.5 -> kept
+
+
+def test_rsi_low_bound_excludes_a_trade_below_the_raised_low():
+    # SC-SSS-1 long: pass iff rsi_14 > low. Raising the low bound to 40 excludes the low-rsi trade.
+    ev = build_shadow_evaluator(_proposal("rsi_long_low", Decimal("40")))
+    assert ev(_rec_sp("-1", rsi_14="35")) is None             # 35 !> 40 -> excluded
+    assert ev(_rec_sp("2", rsi_14="45")) == Decimal("2")      # 45 > 40 -> kept
+
+
+def test_rsi_high_bound_excludes_a_trade_above_the_lowered_high():
+    # SC-SSS-1 long: pass iff rsi_14 < high. Lowering the high bound to 45 excludes the high-rsi trade.
+    ev = build_shadow_evaluator(_proposal("rsi_long_high", Decimal("45")))
+    assert ev(_rec_sp("-1", rsi_14="48")) is None             # 48 !< 45 -> excluded
+    assert ev(_rec_sp("2", rsi_14="42")) == Decimal("2")      # 42 < 45 -> kept
+
+
+def test_entry_filter_without_the_level_replays_as_baseline():
+    # a record carrying no signal_params / not the gated level cannot be re-decided (seed-then-correct).
+    ev = build_shadow_evaluator(_proposal("volume_sss_threshold", Decimal("1.5")))
+    assert ev(_rec("3")) == Decimal("3")                      # no signal_params -> realized outcome
+    assert ev(_rec_sp("-2", rsi_14="35")) == Decimal("-2")    # has signal_params but not volume_ratio
+
+
 # --------------------------------------------------------------------------- seed-then-correct
 def test_unmodellable_param_replays_as_the_realized_outcome():
     ev = build_shadow_evaluator(_proposal("sc_body_threshold", Decimal("0.7"), current=Decimal("0.5")))
     assert ev(_rec("3")) == Decimal("3")       # no per-trade signal field -> baseline, never a crash
     assert ev(_rec("-2")) == Decimal("-2")
+
+
+def test_ema_period_param_is_not_re_simulatable():
+    # ema_9/ema_21 are LEVELS but sss_ema_short/long are PERIODS - a level cannot re-decide a period
+    # change, so an ema-period proposal replays as the realized outcome (seed-then-correct).
+    ev = build_shadow_evaluator(_proposal("sss_ema_short", Decimal("12"), current=Decimal("9")))
+    assert ev(_rec_sp("3", ema_9="100", ema_21="98")) == Decimal("3")
+    assert ev(_rec_sp("-1", ema_9="100", ema_21="98")) == Decimal("-1")
 
 
 # --------------------------------------------------------------------------- through shadow_cohorts

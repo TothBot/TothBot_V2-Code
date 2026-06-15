@@ -220,6 +220,80 @@ def plan_stop_width_proposal(
     )
 
 
+def _median(values: Sequence[object]) -> Decimal:
+    """The median of a Decimal series (parameter-free; the average of the two middle values for an
+    even count). Raises on an empty series (the caller guards min_pairs)."""
+    xs = sorted(_dec(v) for v in values)
+    n = len(xs)
+    if n == 0:
+        raise ValueError("median of an empty series")
+    mid = n // 2
+    return xs[mid] if n % 2 else (xs[mid - 1] + xs[mid]) / 2
+
+
+def plan_entry_filter_proposal(
+    records: Sequence[object],
+    candidate: "IdentifiedCandidate",
+    *,
+    side: str = "long",
+    min_pairs: int = 3,
+) -> "ParameterChangeProposal | None":
+    """Construct the owned ENTRY-FILTER proposal an open_pdca can TEST from a qualifying
+    IdentifiedCandidate (the faithful TB00751 (c) mapping). Names the owned SSS entry threshold the
+    Spearman sign says to move + a DATA-DERIVED bound (the MEDIAN of the level among the LOSING
+    trades - a robust cut that starts excluding the losing tail), so ciats.shadow_replay's entry
+    re-simulation re-decides entry and the PDCA CHECK can prove it. NO new seed (the value is
+    data-derived; unlike the stop-width dial, the entry-filter level and its owned threshold share
+    units). The mapping:
+      volume_ratio -> volume_sss_threshold (a single floor; clean 1:1): testable ONLY when rho > 0
+        (the low-volume tail loses -> RAISE the floor); rho <= 0 has no ceiling param -> DEFER (None).
+      rsi_14 -> the side's binding rsi BOUND: rho > 0 (low rsi loses) RAISES the low bound; rho < 0
+        (high rsi loses) LOWERS the high bound (the short side moves the mirror bound). Both EXCLUDE.
+      ema_9 / ema_21 -> sss_ema_short/long are PERIODS, not levels -> DEFER (None): a stored level
+        cannot re-decide a period change (not re-simulatable). sss_pass / side are categorical -> DEFER.
+    Returns the proposal, or None when the candidate is not re-simulatable (the caller files those to
+    the report track, never sham-tests them). Never the sacred R:R."""
+    key = candidate.level_key
+    rho = _dec(candidate.rho)
+    is_short = str(side).lower().startswith("short")
+    if key == "volume_ratio":
+        if rho <= _ZERO:
+            return None  # only a floor exists - a high-volume-loses theory is not expressible here
+        param = "volume_sss_threshold"
+    elif key == "rsi_14":
+        if rho > _ZERO:
+            param = "rsi_short_high" if is_short else "rsi_long_low"   # raise the low edge
+        else:
+            param = "rsi_short_low" if is_short else "rsi_long_high"   # lower the high edge
+    else:
+        return None  # ema_9 / ema_21 (period) or a categorical key - not re-simulatable
+
+    losers: list = []
+    for record in records:
+        sp = getattr(record, "signal_params", None)
+        if not isinstance(sp, dict):
+            continue
+        level = sp.get(key)
+        if level is None:
+            continue
+        out = _record_net_pl(record)
+        if out is None or out >= _ZERO:
+            continue
+        losers.append(_dec(level))
+    if len(losers) < min_pairs:
+        return None
+    proposed = _median(losers)
+    return ParameterChangeProposal(
+        param_name=param,
+        current_value=_dec(registry.value(param)),
+        proposed_value=proposed,
+        rationale=(
+            f"entry-filter drift: {key} Spearman rho={rho} -> set {param} to the loser-median "
+            f"level {proposed} (data-derived exclusion cut, validated by the entry re-simulation)"
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class KellyUpdate:
     """evt:KELLY_UPDATE [INFO] - a Half-Kelly recompute at a 50-trade boundary: K_full, K_half, and
