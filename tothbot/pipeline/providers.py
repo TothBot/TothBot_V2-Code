@@ -36,6 +36,21 @@ def new_cl_ord_id() -> str:
     return uuid.uuid4().hex
 
 
+def make_expected_reward_provider(reward_store) -> Callable[[str, Regime], Decimal]:
+    """The expected_reward provider backed by the DEC-124 ExpectedRewardStore (the historical run-
+    to-reversal median seed per pair/regime). Raises ProviderNotReady if the pair/regime has no seed
+    yet (the universe-load historical replay observed no realized reversal there) so the sweep skips
+    that candidate - the A1 floor is never fed a missing estimate."""
+
+    def expected_reward(symbol: str, regime: Regime) -> Decimal:
+        value = reward_store.get(symbol, regime)
+        if value is None:
+            raise ProviderNotReady(symbol, "expected_reward")
+        return value
+
+    return expected_reward
+
+
 def make_mpp_provider(mpp_store) -> Callable[[str, PositionSide], Decimal]:
     """The mpp_abs_cap_pct provider backed by the DEC-128 MppCapStore (the historical Q95 seed
     per pair/side). Raises ProviderNotReady if the pair/side has no seed yet (the universe-load
