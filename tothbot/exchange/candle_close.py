@@ -65,6 +65,21 @@ class CommittedCandle:
     volume: Decimal
 
 
+def committed_candle_from_bar(symbol: str, bar: object) -> CommittedCandle:
+    """Build a CommittedCandle from a REST warm-up bar (RestOhlcBar: time/open/high/low/close/
+    volume, no symbol). Used to seed the detector's last_complete_candle from the warm-up's last
+    committed candle so the first ar:AR-045 fire carries a symbol-bearing candle to the sweep."""
+    return CommittedCandle(
+        symbol=symbol,
+        interval_begin=to_interval_unix(bar.time),
+        open=_dec(bar.open),
+        high=_dec(bar.high),
+        low=_dec(bar.low),
+        close=_dec(bar.close),
+        volume=_dec(bar.volume),
+    )
+
+
 def committed_candle_from_frame(elem: dict) -> CommittedCandle:
     """Parse one Kraken WS v2 ohlc data element into a Decimal CommittedCandle (ar:AR-047 / A-16).
 
