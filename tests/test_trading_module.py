@@ -72,7 +72,7 @@ def test_long_module_builds_sell_stop_emergsl():
     )
     leg = msg["params"]["orders"][0]
     assert leg["side"] == "sell"
-    assert leg["reduce_only"] is True
+    assert "reduce_only" not in leg            # spot long SL has no reduce_only (margin-only flag)
 
 
 def test_short_module_builds_buy_to_cover_emergsl():

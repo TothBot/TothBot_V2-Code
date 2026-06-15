@@ -96,12 +96,16 @@ def build_emergsl_order(
         "order_type": _ORDER_TYPE_STOP,         # stop-market (off-book; no limit_price)
         "order_qty": _s(order_qty),
         # The stop trigger: BELOW entry for a long, ABOVE entry for a short (the G8 emergsl_price
-        # already carries the correct side of entry).
-        "triggers": {"price": _s(emergsl_price)},
-        # A close-only stop both sides; mandatory for the SHORT buy-to-cover on margin (ar:AR-009).
-        "reduce_only": True,
+        # already carries the correct side of entry). triggers.reference="last" is mandatory on
+        # every emergSL (UT-EE-004 / rule:HR-EI) - trigger on the last trade price.
+        "triggers": {"reference": "last", "price": _s(emergsl_price)},
         "cl_ord_id": cl_ord_id,
-        "stp_type": _STP_CANCEL_NEWEST,
-        "deadline": deadline,
+        "stp_type": _STP_CANCEL_NEWEST,         # A-4 / UT-EE-002
+        "deadline": deadline,                   # now+5s / UT-EE-003
     }
+    if is_short:
+        # reduce_only is a Kraken MARGIN flag - mandatory on the SHORT buy-to-cover so it can only
+        # CLOSE the margin short (ar:AR-009), never flip long. A spot LONG sell-stop carries NO
+        # reduce_only (spot has no position to "reduce"; the flag is invalid on a spot order).
+        leg["reduce_only"] = True
     return {"method": "batch_add", "params": {"symbol": symbol, "orders": [leg]}}
