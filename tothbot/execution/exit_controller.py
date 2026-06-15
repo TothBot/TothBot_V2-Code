@@ -256,7 +256,7 @@ class ExitController:
         # 7. clear the Position Mirror through the sole writer (rule:HR-PM-009).
         wm.close_position(symbol)
         # 8. update Selection Controller state via the WSManager AR-073 path (HR-EC-014).
-        wm.update_selection_state_on_close(symbol, is_win)
+        wm.update_selection_state_on_close(symbol, is_win, position.side)
         # 9. release the G7 capital-commitment semaphore.
         wm.release_exit_semaphore()
         return record

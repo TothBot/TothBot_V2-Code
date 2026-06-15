@@ -41,8 +41,8 @@ class _FakeWM:
         self._position = None
         return None
 
-    def update_selection_state_on_close(self, symbol, is_win):
-        self.sc_updates.append((symbol, is_win))
+    def update_selection_state_on_close(self, symbol, is_win, side=None):
+        self.sc_updates.append((symbol, is_win, side))
 
     def release_exit_semaphore(self):
         self.sem_released += 1
@@ -100,7 +100,7 @@ def test_long_win_drives_close_clear_scwin_and_semaphore():
     wm = _FakeWM(_pos(), fees_entry=Decimal("7.8"))
     _ec([]).on_paper_close("BTC/USD", "66000", ExitReason.MAE_THRESHOLD_BREACH, "8.58", wm)
     assert wm.closed == ["BTC/USD"]            # step 7 mirror clear (HR-PM-009)
-    assert wm.sc_updates == [("BTC/USD", True)]  # step 8 AR-073 win
+    assert wm.sc_updates == [("BTC/USD", True, PositionSide.LONG)]  # step 8 AR-073 win, per-side
     assert wm.sem_released == 1                  # step 9 semaphore release
 
 
@@ -115,7 +115,7 @@ def test_long_loss_increments_consecutive_loss_and_reaches_mae():
     assert rec.net_loss_usd == Decimal("314.82")  # positive value if loss
     # adverse excursion at exit: (60000-54000)/60000 = 0.1
     assert rec.mae_pct_reached == Decimal("0.1")
-    assert wm.sc_updates == [("BTC/USD", False)]   # AR-073 loss
+    assert wm.sc_updates == [("BTC/USD", False, PositionSide.LONG)]   # AR-073 loss, per-side
 
 
 def test_short_win_direction_symmetric_net_pnl():

@@ -88,6 +88,7 @@ from .seam import DispatchSeam, EventSink, LiveSender, PaperSimulator
 from ..config import registry
 from ..config.settings import Mode
 from ..execution.exit_controller import ExitController, ExitReason
+from ..modules.trading_module import TradingModule
 from ..regime.engine import RegimeClassification
 
 # Per-symbol ticker event_trigger modes (D1 WS-TKR-002/003): a pair WITH an open position
@@ -157,11 +158,16 @@ class WSManager:
         # The G7 capital-commitment BoundedSemaphore (acquired at entry, released on close,
         # sec 12.5 step 9). Injected; None until mod:Risk_Engine wires the acquire side.
         self._exit_semaphore = exit_semaphore
-        # mod:Selection_Controller state, updated ONLY by the Exit Controller via the
-        # AR-073 path (rule:HR-EC-014). consecutive_loss_count + exit_cooldown_log are the
-        # two SC-Gate inputs (sc_consecutive_limit + sc_cooldown_seconds read them, G5).
-        self._selection_consecutive_loss_count: dict[str, int] = {}
-        self._selection_exit_cooldown_log: dict[str, float] = {}
+        # mod:Selection_Controller state, updated ONLY by the Exit Controller via the AR-073
+        # path (rule:HR-EC-014), PER-MODULE - each side carries its OWN consecutive-loss counter
+        # + cooldown log (G5 SC-Gate-3/2 read "this side's" state; sec 7 per-module rule). Keyed
+        # by side then symbol.
+        self._selection_consecutive_loss: dict[PositionSide, dict[str, int]] = {
+            PositionSide.LONG: {}, PositionSide.SHORT: {},
+        }
+        self._selection_cooldown: dict[PositionSide, dict[str, float]] = {
+            PositionSide.LONG: {}, PositionSide.SHORT: {},
+        }
         # Per-pair ticker event_trigger mode (WS-TKR-003); a pair appears here once it has
         # carried an open position (default trades elsewhere).
         self._ticker_event_trigger: dict[str, str] = {}
@@ -193,15 +199,24 @@ class WSManager:
         # debit/credit. In live mode there is no synthetic ledger (real Kraken balances
         # are authoritative) and the paper boundary is inert (the seam uses the
         # transmitter), so both stay None / a no-op boundary.
-        self.ledger: SyntheticCapitalLedger | None = None
+        # TWO independent per-module wallets (mod:Long_Module + mod:Short_Module, sec 7
+        # parallel-module framework): each owns its OWN synthetic ledger (the Long wallet is
+        # spot USD, the Short wallet is Kraken margin equity), seeded per side (D-05 $5,000
+        # each; paper_starting_balance overrides both when given). The two share ONLY this WS
+        # data layer (mirror + seam); a loss in one never touches the other (the per-wallet
+        # isolation Gate-7 enforces). Routed by side: a LONG fill hits the Long wallet, a SHORT
+        # fill the Short wallet (apply_paper_*_fill route via is_short).
+        self.modules: dict[PositionSide, TradingModule] | None = None
         self.paper_fill: PaperFillSimulator | None = None
         if mode is Mode.PAPER:
-            seed = (
-                paper_starting_balance
-                if paper_starting_balance is not None
-                else _DEFAULT_PAPER_STARTING_BALANCE
-            )
-            self.ledger = SyntheticCapitalLedger(seed, on_event=on_event)
+            self.modules = {
+                PositionSide.LONG: TradingModule(
+                    PositionSide.LONG, starting_balance=paper_starting_balance, on_event=on_event
+                ),
+                PositionSide.SHORT: TradingModule(
+                    PositionSide.SHORT, starting_balance=paper_starting_balance, on_event=on_event
+                ),
+            }
             self.paper_fill = PaperFillSimulator(
                 record_execution=self.record_execution,
                 apply_entry_fill=self.apply_paper_entry_fill,
@@ -301,19 +316,33 @@ class WSManager:
     # --- Synthetic Capital Ledger: WSManager is the SOLE writer (rule:HR-WM-032) --
     # The mirror image of the Position-Mirror sole-writer pattern: these are the ONLY
     # callers that tag a ledger write with WRITER_ID (sec 12.4 single-owner). Paper
-    # mode only - in live the ledger is None (real Kraken balances are authoritative).
+    # mode only - in live the wallets are None (real Kraken balances are authoritative).
+    # The two per-module wallets (self.modules) are routed by side; a fill's is_short (the
+    # order side) selects the wallet, so a LONG fill never touches the Short wallet.
+    def _ledger(self, is_short: bool) -> SyntheticCapitalLedger:
+        """The per-module synthetic ledger for the fill's side (HR-WM-032 sole-owner write
+        surface). Raises in live mode (no synthetic wallets - real Kraken balances rule)."""
+        if self.modules is None:
+            raise RuntimeError(
+                "no synthetic wallet (live mode - real Kraken balances are authoritative; "
+                "HR-WM-032 paper-only)"
+            )
+        return self.modules[PositionSide.SHORT if is_short else PositionSide.LONG].ledger
+
+    @property
+    def ledger(self) -> SyntheticCapitalLedger | None:
+        """The LONG module's synthetic ledger (paper), or None in live. Back-compat accessor -
+        the default/long wallet; use _ledger(is_short) or modules[side] for the short wallet."""
+        return None if self.modules is None else self.modules[PositionSide.LONG].ledger
+
     def apply_paper_entry_fill(
         self, symbol: str, qty: object, entry_fill_price: object, *, is_short: bool = False
     ) -> LedgerUpdate:
-        """Apply the synthetic entry-fill cash flow (sec 12.4), direction-aware: a LONG
-        (default) buy-to-open DEBITS; a SHORT sell-to-open CREDITS net of the taker + margin
-        OPEN fee (ar:AR-009). Paper mode only."""
-        if self.ledger is None:
-            raise RuntimeError(
-                "apply_paper_entry_fill called with no synthetic ledger (live mode - "
-                "real Kraken balances are authoritative; HR-WM-032 paper-only)"
-            )
-        return self.ledger.entry_fill_debit(
+        """Apply the synthetic entry-fill cash flow (sec 12.4) to the SIDE's wallet,
+        direction-aware: a LONG (default) buy-to-open DEBITS the Long wallet; a SHORT
+        sell-to-open CREDITS the Short wallet net of the taker + margin OPEN fee (ar:AR-009).
+        Paper mode only."""
+        return self._ledger(is_short).entry_fill_debit(
             symbol, qty, entry_fill_price, writer=WRITER_ID, is_short=is_short
         )
 
@@ -331,12 +360,7 @@ class WSManager:
         EXIT-FILL CREDIT, FEE_TAKER_PCT). Paper mode only. retain_fees_entry=True (the
         sec-12.5 close path, step 2) keeps the symbol's entry fee for on_paper_close to
         read; the close then clears it via close_position (step 7)."""
-        if self.ledger is None:
-            raise RuntimeError(
-                "apply_paper_exit_fill called with no synthetic ledger (live mode - "
-                "real Kraken balances are authoritative; HR-WM-032 paper-only)"
-            )
-        return self.ledger.exit_fill_credit(
+        return self._ledger(is_short).exit_fill_credit(
             symbol,
             qty,
             exit_price,
@@ -349,35 +373,44 @@ class WSManager:
     def fees_entry_for(self, symbol: str) -> Decimal | None:
         """The taker entry fee retained for the symbol's open paper position
         (pos.fees_entry_usd), or None (no open paper position / live mode). The Exit
-        Controller reads this through wm in the sec-12.5 close to compute net P&L."""
-        return None if self.ledger is None else self.ledger.fees_entry_for(symbol)
+        Controller reads this through wm in the sec-12.5 close to compute net P&L. A symbol is
+        open in at most ONE wallet (the mirror is symbol-keyed), so the first wallet holding a
+        retained fee for it is the owner."""
+        if self.modules is None:
+            return None
+        for module in self.modules.values():
+            fee = module.ledger.fees_entry_for(symbol)
+            if fee is not None:
+                return fee
+        return None
 
     # --- sec 12.5 close surfaces (the Exit Controller calls these through `wm`) -------
     def close_position(self, symbol: str) -> Position | None:
         """sec 12.5 step 7: clear the symbol from the Position Mirror (rule:HR-PM-009 sole
         writer) and drop its retained entry fee from the synthetic ledger. The Exit
-        Controller requests the clear here - it never mutates the mirror directly."""
+        Controller requests the clear here - it never mutates the mirror directly. The retained
+        fee lives in the wallet that opened the symbol; clear_fees_entry is idempotent, so
+        clearing it on BOTH wallets drops it from the owner and no-ops on the other."""
         cleared = self.positions.close(symbol, writer=WRITER_ID)
-        if self.ledger is not None:
-            self.ledger.clear_fees_entry(symbol, writer=WRITER_ID)
+        if self.modules is not None:
+            for module in self.modules.values():
+                module.ledger.clear_fees_entry(symbol, writer=WRITER_ID)
         return cleared
 
-    def update_selection_state_on_close(self, symbol: str, is_win: bool) -> None:
+    def update_selection_state_on_close(
+        self, symbol: str, is_win: bool, side: PositionSide = PositionSide.LONG
+    ) -> None:
         """sec 12.5 step 8 (ar:AR-073 / rule:HR-EC-014): the Exit Controller's sole-updater
-        path into mod:Selection_Controller state. LOSS -> increment consecutive_loss_count
-        + stamp exit_cooldown_log (monotonic, rule:HR-SC-006); WIN -> reset the count to 0."""
+        path into THIS SIDE's mod:Selection_Controller state (per-module, sec 7). LOSS ->
+        increment this side's consecutive_loss_count + stamp its cooldown log (monotonic,
+        rule:HR-SC-006); WIN -> reset this side's count to 0."""
+        losses = self._selection_consecutive_loss[side]
         if is_win:
-            self._selection_consecutive_loss_count[symbol] = 0
+            losses[symbol] = 0
         else:
-            self._selection_consecutive_loss_count[symbol] = (
-                self._selection_consecutive_loss_count.get(symbol, 0) + 1
-            )
-            self._selection_exit_cooldown_log[symbol] = self._now_monotonic()
-        self._emit_event(
-            SelectionStateUpdated(
-                symbol, is_win, self._selection_consecutive_loss_count[symbol]
-            )
-        )
+            losses[symbol] = losses.get(symbol, 0) + 1
+            self._selection_cooldown[side][symbol] = self._now_monotonic()
+        self._emit_event(SelectionStateUpdated(symbol, is_win, losses[symbol]))
 
     def release_exit_semaphore(self) -> None:
         """sec 12.5 step 9: release the G7 capital-commitment BoundedSemaphore acquired at
@@ -391,16 +424,18 @@ class WSManager:
             # BoundedSemaphore.release() past its initial value - nothing was acquired.
             pass
 
-    def consecutive_loss_count(self, symbol: str) -> int:
-        """mod:Selection_Controller read helper - the symbol's consecutive-loss count
-        (SC-Gate-3 reads it against param:sc_consecutive_limit)."""
-        return self._selection_consecutive_loss_count.get(symbol, 0)
+    def consecutive_loss_count(self, symbol: str, side: PositionSide = PositionSide.LONG) -> int:
+        """mod:Selection_Controller read helper - THIS SIDE's consecutive-loss count for the
+        symbol (SC-Gate-3 reads it against param:sc_consecutive_limit; per-module, sec 7)."""
+        return self._selection_consecutive_loss[side].get(symbol, 0)
 
-    def exit_cooldown_at(self, symbol: str) -> float | None:
-        """mod:Selection_Controller read helper - the monotonic instant of the symbol's
-        last loss-exit (SC-Gate-2 measures the cooldown against param:sc_cooldown_seconds),
-        or None if no loss-exit is on record."""
-        return self._selection_exit_cooldown_log.get(symbol)
+    def exit_cooldown_at(
+        self, symbol: str, side: PositionSide = PositionSide.LONG
+    ) -> float | None:
+        """mod:Selection_Controller read helper - the monotonic instant of THIS SIDE's last
+        loss-exit on the symbol (SC-Gate-2 measures the cooldown against param:sc_cooldown_
+        seconds; per-module, sec 7), or None if no loss-exit is on record."""
+        return self._selection_cooldown[side].get(symbol)
 
     # --- ticker-driven paper exit detection + the sec-12.5 close drive ----------------
     def _emit_event(self, event: object) -> None:
@@ -566,9 +601,15 @@ class WSManager:
 
     @property
     def spot_usd_balance(self) -> Decimal | None:
-        """The synthetic spot_usd_balance (paper mode), or None in live mode where the
-        real Kraken balance is authoritative (sec 12.4)."""
-        return None if self.ledger is None else self.ledger.balance
+        """The LONG module's synthetic spot_usd_balance (paper), or None in live mode (real
+        Kraken balance authoritative, sec 12.4). Back-compat accessor - the long/default wallet;
+        use wallet_balance(side) for either side's wallet."""
+        return None if self.modules is None else self.modules[PositionSide.LONG].wallet_balance
+
+    def wallet_balance(self, side: PositionSide) -> Decimal | None:
+        """THIS SIDE's synthetic wallet balance (paper): the Long wallet is spot USD, the Short
+        wallet is Kraken margin equity (sec 7 per-module). None in live mode."""
+        return None if self.modules is None else self.modules[side].wallet_balance
 
     # --- Position Mirror read helpers (the rule:HR-PM-009 read contract) ------
     def position(self, symbol: str) -> Position | None:

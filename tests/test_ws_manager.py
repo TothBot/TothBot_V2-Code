@@ -14,7 +14,11 @@ from decimal import Decimal
 import pytest
 
 from tothbot.config.settings import Mode
-from tothbot.exchange.position_mirror import PositionAction, SoleWriterViolationError
+from tothbot.exchange.position_mirror import (
+    PositionAction,
+    PositionSide,
+    SoleWriterViolationError,
+)
 from tothbot.exchange import connection as conn
 from tothbot.exchange.channels import PrivateChannel, PublicChannel
 from tothbot.exchange.connection import (
@@ -508,7 +512,7 @@ def test_paper_exit_lifecycle_l3_emergsl_touch():
 
 def test_paper_exit_win_resets_consecutive_loss_count():
     m = WSManager(Mode.PAPER)
-    m._selection_consecutive_loss_count["BTC/USD"] = 2  # a prior streak
+    m._selection_consecutive_loss[PositionSide.LONG]["BTC/USD"] = 2  # a prior streak (long wallet)
     _open_paper_long(m, atr="500", emergsl=None)        # threshold 750
     # bid 66000 is favorable for a long; force a regime-style profitable close directly.
     m.update_selection_state_on_close("BTC/USD", is_win=True)
@@ -663,3 +667,53 @@ def test_l1a_is_noop_in_live_mode():
     m.on_regime_classified("BTC/USD", _trending_neg(), bid="61000", ask="61100")
     m.on_htf_ohlc_close("BTC/USD", "99", "100", bid="61000", ask="61100")
     assert m.exit_controller is None
+
+
+# -- two independent per-module wallets (mod:Long_Module + mod:Short_Module, sec 7) ----
+
+def test_paper_mode_builds_two_independent_wallets():
+    m = WSManager(Mode.PAPER)
+    assert set(m.modules) == {PositionSide.LONG, PositionSide.SHORT}
+    assert m.modules[PositionSide.LONG] is not m.modules[PositionSide.SHORT]
+    assert m.wallet_balance(PositionSide.LONG) == Decimal("5000.0")
+    assert m.wallet_balance(PositionSide.SHORT) == Decimal("5000.0")
+
+
+def test_short_entry_fill_hits_only_the_short_wallet():
+    m = WSManager(Mode.PAPER)
+    # a SHORT sell-to-open CREDITS the short wallet (proceeds net of taker + margin open fee);
+    # the long wallet is untouched - per-wallet isolation (sec 7 / Gate-7).
+    m.apply_paper_entry_fill("BTC/USD", "0.05", "60000", is_short=True)
+    assert m.wallet_balance(PositionSide.SHORT) > Decimal("5000.0")   # credited
+    assert m.wallet_balance(PositionSide.LONG) == Decimal("5000.0")   # untouched
+    # the back-compat spot_usd_balance still reads the LONG wallet.
+    assert m.spot_usd_balance == Decimal("5000.0")
+
+
+def test_long_entry_fill_hits_only_the_long_wallet():
+    m = WSManager(Mode.PAPER)
+    m.apply_paper_entry_fill("BTC/USD", "0.05", "60000")  # long debit (is_short default False)
+    assert m.wallet_balance(PositionSide.LONG) == Decimal("1992.2")
+    assert m.wallet_balance(PositionSide.SHORT) == Decimal("5000.0")  # untouched
+
+
+def test_fees_entry_routed_to_the_owning_wallet():
+    m = WSManager(Mode.PAPER)
+    m.apply_paper_entry_fill("ETH/USD", "1", "3000", is_short=True)   # short wallet holds the fee
+    assert m.fees_entry_for("ETH/USD") is not None
+    assert m.modules[PositionSide.SHORT].ledger.fees_entry_for("ETH/USD") is not None
+    assert m.modules[PositionSide.LONG].ledger.fees_entry_for("ETH/USD") is None
+
+
+def test_selection_state_is_per_side():
+    m = WSManager(Mode.PAPER)
+    m.update_selection_state_on_close("BTC/USD", is_win=False, side=PositionSide.SHORT)
+    m.update_selection_state_on_close("BTC/USD", is_win=False, side=PositionSide.SHORT)
+    assert m.consecutive_loss_count("BTC/USD", PositionSide.SHORT) == 2
+    assert m.consecutive_loss_count("BTC/USD", PositionSide.LONG) == 0   # the long counter is its own
+
+
+def test_paper_starting_balance_override_seeds_both_wallets():
+    m = WSManager(Mode.PAPER, paper_starting_balance="7500")
+    assert m.wallet_balance(PositionSide.LONG) == Decimal("7500")
+    assert m.wallet_balance(PositionSide.SHORT) == Decimal("7500")
