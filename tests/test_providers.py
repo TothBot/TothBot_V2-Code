@@ -19,7 +19,14 @@ from tothbot.exchange.bbo_cache import BboCache
 from tothbot.exchange.instrument_cache import InstrumentCache
 from tothbot.exchange.liquidity_cache import LiquidityCache
 from tothbot.exchange.position_mirror import PositionSide
-from tothbot.pipeline.providers import make_deadline, make_live_providers, new_cl_ord_id
+from tothbot.exchange.silent_pair import SilentPairMachine
+from tothbot.pipeline.providers import (
+    WS_STATE_SUBSCRIBED,
+    make_deadline,
+    make_live_providers,
+    make_ws_state_provider,
+    new_cl_ord_id,
+)
 from tothbot.pipeline.sweep import ProviderNotReady, sweep_pair
 from tothbot.regime.taxonomy import Regime
 from tothbot.exchange.candle_close import CommittedCandle
@@ -108,6 +115,46 @@ def test_cl_ord_id_unique():
 def test_deadline_is_now_plus_offset_iso_z():
     clock = lambda: datetime(2026, 6, 15, 7, 30, 0, tzinfo=timezone.utc)
     assert make_deadline(clock, offset_sec=5)() == "2026-06-15T07:30:05.000Z"
+
+
+# --------------------------------------------------------------------------- ws_state provider
+def _machine(clock):
+    return SilentPairMachine(clock=clock)
+
+
+def test_ws_state_subscribed_after_ack():
+    m = _machine(lambda: 0.0)
+    m.mark_subscribed(now=0.0)  # INITIAL -> SUBSCRIBED
+    provider = make_ws_state_provider({"BTC/USD": m}.get)
+    assert provider("BTC/USD") == WS_STATE_SUBSCRIBED
+
+
+def test_ws_state_subscribed_after_data_ready():
+    m = _machine(lambda: 0.0)
+    m.mark_subscribed(now=0.0)
+    m.mark_data(now=1.0)  # SUBSCRIBED -> DATA_READY
+    provider = make_ws_state_provider({"BTC/USD": m}.get)
+    assert provider("BTC/USD") == WS_STATE_SUBSCRIBED
+
+
+def test_ws_state_initial_is_not_subscribed():
+    m = _machine(lambda: 0.0)  # never ACKed: INITIAL
+    provider = make_ws_state_provider({"BTC/USD": m}.get)
+    assert provider("BTC/USD") != WS_STATE_SUBSCRIBED
+
+
+def test_ws_state_data_pending_is_not_subscribed():
+    m = _machine(lambda: 0.0)
+    m.mark_subscribed(now=0.0)
+    m.evaluate(now=100.0)  # > T_silent (60s) -> DATA_PENDING
+    assert m.is_data_pending
+    provider = make_ws_state_provider({"BTC/USD": m}.get)
+    assert provider("BTC/USD") != WS_STATE_SUBSCRIBED
+
+
+def test_ws_state_missing_machine_is_not_subscribed():
+    provider = make_ws_state_provider({}.get)  # pair not tracked
+    assert provider("BTC/USD") != WS_STATE_SUBSCRIBED
 
 
 # --------------------------------------------------------------------------- sweep skip
