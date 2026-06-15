@@ -75,12 +75,14 @@ class SssComputeError(ValueError):
     """Insufficient committed candles to seed the SSS indicators (< sss_ema_long)."""
 
 
-def rsi_14(closes: Sequence[object], period: int = _RSI_PERIOD) -> Decimal:
-    """indicator:RSI - the final Wilder RSI(period) over a committed close series (ar:AR-076).
+def rsi_state(closes: Sequence[object], period: int = _RSI_PERIOD) -> tuple[Decimal, Decimal]:
+    """The Wilder running (avg_gain, avg_loss) after the full committed close series (ar:AR-076).
 
-    Needs at least period + 1 closes (period deltas to seed). Applies the HR-SSS-004 division
-    guard for a zero average loss (RSI 100 on pure gains, 50 on a flat series).
-    """
+    This is the incremental RSI state the WS-Manager maintains per ar:AR-075 (the per-symbol
+    state dict's rsi_14_avg_gain / rsi_14_avg_loss): seeded over the first `period` deltas, then
+    stepped one delta at a time. Computed here in batch over the warm-up series; the live
+    maintainer seeds from this and steps with the identical recurrence (the two are bit-identical
+    by construction). Needs at least period + 1 closes (period deltas to seed)."""
     c = [_dec(x) for x in closes]
     if len(c) < period + 1:
         raise SssComputeError(f"RSI({period}) needs at least {period + 1} closes, got {len(c)}")
@@ -91,13 +93,36 @@ def rsi_14(closes: Sequence[object], period: int = _RSI_PERIOD) -> Decimal:
     avg_gain = sum(gains[:period], Decimal(0)) / period
     avg_loss = sum(losses[:period], Decimal(0)) / period
     for g, l in zip(gains[period:], losses[period:]):
-        avg_gain = (avg_gain * (period - 1) + g) / period
-        avg_loss = (avg_loss * (period - 1) + l) / period
+        avg_gain = step_rsi_state(avg_gain, g, period)
+        avg_loss = step_rsi_state(avg_loss, l, period)
+    return avg_gain, avg_loss
 
-    if avg_loss == 0:
-        return Decimal(100) if avg_gain > 0 else Decimal(50)
-    rs = avg_gain / avg_loss
+
+def step_rsi_state(prev_avg: object, delta: object, period: int = _RSI_PERIOD) -> Decimal:
+    """One Wilder SMMA step of a running avg_gain/avg_loss (ar:AR-076): O(1) per candle close.
+
+    avg = (prev_avg * (period - 1) + delta) / period. The single recurrence used by both the
+    batch seed loop above and the live per-candle maintainer (no divergence)."""
+    return (_dec(prev_avg) * (period - 1) + _dec(delta)) / period
+
+
+def rsi_from_state(avg_gain: object, avg_loss: object) -> Decimal:
+    """indicator:RSI from the running Wilder (avg_gain, avg_loss) with the HR-SSS-004 guard.
+
+    avg_loss == 0 and avg_gain > 0 -> RSI 100; both 0 (flat) -> RSI 50; else 100 - 100/(1+RS)."""
+    ag, al = _dec(avg_gain), _dec(avg_loss)
+    if al == 0:
+        return Decimal(100) if ag > 0 else Decimal(50)
+    rs = ag / al
     return Decimal(100) - Decimal(100) / (Decimal(1) + rs)
+
+
+def rsi_14(closes: Sequence[object], period: int = _RSI_PERIOD) -> Decimal:
+    """indicator:RSI - the final Wilder RSI(period) over a committed close series (ar:AR-076).
+
+    Needs at least period + 1 closes (period deltas to seed). Applies the HR-SSS-004 division
+    guard for a zero average loss (RSI 100 on pure gains, 50 on a flat series)."""
+    return rsi_from_state(*rsi_state(closes, period))
 
 
 def volume_ma_20(volumes: Sequence[object], period: int = _VOLUME_MA_PERIOD) -> Decimal:
@@ -177,6 +202,57 @@ class SssVerdict:
         return "SIGNAL_PASS" if self.passed else "SIGNAL_REJECTED"
 
 
+def _resolve_rsi_bounds(
+    side: SignalSide, rsi_low: object | None, rsi_high: object | None
+) -> tuple[object, object]:
+    """Default rsi_low / rsi_high to the side's registry seeds (long 30/50, short 70/50)."""
+    if rsi_low is not None and rsi_high is not None:
+        return rsi_low, rsi_high
+    if side is SignalSide.LONG:
+        return _RSI_LONG_LOW, _RSI_LONG_HIGH
+    return _RSI_SHORT_LOW, _RSI_SHORT_HIGH
+
+
+def sss_verdict_from_indicators(
+    symbol: str,
+    *,
+    side: SignalSide,
+    rsi: object,
+    ema9: object,
+    ema21: object,
+    volume: object,
+    volume_ma20: object,
+    rsi_low: object | None = None,
+    rsi_high: object | None = None,
+    volume_threshold: object = _VOLUME_THRESHOLD,
+) -> SssVerdict:
+    """Build the SssVerdict from already-computed indicator scalars - the LIVE path (ar:AR-075).
+
+    The WS-Manager maintains rsi_14 / ema_9 / ema_21 / volume_ma_20 as incremental running
+    values per ar:AR-016/AR-075 and serves them to the gates WITHOUT recomputation (the Pre-Step-2
+    pre-computation cache read). This applies the identical three-factor PASS rule the batch
+    evaluate_sss uses, so the live verdict is bit-identical to the batch verdict over the same
+    committed history. `volume` is the current (signal) candle's volume vs the running MA(20)."""
+    rsi_low, rsi_high = _resolve_rsi_bounds(side, rsi_low, rsi_high)
+    sc1, sc2, sc3 = three_factor_pass(
+        rsi, ema9, ema21, volume, volume_ma20,
+        side=side, rsi_low=rsi_low, rsi_high=rsi_high, volume_threshold=volume_threshold,
+    )
+    return SssVerdict(
+        symbol=symbol,
+        side=side,
+        rsi_14=_dec(rsi),
+        ema9=_dec(ema9),
+        ema21=_dec(ema21),
+        ema_cross=sc2,
+        volume=_dec(volume),
+        volume_ma20=_dec(volume_ma20),
+        volume_vs_ma20=sc3,
+        sc_sss=(sc1, sc2, sc3),
+        passed=sc1 and sc2 and sc3,
+    )
+
+
 def evaluate_sss(
     symbol: str,
     closes: Sequence[object],
@@ -191,9 +267,11 @@ def evaluate_sss(
 ) -> SssVerdict:
     """Run the SSS Signal Engine on one pair's committed 5-minute candle series for one side.
 
-    Computes RSI(14), EMA9, EMA21, VolumeMA20 over the committed closes/volumes and applies the
-    three-factor PASS rule. rsi_low / rsi_high default to the side's registry seeds (long
-    30/50, short 70/50). Requires >= ema_long (21) committed candles, else SssComputeError.
+    The BATCH path: computes RSI(14), EMA9, EMA21, VolumeMA20 over the committed closes/volumes
+    and applies the three-factor PASS rule via sss_verdict_from_indicators (one verdict path).
+    rsi_low / rsi_high default to the side's registry seeds (long 30/50, short 70/50). Requires
+    >= ema_long (21) committed candles, else SssComputeError. The live maintainer
+    (LiveIndicators) seeds from this same math and steps incrementally per ar:AR-016/AR-075.
     """
     n = len(closes)
     if n < int(ema_long) or len(volumes) < _VOLUME_MA_PERIOD:
@@ -202,32 +280,15 @@ def evaluate_sss(
             f"({int(ema_long)} closes, {_VOLUME_MA_PERIOD} volumes)"
         )
 
-    if rsi_low is None or rsi_high is None:
-        if side is SignalSide.LONG:
-            rsi_low, rsi_high = _RSI_LONG_LOW, _RSI_LONG_HIGH
-        else:
-            rsi_low, rsi_high = _RSI_SHORT_LOW, _RSI_SHORT_HIGH
-
-    rsi = rsi_14(closes)
-    ema9 = ema(closes, int(ema_short))
-    ema21 = ema(closes, int(ema_long))
-    vma = volume_ma_20(volumes)
-    current_volume = _dec(volumes[-1])
-
-    sc1, sc2, sc3 = three_factor_pass(
-        rsi, ema9, ema21, current_volume, vma,
-        side=side, rsi_low=rsi_low, rsi_high=rsi_high, volume_threshold=volume_threshold,
-    )
-    return SssVerdict(
-        symbol=symbol,
+    return sss_verdict_from_indicators(
+        symbol,
         side=side,
-        rsi_14=rsi,
-        ema9=ema9,
-        ema21=ema21,
-        ema_cross=sc2,
-        volume=current_volume,
-        volume_ma20=vma,
-        volume_vs_ma20=sc3,
-        sc_sss=(sc1, sc2, sc3),
-        passed=sc1 and sc2 and sc3,
+        rsi=rsi_14(closes),
+        ema9=ema(closes, int(ema_short)),
+        ema21=ema(closes, int(ema_long)),
+        volume=_dec(volumes[-1]),
+        volume_ma20=volume_ma_20(volumes),
+        rsi_low=rsi_low,
+        rsi_high=rsi_high,
+        volume_threshold=volume_threshold,
     )
