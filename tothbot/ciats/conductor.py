@@ -50,8 +50,10 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 
+from ..config import registry
 from .pdca_engine import PdcaEngine, PlanBlocked
 from .proposal_engine import (
+    MAE_MULT_PARAM,
     PER_TRADE_SIZE_PARAM,
     IdentifiedCandidate,
     KellyNegative,
@@ -59,6 +61,8 @@ from .proposal_engine import (
     ParameterChangeProposal,
     ProposalEngine,
     identify_spearman_candidate,
+    plan_entry_filter_proposal,
+    plan_stop_width_proposal,
 )
 from .shadow_replay import build_shadow_evaluator
 from .statistical_engine import cusum_lower
@@ -97,6 +101,21 @@ class ApprovalRequested:
     check: object | None
     kind: str
     code: str = field(default="CIATS_APPROVAL_REQUESTED", init=False)
+
+
+@dataclass(frozen=True)
+class DeferredCandidate:
+    """evt:CIATS_CANDIDATE_DEFERRED [INFO] - an IDENTIFIED PLAN candidate that has no faithful
+    testable mapping yet, so it is FILED to the report track (the contract:Operator_Reporting_
+    Hierarchy periodic PULL reports, NOT a C1 alert), never sham-tested (Bill's directive: a not-yet-
+    testable theory is REPORTED, not brought for a decision). Today this is the ema level->period
+    candidate (a stored level cannot re-decide a period change), an entry-filter direction a single
+    bound cannot express, or a candidate with too few losing samples. Carries the IdentifiedCandidate
+    + the reason it was deferred."""
+
+    candidate: object
+    reason: str
+    code: str = field(default="CIATS_CANDIDATE_DEFERRED", init=False)
 
 
 @dataclass
@@ -249,13 +268,14 @@ class CiatsConductor:
                                   wallet_balance is None (live mode has no synthetic wallet; the seed
                                   sizing stands). current_size is read from THIS module's store.
           3. scan_drift         - the HR-CI-007 net-P/L CUSUM out-of-cycle PLAN trigger (DETECT/emit).
-                                  On a drift signal the PLAN candidate is IDENTIFIED via the Spearman gate
-                                  over the per-trade signal_params level series (now in the corpus, wired
-                                  TB00750 a/b) and SURFACED (evt:CIATS_PLAN_CANDIDATE). Constructing the
-                                  owned-parameter proposal open_pdca writes - mapping the identified
-                                  signal_params level to its owned threshold + deriving the proposed value
-                                  (magnitude/direction) - is an unspecified design decision the diagram
-                                  does not derive: surfaced for a ruling, never fabricated into a write.
+                                  On a drift signal plan_from_drift runs the FORM -> TEST -> ROUTE loop
+                                  (Bill's TB00750 directive): for each TESTABLE dial it FORMS a data-
+                                  derived candidate, TESTS it via open_pdca (the real shadow replay +
+                                  CHECK), and ROUTES by result - a CHECK pass STAGES it for the HR-CI-011
+                                  C1 alert (profitable -> brought to Bill), a fail emits the CheckResult
+                                  (unprofitable -> the report track). A not-yet-testable entry-filter
+                                  candidate is FILED to the report track (DeferredCandidate), never sham-
+                                  tested. The sacred R:R is never a candidate.
           4. on_inter_trade_boundary - poll the operator inbox + APPLY any Bill-approved change at this
                                   confirmed boundary (never auto-applied).
 
@@ -270,13 +290,10 @@ class CiatsConductor:
             )
         drift = self.scan_drift()
         if drift is not None:
-            # The drift-triggered PLAN: identify the Spearman candidate over the per-trade signal_params
-            # level series (now in the corpus) and SURFACE it (evt:CIATS_PLAN_CANDIDATE). The open_pdca
-            # construction - the owned-threshold mapping + the proposed value - awaits a design ruling, so
-            # the candidate is surfaced to Bill, never fabricated into a write.
-            candidate = self.identify_drift_candidate()
-            if candidate is not None:
-                self._emit(candidate)
+            # The drift-triggered FORM -> TEST -> ROUTE loop (Bill's TB00750 directive): test each
+            # testable dial off the running close + file any not-yet-testable candidate to the report
+            # track. The two-track routing lives in open_pdca; this feeds it real testable candidates.
+            self.plan_from_drift()
         applied = self.on_inter_trade_boundary(inbox) if inbox is not None else []
         return kelly, drift, applied
 
@@ -335,6 +352,72 @@ class CiatsConductor:
         construct an owned-parameter proposal or a proposed value (the level-to-owned-threshold mapping +
         the magnitude/direction are an unspecified design decision, surfaced - never fabricated)."""
         return identify_spearman_candidate(self._records)
+
+    def _resolve_mae_mult(self) -> Decimal:
+        """The module's current mae_mult: the CIATS-owned store value if written, else the registry
+        seed (the stop-width theory needs the current value to nudge from)."""
+        owned = self._store.get(MAE_MULT_PARAM)
+        return _dec(owned if owned is not None else registry.value(MAE_MULT_PARAM))
+
+    def _side(self) -> str:
+        """The module's trading side token ('long' / 'short') for the entry-filter bound mapping."""
+        return "short" if "short" in self._module.lower() else "long"
+
+    def plan_from_drift(self, *, current_mae_mult: object = None) -> list:
+        """The drift-triggered FORM -> TEST -> ROUTE loop (Bill's TB00750 directive). For each TESTABLE
+        dial FORM a data-derived candidate, TEST it via open_pdca (the real shadow replay + the absolute
+        CHECK), and ROUTE by result; FILE any not-yet-testable entry-filter candidate to the report
+        track (never sham-tested). Returns the list of routed outcomes (an ApprovalRequested = the C1
+        alert track / a CheckResult = the report track / a DeferredCandidate = filed pending a mapping /
+        a PlanBlocked). The two-track routing already lives in open_pdca; this feeds it real candidates.
+
+          Track 1 - the STOP-LOSS-WIDTH dial (fully testable today): correlate each trade's heat-taken
+            (mae_pct_reached) against its outcome; on a qualifying Spearman FORM a mae_mult nudge (data-
+            derived direction, bounded seed magnitude) and TEST it (shadow_replay scales the losses).
+          Track 2 - the ENTRY-FILTER candidate identified over the per-trade signal_params LEVELS: map
+            it to an owned SSS threshold + a data-derived bound and TEST it via the entry re-simulation
+            (re-decide "would this trade have been entered"); an ema-period / unexpressible candidate is
+            FILED to the report track (DeferredCandidate) instead.
+
+        The sacred 1:1.5 R:R is never a candidate; nothing is applied without Bill's approval."""
+        outcomes: list = []
+
+        # Track 1: the stop-loss-width dial (mae_pct_reached -> mae_mult).
+        cur = current_mae_mult if current_mae_mult is not None else self._resolve_mae_mult()
+        theory = plan_stop_width_proposal(self._records, current_mae_mult=cur)
+        if theory is not None:
+            outcomes.append(
+                self.open_pdca(
+                    theory.proposal,
+                    spearman_xy=(theory.levels, theory.outcomes),
+                    out_of_cycle=True,
+                )
+            )
+
+        # Track 2: the entry-filter candidate over the signal_params level series.
+        candidate = self.identify_drift_candidate()
+        if candidate is not None:
+            self._emit(candidate)  # always SURFACE the identification (evt:CIATS_PLAN_CANDIDATE)
+            proposal = plan_entry_filter_proposal(self._records, candidate, side=self._side())
+            if proposal is not None:
+                outcomes.append(
+                    self.open_pdca(
+                        proposal,
+                        spearman_xy=(candidate.levels, candidate.outcomes),
+                        out_of_cycle=True,
+                    )
+                )
+            else:
+                deferred = DeferredCandidate(
+                    candidate=candidate,
+                    reason=(
+                        "no faithful testable mapping (ema level->period, an unexpressible single-bound "
+                        "direction, or too few losing samples) - filed to the report track"
+                    ),
+                )
+                self._emit(deferred)
+                outcomes.append(deferred)
+        return outcomes
 
     def _current_value(self, proposal: object) -> object:
         """The candidate parameter's current (pre-change) value the DO replay's scale ratio needs:

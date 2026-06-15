@@ -21,6 +21,7 @@ from tothbot.ciats.conductor import (
     ApprovalInbox,
     ApprovalRequested,
     CiatsConductor,
+    DeferredCandidate,
     DriftSignal,
     shadow_cohorts,
 )
@@ -425,6 +426,79 @@ def test_boundary_consumes_a_bill_rejection():
     assert len(outcomes) == 1 and isinstance(outcomes[0], PlanBlocked)
     assert inbox.decision(req.request_id) is None  # the rejection was consumed (not re-applied)
     assert conductor._store.get("per_trade_size_usd") is None  # never written
+
+
+# ------------------------------------------------ the drift-triggered FORM->TEST->ROUTE loop (TB00751 b)
+def _heat_close(net_pl, heat, **sp):
+    """A TRADE_CLOSE-shaped record: net P/L + a heat-taken level (mae_pct_reached) + signal_params."""
+    n = Decimal(str(net_pl))
+    rec = _close(net_pl=str(n), net_gain=str(n) if n > 0 else "0", net_loss="0" if n > 0 else str(-n))
+    rec.mae_pct_reached = Decimal(str(heat))
+    if sp:
+        rec.signal_params = {k: Decimal(str(v)) for k, v in sp.items()}
+    return rec
+
+
+def _ingest(conductor, records):
+    for r in records:
+        conductor.ingest_close(r)
+
+
+def test_plan_from_drift_stages_a_stop_width_tighten_for_approval():
+    # Track 1: losers ran HOT (heat 5, -10) and winners ran COOL (heat 1, +5) -> heat predicts loss
+    # (rho < 0) -> a mae_mult TIGHTEN; the real replay scales the losses down -> CHECK passes -> a C1
+    # alert (ApprovalRequested) reaches Bill.
+    conductor, _, approvals = _make()
+    _ingest(conductor, [_heat_close(5, 1) for _ in range(100)]      # winners, cool
+                       + [_heat_close(-10, 5) for _ in range(100)])  # losers, hot
+    outcomes = conductor.plan_from_drift()
+    assert any(isinstance(o, ApprovalRequested) and o.check.passed for o in outcomes)
+    assert any(isinstance(a, ApprovalRequested) and a.proposal.param_name == "mae_mult" for a in approvals)
+
+
+def test_plan_from_drift_reports_a_stop_width_loosen_no_alert():
+    # Track 1, the report track: winners ran HOT and losers ran COOL -> heat predicts a WIN (rho > 0)
+    # -> a LOOSEN; the replay can only scale the losses UP (it cannot credit saved winners) -> CHECK
+    # fails -> the CheckResult is REPORTED (no ApprovalRequested, no C1 alert).
+    conductor, _, approvals = _make()
+    _ingest(conductor, [_heat_close(5, 5) for _ in range(100)]       # winners, hot
+                       + [_heat_close(-10, 1) for _ in range(100)])  # losers, cool
+    outcomes = conductor.plan_from_drift()
+    assert any(isinstance(o, CheckResult) and o.passed is False for o in outcomes)
+    assert not any(isinstance(a, ApprovalRequested) and a.proposal.param_name == "mae_mult" for a in approvals)
+
+
+def test_plan_from_drift_tests_a_volume_entry_filter_candidate():
+    # Track 2 (the entry re-simulation): low-volume trades lose (rho > 0) -> raise volume_sss_threshold
+    # to the loser-median; the re-gate replay EXCLUDES the low-volume losers -> CHECK passes -> alert.
+    conductor, _, approvals = _make()
+    # varied winner gains keep the post-exclusion cohort non-degenerate (real net P/L always varies).
+    _ingest(conductor, [_heat_close(5 if i % 2 else 6, 1, volume_ratio=2) for i in range(100)]  # high vol
+                       + [_heat_close(-10, 1, volume_ratio="1.2") for _ in range(100)])  # losers, low vol
+    conductor.plan_from_drift()
+    assert any(isinstance(a, ApprovalRequested) and a.proposal.param_name == "volume_sss_threshold"
+               for a in approvals)
+
+
+def test_plan_from_drift_files_a_deferred_ema_candidate_to_the_report_track():
+    # Track 2, the report track: an ema_9 level correlates with outcome but maps to a PERIOD, not a
+    # threshold -> not re-simulatable -> FILED (DeferredCandidate), never sham-tested.
+    conductor, events, approvals = _make()
+    _ingest(conductor, [_heat_close(i - 5, 1, ema_9=i) for i in range(12)])   # ema_9 tracks the outcome
+    outcomes = conductor.plan_from_drift()
+    deferred = [o for o in outcomes if isinstance(o, DeferredCandidate)]
+    assert len(deferred) == 1 and deferred[0].candidate.level_key == "ema_9"
+    assert any(isinstance(e, DeferredCandidate) for e in events)
+    assert not any(isinstance(a, ApprovalRequested) for a in approvals)   # not brought to Bill
+
+
+def test_on_close_runs_plan_from_drift_on_a_drift_signal():
+    # the full wiring: a degrading close fires scan_drift -> on_close runs plan_from_drift -> the
+    # stop-width tighten is staged off the running close (no manual plan_from_drift call).
+    conductor, _, approvals = _make(drift_monitor=_SustainedMon())
+    _ingest(conductor, [_heat_close(5, 1) for _ in range(100)] + [_heat_close(-10, 5) for _ in range(99)])
+    conductor.on_close(_heat_close(-10, 5))   # the 200th close fires drift -> plan_from_drift
+    assert any(isinstance(a, ApprovalRequested) and a.proposal.param_name == "mae_mult" for a in approvals)
 
 
 # --------------------------------------------------------------------------- the Gate-3 protective feed

@@ -333,8 +333,10 @@ def test_running_exit_applies_an_inbox_approved_change_at_the_boundary():
 # --------------------------------------------------------------------------- TB00749 (c): the running
 # close DRIVES the propose/detect cadence (stage to Bill + the drift trigger), through the wired sink
 
-def _close_record(net):
-    """A schema-valid 23-field TRADE_CLOSE for the corpus; net>0 = a win, net<0 = a loss."""
+def _close_record(net, *, heat=None, **sp):
+    """A schema-valid 23-field TRADE_CLOSE for the corpus; net>0 = a win, net<0 = a loss. `heat` is
+    the per-trade mae_pct_reached (field 11) the stop-width theory reads; **sp are signal_params
+    LEVELS the entry-filter theory reads."""
     n = Decimal(net)
     win = n > 0
     return TradeClose(
@@ -343,6 +345,8 @@ def _close_record(net):
         fees_entry_usd=Decimal("0"), fees_exit_usd=Decimal("0"), fees_total_usd=Decimal("0"),
         net_pl_usd=n, net_gain_usd=(n if win else Decimal("0")),
         net_loss_usd=(Decimal("0") if win else -n), asset_regime="TRENDING_POS_NORMAL",
+        mae_pct_reached=(Decimal(str(heat)) if heat is not None else None),
+        signal_params=({k: Decimal(str(v)) for k, v in sp.items()} or None),
     )
 
 
@@ -395,3 +399,41 @@ def test_running_closes_emit_a_drift_signal_on_degradation():
     for _ in range(10):
         sink(_close_record("-10"))                         # a sharp drop -> the net-P/L CUSUM breaches
     assert any(getattr(e, "code", None) == "CIATS_DRIFT_SIGNAL" for e in logger.operational)
+
+
+# ------------------------------------------------ TB00751 (b): the drift-triggered FORM->TEST->ROUTE
+# loop on the assembled real-wm organism - a tested stop-width tighten EMAILS Bill / a loosen REPORTS
+
+def _mae_alert(logger):
+    return [a for a in logger.alerts if getattr(a, "code", None) == "CIATS_APPROVAL_REQUESTED"
+            and getattr(getattr(a, "proposal", None), "param_name", None) == "mae_mult"]
+
+
+def test_running_closes_email_bill_a_tested_stop_width_tighten():
+    # FORM->TEST->ROUTE track 1 end-to-end through the wired ciats_sink: losers ran HOT and winners
+    # COOL -> heat predicts loss -> on the drift signal plan_from_drift FORMS a mae_mult TIGHTEN, the
+    # REAL shadow replay scales the losses down -> the absolute CHECK passes -> a C1 alert
+    # (ApprovalRequested for mae_mult) reaches mod:Logger.alerts (the HR-RPT-001 push to Bill).
+    system, _wm, logger = _assemble_real_wm()
+    sink = system.ciats_sinks[PositionSide.LONG]
+    for _ in range(120):
+        sink(_close_record("5", heat=1))                   # winners, cool
+    for _ in range(80):
+        sink(_close_record("-10", heat=5))                 # losers, hot -> 200 + the CUSUM breaches
+    assert _mae_alert(logger)                               # the tested tighten was brought to Bill
+    assert system.conductors[PositionSide.SHORT].trade_count == 0   # the short loop is isolated
+
+
+def test_running_closes_report_a_stop_width_loosen_without_alerting():
+    # track 1 report track: winners ran HOT, losers COOL -> heat predicts a WIN -> a LOOSEN; the
+    # replay can only scale the losses UP (it cannot credit saved winners) -> CHECK fails -> the
+    # CheckResult is REPORTED into Stream-1 with NO mae_mult C1 alert (unprofitable -> reported).
+    system, _wm, logger = _assemble_real_wm()
+    sink = system.ciats_sinks[PositionSide.LONG]
+    for _ in range(120):
+        sink(_close_record("5", heat=5))                   # winners, hot
+    for _ in range(80):
+        sink(_close_record("-10", heat=1))                 # losers, cool
+    assert any(getattr(e, "code", None) == "PDCA_CHECK_RESULT" and getattr(e, "passed", None) is False
+               for e in logger.operational)                # the disproven theory is reported
+    assert not _mae_alert(logger)                          # never brought to Bill
