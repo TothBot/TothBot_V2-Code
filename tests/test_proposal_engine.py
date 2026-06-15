@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from tothbot.config import registry
 from tothbot.ciats.pool import CiatsPool
 from tothbot.ciats.proposal_engine import (
     KELLY_RECOMPUTE_INTERVAL,
@@ -18,7 +19,9 @@ from tothbot.ciats.proposal_engine import (
     KellyUpdate,
     ParameterChangeProposal,
     ProposalEngine,
+    StopWidthTheory,
     identify_spearman_candidate,
+    plan_stop_width_proposal,
 )
 
 
@@ -186,3 +189,58 @@ def test_identify_skips_a_degenerate_key_under_min_pairs():
     # only 2 records carry the key -> below min_pairs -> skipped (no spurious candidate).
     records = [_Rec({"rsi_14": Decimal(1)}, 1), _Rec({"rsi_14": Decimal(2)}, 2)]
     assert identify_spearman_candidate(records) is None
+
+
+# ---------------------------------------------------- stop-loss-width theory (mae_mult, TB00751 a)
+class _HeatRec:
+    """A minimal TRADE_CLOSE-shaped record: a heat-taken level (mae_pct_reached) + the net-P/L."""
+
+    def __init__(self, mae_pct_reached, net_pl):
+        self.mae_pct_reached = Decimal(str(mae_pct_reached))
+        self.net_pl_usd = Decimal(str(net_pl))
+
+
+def test_seed_mae_mult_nudge_pct_registered():
+    # the genuine new seed: a CIATS-owned per-module relative step, default 0.10 (10pct).
+    assert registry.value("mae_mult_nudge_pct") == 0.10
+
+
+def test_stop_width_tightens_when_more_heat_predicts_loss():
+    # heat rises as the outcome falls (rho = -1): more heat predicts a worse outcome -> TIGHTEN.
+    records = [_HeatRec(mae_pct_reached=i, net_pl=(20 - i)) for i in range(20)]
+    theory = plan_stop_width_proposal(records, current_mae_mult=Decimal("1.5"))
+    assert isinstance(theory, StopWidthTheory)
+    assert theory.tighten is True
+    assert theory.rho < 0
+    assert theory.proposal.param_name == "mae_mult"
+    assert theory.proposal.proposed_value == Decimal("1.5") * Decimal("0.9")   # 10pct tighter
+    assert len(theory.levels) == 20 and len(theory.outcomes) == 20             # the CHECK series
+
+
+def test_stop_width_loosens_when_more_heat_then_recovers():
+    # heat rises with the outcome (rho = +1): the trades that ran hot then recovered -> LOOSEN.
+    records = [_HeatRec(mae_pct_reached=i, net_pl=i) for i in range(20)]
+    theory = plan_stop_width_proposal(records, current_mae_mult=Decimal("1.5"))
+    assert isinstance(theory, StopWidthTheory)
+    assert theory.tighten is False
+    assert theory.proposal.proposed_value == Decimal("1.5") * Decimal("1.1")   # 10pct looser
+
+
+def test_stop_width_none_without_a_qualifying_correlation():
+    # a flat heat series -> no rank variance -> no monotone association -> no theory.
+    records = [_HeatRec(mae_pct_reached=1, net_pl=i) for i in range(20)]
+    assert plan_stop_width_proposal(records, current_mae_mult=Decimal("1.5")) is None
+
+
+def test_stop_width_none_without_enough_heat_samples():
+    # records carry no mae_pct_reached (heat unset) -> below min_pairs -> no theory (never crashes).
+    records = [_Rec({"rsi_14": Decimal(i)}, i) for i in range(20)]
+    assert plan_stop_width_proposal(records, current_mae_mult=Decimal("1.5")) is None
+
+
+def test_stop_width_honours_an_overridden_nudge():
+    records = [_HeatRec(mae_pct_reached=i, net_pl=(20 - i)) for i in range(20)]
+    theory = plan_stop_width_proposal(
+        records, current_mae_mult=Decimal("2.0"), nudge_pct=Decimal("0.25")
+    )
+    assert theory.proposal.proposed_value == Decimal("2.0") * Decimal("0.75")

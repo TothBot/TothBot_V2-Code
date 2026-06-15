@@ -26,6 +26,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 
+from ..config import registry
 from .pdca_engine import SACRED_RR_PARAM
 from .pool import CIATS_TRADE_FLOOR
 from .statistical_engine import spearman_significant
@@ -33,6 +34,15 @@ from .statistical_engine import spearman_significant
 # Kelly is recomputed every 50 closed trades after the 200-trade activation (HR-CI-004 / CI-KE-007).
 KELLY_RECOMPUTE_INTERVAL = 50
 PER_TRADE_SIZE_PARAM = "per_trade_size_usd"
+
+# The fully-testable stop-loss-width dial (TB00751 (a)): the L2 risk-leg multiplier param and the
+# per-trade heat-taken field (contract:TRADE_CLOSE field 11) the theory correlates against outcome.
+MAE_MULT_PARAM = "mae_mult"
+MAE_HEAT_FIELD = "mae_pct_reached"
+# The conservative RELATIVE step the stop-width theory nudges mae_mult by (the genuine new seed,
+# value home TB00000 sec 8 / 0500000 provenance). Direction is data-derived; only this magnitude is
+# a seed - see the registry note. NEVER applied to the sacred R:R.
+MAE_MULT_NUDGE_PCT = "mae_mult_nudge_pct"
 
 # The CONTINUOUS per-trade signal_params LEVEL keys the Spearman PLAN-candidate gate ranks against the
 # realized outcome (the SSS indicator levels the entry was taken under, contract:TRADE_CLOSE field 19).
@@ -132,6 +142,82 @@ def identify_spearman_candidate(
                 levels=tuple(levels), outcomes=tuple(outcomes),
             )
     return best
+
+
+@dataclass(frozen=True)
+class StopWidthTheory:
+    """The mae_mult stop-loss-width theory FORMED from the corpus (TB00751 (a)) - a fully testable
+    dial. proposal is the candidate mae_mult ParameterChangeProposal; (levels, outcomes) is the
+    per-trade (heat, net-P/L) series the open_pdca CHECK corroborates (the Spearman gate input); rho
+    is the heat-vs-outcome rank correlation; tighten is the data-derived direction (True = more heat
+    predicts a worse outcome -> a TIGHTER stop; False = the converse -> a LOOSER stop)."""
+
+    proposal: ParameterChangeProposal
+    levels: tuple
+    outcomes: tuple
+    rho: Decimal
+    tighten: bool
+
+
+def _record_heat(record: object) -> Decimal | None:
+    """The per-trade heat-taken of a TRADE_CLOSE record (field 11 mae_pct_reached), or None if the
+    field is absent / unset (the at-exit MAE until the max-over-life MTM tracker lands)."""
+    value = getattr(record, MAE_HEAT_FIELD, None)
+    return None if value is None else _dec(value)
+
+
+def plan_stop_width_proposal(
+    records: Sequence[object],
+    *,
+    current_mae_mult: object,
+    nudge_pct: object | None = None,
+    min_pairs: int = 3,
+) -> "StopWidthTheory | None":
+    """FORM the stop-loss-width theory from the Stream-2 corpus (PURE; the fully-testable dial). For
+    every record carrying a heat-taken level (mae_pct_reached, field 11) build the aligned (heat,
+    net-P/L) pairs and run the CIATS Spearman gate (|rho| > 0.3 AND p < 0.05). On a qualifying
+    correlation propose a mae_mult change: rho < 0 (MORE heat predicts a WORSE outcome) TIGHTENS the
+    stop (mae_mult * (1 - nudge)); rho > 0 (heat then recovers to a better outcome) LOOSENS it
+    (mae_mult * (1 + nudge)). Returns a StopWidthTheory (proposal + the Spearman series + direction)
+    or None (no qualifying correlation / < min_pairs paired heat samples).
+
+    The DIRECTION is fully data-derived (the Spearman sign); only the MAGNITUDE is the bounded seed
+    nudge_pct (registry mae_mult_nudge_pct - mae_mult is an ATR multiple while heat is a price
+    fraction, so an exact data value is not derivable; the PDCA CHECK + Bill approval gate every
+    application). NEVER the sacred R:R (mae_mult is a CIATS-owned stop leg, never the 1:1.5 floor)."""
+    step = _dec(registry.value(MAE_MULT_NUDGE_PCT) if nudge_pct is None else nudge_pct)
+    levels: list = []
+    outcomes: list = []
+    for record in records:
+        heat = _record_heat(record)
+        if heat is None:
+            continue
+        out = _record_net_pl(record)
+        if out is None:
+            continue
+        levels.append(heat)
+        outcomes.append(out)
+    if len(levels) < min_pairs:
+        return None
+    rho, qualifies = spearman_significant(levels, outcomes)
+    if not qualifies:
+        return None
+    cur = _dec(current_mae_mult)
+    tighten = rho < _ZERO
+    factor = (_ONE - step) if tighten else (_ONE + step)
+    direction = "tighten" if tighten else "loosen"
+    proposal = ParameterChangeProposal(
+        param_name=MAE_MULT_PARAM,
+        current_value=cur,
+        proposed_value=cur * factor,
+        rationale=(
+            f"stop-width drift: heat~outcome Spearman rho={rho} -> {direction} mae_mult by "
+            f"{step} (data-derived direction, bounded seed nudge)"
+        ),
+    )
+    return StopWidthTheory(
+        proposal=proposal, levels=tuple(levels), outcomes=tuple(outcomes), rho=rho, tighten=tighten
+    )
 
 
 @dataclass(frozen=True)

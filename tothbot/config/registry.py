@@ -113,6 +113,21 @@ REGISTRY: tuple[Param, ...] = (
     Param("cancel_timeout_window", 5.0, _C, _M, "s", ""),
     Param("mpp_retry_count", 3, _C, _M, "count", ""),
 
+    # -- CIATS: self-tuning step (the FORM->TEST->ROUTE loop's bounded magnitude) --
+    Param(
+        "mae_mult_nudge_pct", 0.10, _C, _M, "fraction",
+        "The conservative RELATIVE step CIATS nudges param:mae_mult by per "
+        "qualifying stop-width drift signal (TB00751 FORM->TEST->ROUTE loop). The "
+        "DIRECTION is data-derived - the sign of the Spearman heat-vs-outcome "
+        "correlation - tighten mae_mult when more heat predicts a worse outcome, "
+        "loosen on the converse. Only this MAGNITUDE is a seed: mae_mult is an "
+        "ATR(14) multiple while mae_pct_reached is a price fraction, and the "
+        "per-trade ATR is NOT stored on the contract:TRADE_CLOSE record, so an "
+        "exact data-derived mae_mult value cannot be computed - a bounded 10pct "
+        "nudge stands in, and every application is gated by the PDCA CHECK + Bill "
+        "approval HR-CI-011. NEVER the sacred R:R. CIATS-owned, refined from paper.",
+    ),
+
     # -- CIATS: run-to-reversal expected-reward estimator (DEC-124) ----
     Param(
         "expected_reward_estimator_seed", None, _C, _M, "fraction of entry_fill_price",
