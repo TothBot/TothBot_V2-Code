@@ -168,6 +168,11 @@ class WSManager:
         self._selection_cooldown: dict[PositionSide, dict[str, float]] = {
             PositionSide.LONG: {}, PositionSide.SHORT: {},
         }
+        # Pending Order Registry (ar:AR-053 / UT-EE-010): the entry-time D6 snapshot
+        # (emergsl_price + atr_14_entry + regime_at_entry) stashed per symbol at entry dispatch,
+        # so record_execution can attach it to the position at the opening fill (the snapshot is
+        # TothBot-internal context, not on the Kraken wire frame). Cleared once the entry resolves.
+        self._pending_entries: dict[str, dict] = {}
         # Per-pair ticker event_trigger mode (WS-TKR-003); a pair appears here once it has
         # carried an open position (default trades elsewhere).
         self._ticker_event_trigger: dict[str, str] = {}
@@ -286,7 +291,19 @@ class WSManager:
         The write source diverged by mode upstream (PA-004 div #4); the frame reaches
         here byte-identical in both paper and live. atr_14_entry + emergsl_price are the
         D6 entry-time snapshot the sole writer attaches when OPENING (dv1_242), read later
-        by the Exit Controller for L2 MAE / L3 emergSL detection."""
+        by the Exit Controller for L2 MAE / L3 emergSL detection. When the snapshot is not
+        passed explicitly (the paper simulator records the bare Kraken frame), it is taken from
+        the Pending Order Registry stashed at entry dispatch (AR-053) so the opening fill still
+        carries it."""
+        symbol = _opt_str(event.get("symbol"))
+        pending = self._pending_entries.get(symbol) if symbol is not None else None
+        if pending is not None:
+            if regime_at_entry is None:
+                regime_at_entry = pending.get("regime_at_entry")
+            if atr_14_entry is None:
+                atr_14_entry = pending.get("atr_14_entry")
+            if emergsl_price is None:
+                emergsl_price = pending.get("emergsl_price")
         outcome = self.positions.apply_execution(
             event,
             writer=WRITER_ID,
@@ -383,6 +400,68 @@ class WSManager:
             if fee is not None:
                 return fee
         return None
+
+    # --- the ENTRY dispatch flow (mod:Long_Module / mod:Short_Module -> shared seam) ---
+    async def dispatch_entry(
+        self,
+        side: PositionSide,
+        symbol: str,
+        *,
+        order_qty: object,
+        entry_limit_price: object,
+        emergsl_price: object,
+        atr_14_entry: object | None = None,
+        regime_at_entry: str | None = None,
+        cl_ord_id: str,
+        deadline: str,
+    ) -> bool:
+        """Dispatch a gate:G8-accepted entry for THIS side through the shared seam, then place
+        its on-fill emergSL. The marketable-IOC entry fills-or-kills atomically (AR-054): in
+        paper the simulator opens the position (record_execution attaches the Pending-Order-
+        Registry D6 snapshot) + moves THIS side's wallet (routed by the order side); on a fill
+        (UT-EE-005: batch_add ONLY on exec_type=filled) the off-book emergSL is placed (LONG
+        sell-stop below / SHORT buy-to-cover reduce_only above). Returns True if the entry
+        filled (a position opened). Everything traverses the seam (rule:HR-EE-013); a module
+        NEVER calls ws_private directly. Paper-mode entry flow (live entry is a later slice)."""
+        if self.modules is None:
+            raise RuntimeError(
+                "dispatch_entry is paper-mode only for now (the live entry path is a later slice)"
+            )
+        module = self.modules[side]
+        # Pending Order Registry (AR-053 / UT-EE-010): stash the entry-time D6 snapshot so the
+        # opening fill attaches it (emergsl_price for L3, atr_14_entry for L2, regime for tagging).
+        self._pending_entries[symbol] = {
+            "emergsl_price": emergsl_price,
+            "atr_14_entry": atr_14_entry,
+            "regime_at_entry": regime_at_entry,
+        }
+        try:
+            # 1. ENTRY add_order (marketable IOC) -> the side's wallet + the opening position.
+            await self.seam.add_order(
+                module.build_entry(
+                    symbol,
+                    order_qty=order_qty,
+                    entry_limit_price=entry_limit_price,
+                    cl_ord_id=cl_ord_id,
+                    deadline=deadline,
+                )
+            )
+            # 2. ON FILL: place the off-book emergSL (UT-EE-005). A zero-fill IOC opens nothing,
+            #    so there is nothing to protect - skip the batch_add.
+            filled = self.positions.has_position(symbol)
+            if filled:
+                await self.seam.batch_add(
+                    module.build_emergsl(
+                        symbol,
+                        order_qty=order_qty,
+                        emergsl_price=emergsl_price,
+                        cl_ord_id=f"{cl_ord_id}-sl",
+                        deadline=deadline,
+                    )
+                )
+            return filled
+        finally:
+            self._pending_entries.pop(symbol, None)
 
     # --- sec 12.5 close surfaces (the Exit Controller calls these through `wm`) -------
     def close_position(self, symbol: str) -> Position | None:

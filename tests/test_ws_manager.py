@@ -717,3 +717,48 @@ def test_paper_starting_balance_override_seeds_both_wallets():
     m = WSManager(Mode.PAPER, paper_starting_balance="7500")
     assert m.wallet_balance(PositionSide.LONG) == Decimal("7500")
     assert m.wallet_balance(PositionSide.SHORT) == Decimal("7500")
+
+
+# -- the ENTRY dispatch flow (G8 accepted -> entry add_order -> on-fill emergSL) --------
+
+def test_dispatch_entry_long_opens_position_places_emergsl_debits_long_wallet():
+    events: list = []
+    m = WSManager(Mode.PAPER, on_event=events.append)
+    filled = asyncio.run(m.dispatch_entry(
+        PositionSide.LONG, "BTC/USD",
+        order_qty="0.05", entry_limit_price="60000", emergsl_price="57000",
+        atr_14_entry="1000", regime_at_entry="TRENDING_POS_NORMAL",
+        cl_ord_id="cl-1", deadline="2026-06-15T07:30:00Z",
+    ))
+    assert filled is True
+    pos = m.position("BTC/USD")
+    assert pos is not None and pos.side is PositionSide.LONG
+    # the entry-time D6 snapshot was attached at the opening fill (Pending Order Registry).
+    assert pos.emergsl_price == Decimal("57000")        # L3 stop below entry
+    assert pos.atr_14_entry == Decimal("1000")          # L2 MAE basis
+    assert pos.regime_at_entry == "TRENDING_POS_NORMAL"
+    # the LONG wallet was debited (buy-to-open); the SHORT wallet is untouched.
+    assert m.wallet_balance(PositionSide.LONG) < Decimal("5000.0")
+    assert m.wallet_balance(PositionSide.SHORT) == Decimal("5000.0")
+    # both the entry add_order AND the on-fill emergSL batch_add traversed the seam.
+    ops = [e.op for e in events if isinstance(e, PaperOrderSimulated)]
+    assert OutboundOp.ADD_ORDER in ops and OutboundOp.BATCH_ADD in ops
+    # the pending registry was cleared after the entry resolved.
+    assert m._pending_entries == {}
+
+
+def test_dispatch_entry_short_opens_short_credits_short_wallet_emergsl_above():
+    m = WSManager(Mode.PAPER)
+    filled = asyncio.run(m.dispatch_entry(
+        PositionSide.SHORT, "BTC/USD",
+        order_qty="0.05", entry_limit_price="60000", emergsl_price="63000",
+        atr_14_entry="1000", regime_at_entry="TRENDING_NEG_NORMAL",
+        cl_ord_id="cl-2", deadline="2026-06-15T07:30:00Z",
+    ))
+    assert filled is True
+    pos = m.position("BTC/USD")
+    assert pos.side is PositionSide.SHORT              # sell-to-open opened a SHORT
+    assert pos.emergsl_price == Decimal("63000")       # buy-to-cover stop ABOVE entry
+    # the SHORT wallet was credited (sell-to-open proceeds); the LONG wallet is untouched.
+    assert m.wallet_balance(PositionSide.SHORT) > Decimal("5000.0")
+    assert m.wallet_balance(PositionSide.LONG) == Decimal("5000.0")
