@@ -57,10 +57,14 @@ GLOBAL_CHANNELS: tuple[PublicChannel, ...] = (
 )
 
 # Per-pair channels: each pair's subscriptions live on that pair's shard
-# (Image1 partitions ohlc(5m) + ticker by i%N). ohlc_5m on shard 0's partition
-# is the system clock.
+# (Image1 partitions ohlc(5m) + ohlc(60) + ticker by i%N). ohlc_5m on shard 0's
+# partition is the system clock; ohlc(60) is the 1H HTF feed that maintains the
+# EMA(20)/EMA(50) cache + drives the EC-L1A-001 1H reversal exit (Image1 "ohlc_5m
+# + ohlc_60"; "1H candle close ohlc(60) WS event"); ticker feeds the drawdown
+# monitor + sizing.
 PER_PAIR_CHANNELS: tuple[PublicChannel, ...] = (
     PublicChannel.OHLC_5M,
+    PublicChannel.OHLC_60M,
     PublicChannel.TICKER,
 )
 
@@ -93,7 +97,7 @@ class ShardAssignment:
     shard_index: int
     pairs: tuple[str, ...]                     # pairs whose per-pair channels this shard owns
     global_channels: tuple[PublicChannel, ...]  # instrument+status on shard 0, else empty
-    per_pair_channels: tuple[PublicChannel, ...]  # ohlc_5m + ticker (every shard)
+    per_pair_channels: tuple[PublicChannel, ...]  # ohlc_5m + ohlc_60 + ticker (every shard)
 
     @property
     def is_clock_shard(self) -> bool:

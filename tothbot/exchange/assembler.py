@@ -198,6 +198,7 @@ class DataLayerAssembler:
         bucket: SubscribeTokenBucket,
         coordinator: ShardReconnectCoordinator | None = None,
         handler_provider: HandlerProvider | None = None,
+        silent_pairs: dict[str, SilentPairMachine] | None = None,
         on_event: EventSink | None = None,
         clock: Clock = time.monotonic,
         sleep: Sleep = asyncio.sleep,
@@ -209,6 +210,11 @@ class DataLayerAssembler:
         self._bucket = bucket
         self._coordinator = coordinator or ShardReconnectCoordinator()
         self._handler_provider = handler_provider
+        # An optional SHARED silent-pair registry (pair -> machine). When the operational
+        # assembly injects one, the same machines back the ws_state provider (the G1 gate
+        # reads their subscription lifecycle); each shard takes its own pairs' machines from
+        # it. When None, each shard owns a fresh per-shard registry (the standalone bring-up).
+        self._silent_pairs_registry = silent_pairs
         self._on_event = on_event
         self._clock = clock
         self._sleep = sleep
@@ -271,9 +277,17 @@ class DataLayerAssembler:
         transport = await self._open_socket(k)
 
         keepalive = ConnectionKeepalive(clock=self._clock)
-        silent_pairs = {
-            pair: SilentPairMachine(clock=self._clock) for pair in assignment.pairs
-        }
+        if self._silent_pairs_registry is not None:
+            silent_pairs = {
+                pair: self._silent_pairs_registry.setdefault(
+                    pair, SilentPairMachine(clock=self._clock)
+                )
+                for pair in assignment.pairs
+            }
+        else:
+            silent_pairs = {
+                pair: SilentPairMachine(clock=self._clock) for pair in assignment.pairs
+            }
         dispatch = DispatchTable()
         if self._handler_provider is not None:
             for channel in (*assignment.global_channels, *assignment.per_pair_channels):

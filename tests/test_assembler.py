@@ -68,7 +68,7 @@ def test_subscribe_requests_count_matches_shard_subscribe_count():
     plan = ShardPlan(["BTC/USD", "ETH/USD", "SOL/USD"])
     assignment = plan.shards[0]
     reqs = subscribe_requests(assignment)
-    assert len(reqs) == assignment.subscribe_count == 2 + 3 * 2  # globals + pairs x 2
+    assert len(reqs) == assignment.subscribe_count == 2 + 3 * 3  # globals + pairs x 3 channels
     # Global channels (instrument, status) come first, on shard 0 only.
     assert reqs[0] == SubscribeRequest(PublicChannel.INSTRUMENT)
     assert reqs[1] == SubscribeRequest(PublicChannel.STATUS)
@@ -134,7 +134,7 @@ def test_initial_paced_subscribe_sends_every_request():
 # -- WM-PACE-001: the shared token bucket paces the subscribe storm ------
 
 def test_subscribe_blocks_on_empty_bucket_and_paces():
-    plan = ShardPlan(["BTC/USD", "ETH/USD", "SOL/USD"])  # 8 subscribe RPCs on 1 shard
+    plan = ShardPlan(["BTC/USD", "ETH/USD", "SOL/USD"])  # 11 subscribe RPCs on 1 shard
     open_socket, opened = _opener()
     events: list = []
     clk = {"t": 0.0}
@@ -152,11 +152,11 @@ def test_subscribe_blocks_on_empty_bucket_and_paces():
                              on_event=events.append, sleep=sleep)
     data = asyncio.run(asm.build())
 
-    # All 8 RPCs still get sent (no bypass, no drop) ...
-    assert len(opened[0][0].sent) == data.shards[0].assignment.subscribe_count == 8
+    # All 11 RPCs still get sent (no bypass, no drop) ...
+    assert len(opened[0][0].sent) == data.shards[0].assignment.subscribe_count == 11
     # ... but the bucket forced pace-waits after the initial burst of 2.
     waits = [e for e in events if isinstance(e, SubscribePaceWait)]
-    assert len(waits) == 8 - 2  # 6 requests had to wait for a token
+    assert len(waits) == 11 - 2  # 9 requests had to wait for a token
     assert all(w.wait_seconds > 0 for w in waits)
 
 
@@ -171,7 +171,7 @@ def test_one_bucket_shared_across_shards():
     data = asyncio.run(asm.build())
     assert data.bucket is bucket
     total = sum(s.assignment.subscribe_count for s in data.shards)
-    assert total == 1004  # 504 (shard0: 2 globals + 251x2) + 500 (shard1: 250x2)
+    assert total == 1505  # 755 (shard0: 2 globals + 251x3) + 750 (shard1: 250x3)
     assert bucket.available(now=0.0) == 100000.0 - total  # one bucket drained by both
 
 

@@ -37,8 +37,12 @@ def test_global_channels_are_instrument_and_status():
     assert GLOBAL_CHANNELS == (PublicChannel.INSTRUMENT, PublicChannel.STATUS)
 
 
-def test_per_pair_channels_are_ohlc5m_and_ticker():
-    assert PER_PAIR_CHANNELS == (PublicChannel.OHLC_5M, PublicChannel.TICKER)
+def test_per_pair_channels_are_ohlc5m_ohlc60m_and_ticker():
+    assert PER_PAIR_CHANNELS == (
+        PublicChannel.OHLC_5M,
+        PublicChannel.OHLC_60M,
+        PublicChannel.TICKER,
+    )
 
 
 # -- N_conns = ceil(universe / 500), floored at 1 -----------------------
@@ -110,7 +114,11 @@ def test_shard0_carries_global_channels_only():
 def test_every_shard_carries_per_pair_channels():
     plan = ShardPlan(_universe(600))
     for s in plan.shards:
-        assert s.per_pair_channels == (PublicChannel.OHLC_5M, PublicChannel.TICKER)
+        assert s.per_pair_channels == (
+            PublicChannel.OHLC_5M,
+            PublicChannel.OHLC_60M,
+            PublicChannel.TICKER,
+        )
 
 
 def test_shard0_is_the_clock_shard():
@@ -143,10 +151,10 @@ def test_every_universe_pair_assigned_exactly_once():
 def test_subscribe_count_decoupled_from_connection_count():
     # rule:HR-WM-031: subscribe-count = globals + pairs*per_pair_channels,
     # independent of N_conns. Shard 0 has the 2 globals; total subscribes are
-    # 2 (globals) + 600 pairs * 2 per-pair channels = 1202.
+    # 2 (globals) + 600 pairs * 3 per-pair channels (ohlc_5m/ohlc_60/ticker).
     plan = ShardPlan(_universe(600))
     total = sum(s.subscribe_count for s in plan.shards)
-    assert total == 2 + 600 * 2
+    assert total == 2 + 600 * 3
 
 
 # -- single-shard universe (<= 500 pairs) -------------------------------
