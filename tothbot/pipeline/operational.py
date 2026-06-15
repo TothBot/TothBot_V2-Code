@@ -23,9 +23,10 @@ TWO deliverables:
      2. REST DAILY REGIME (scheduler.py) - GetOHLCData(1440) per pair + the BTC/USD anchor -> the
         RegimeCache (also drives EC-L1A-002 for any open position via wm.on_regime_classified).
      3. REST LIQUIDITY PROBE (LiquidityProbe) - GetTicker 24h USD volume -> the LiquidityCache.
-     4. make_live_providers over the caches + the CIATS seed stores (the DEC-124 expected_reward +
-        DEC-128 mpp seeds, both CIATS-owned, seeded from historical OHLC at universe load) + the
-        ws_state machine lifecycle.
+     4. make_live_providers over the caches + the CIATS seed stores (OPS-1: the DEC-124
+        expected_reward + DEC-128 mpp stores are SEEDED IN PHASES 1-2 from the 5m / daily series
+        those phases already fetch - CIATS owns the values from the first tick) + the ws_state
+        machine lifecycle.
      5. the LiveSweepDriver over the warmed pairs + the RegimeCache + the providers.
      6. build the DataLayerAssembler with the handler_provider bound + the SHARED silent-pair
         registry (so ws_state reads the same machines the receive loop drives), open the sockets, and
@@ -160,7 +161,8 @@ async def assemble_operational(
     """Run the ar:AR-049 cold-start sequence and return the runnable public organism (see module
     docstring). `on_event` (defaulting to logger.record) sinks the warm-up / regime / liquidity /
     pacing telemetry; `logger` is mod:Logger (the sweep's per-module Stream-2 sink). The CIATS seed
-    stores are injected pre-seeded (the universe-load historical probe owns the seeding)."""
+    stores are passed in EMPTY and seeded in-line during phases 1-2 from the historical bars those
+    phases fetch (OPS-1) - no separate seeding pass, no duplicate REST."""
     universe = list(universe)
     instrument_cache = instrument_cache or InstrumentCache()
     bbo_cache = bbo_cache or BboCache()
@@ -181,13 +183,17 @@ async def assemble_operational(
     }
     coordinator = ShardReconnectCoordinator()
 
-    # 1. REST WARM-UP (ar:AR-044): seed the per-pair LiveIndicators + the 1H HtfCache.
-    warmups = await WarmupOrchestrator(rest_client, sleep=rest_sleep, on_event=event_sink).warm_all(
-        universe
-    )
+    # 1. REST WARM-UP (ar:AR-044): seed the per-pair LiveIndicators + the 1H HtfCache. OPS-1: the
+    #    5m series also seeds the DEC-128 mpp cap store (no extra REST under the AR-036 stagger).
+    warmups = await WarmupOrchestrator(
+        rest_client, sleep=rest_sleep, on_event=event_sink, on_5m_bars=mpp_store.seed_from_bars
+    ).warm_all(universe)
     # 2. REST DAILY REGIME (ar:AR-074 anchor): fill the RegimeCache (+ EC-L1A-002 for open positions).
+    #    OPS-1: the daily series also seeds the DEC-124 expected_reward store (the run-to-reversal
+    #    median per pair/regime) - again from the bars already fetched, no extra REST.
     regime_cache = await DailyRegimeCompute(
-        rest_client, sleep=rest_sleep, on_event=event_sink, ws_manager=wm, bbo_provider=bbo_pair
+        rest_client, sleep=rest_sleep, on_event=event_sink, ws_manager=wm, bbo_provider=bbo_pair,
+        on_daily_bars=reward_store.seed_from_bars,
     ).compute_all(universe)
     # 3. REST LIQUIDITY PROBE (Gate-2 vol_24h_usd): fill the LiquidityCache.
     await LiquidityProbe(

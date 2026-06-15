@@ -110,6 +110,7 @@ class DailyRegimeCompute:
         on_event: EventSink | None = None,
         ws_manager=None,
         bbo_provider: BboProvider | None = None,
+        on_daily_bars: Callable[[str, Sequence[DailyBar]], None] | None = None,
     ) -> None:
         self._rest = rest_client
         self._market_anchor = market_anchor
@@ -118,6 +119,10 @@ class DailyRegimeCompute:
         self._on_event = on_event
         self._wm = ws_manager
         self._bbo = bbo_provider
+        # OPS-1: an optional sink for the just-fetched committed daily series (the DEC-124
+        # expected_reward estimator seeds its per-pair/regime run-to-reversal median from it - no
+        # extra REST under the AR-036 stagger).
+        self._on_daily_bars = on_daily_bars
 
     def _emit(self, event: object) -> None:
         if self._on_event is not None:
@@ -159,6 +164,8 @@ class DailyRegimeCompute:
 
         cache.put(symbol, classification)
         self._emit(classification.classified_event)
+        if self._on_daily_bars is not None:
+            self._on_daily_bars(symbol, bars)  # OPS-1: seed the DEC-124 expected_reward from this series
         self._drive_regime_exit(symbol, classification)
 
     def _drive_regime_exit(self, symbol: str, classification: RegimeClassification) -> None:

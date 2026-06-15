@@ -122,6 +122,7 @@ class WarmupOrchestrator:
         on_event: EventSink | None = None,
         htf_ema_short: int = HTF_EMA_SHORT,
         htf_ema_long: int = HTF_EMA_LONG,
+        on_5m_bars: Callable[[str, Sequence[RestOhlcBar]], None] | None = None,
     ) -> None:
         self._rest = rest_client
         self._stagger_sec = stagger_sec
@@ -129,6 +130,9 @@ class WarmupOrchestrator:
         self._on_event = on_event
         self._htf_ema_short = int(htf_ema_short)
         self._htf_ema_long = int(htf_ema_long)
+        # OPS-1: an optional sink for the just-fetched 5m committed series (the DEC-128 mpp
+        # estimator seeds its per-pair/side Q95 cap from it - no extra REST under the AR-036 stagger).
+        self._on_5m_bars = on_5m_bars
 
     def _emit(self, event: object) -> None:
         if self._on_event is not None:
@@ -141,6 +145,8 @@ class WarmupOrchestrator:
         resp5 = await self._rest.get_ohlc_data(symbol, INTERVAL_5_MIN)
         indicators = LiveIndicators(symbol)
         indicators.seed_from_bars(resp5.committed)  # ar:AR-068 seeds all five + the 5m ATR(14)
+        if self._on_5m_bars is not None:
+            self._on_5m_bars(symbol, resp5.committed)  # OPS-1: seed the DEC-128 mpp cap from this series
 
         await self._sleep(self._stagger_sec)  # ar:AR-036 same-pair inter-call stagger
 

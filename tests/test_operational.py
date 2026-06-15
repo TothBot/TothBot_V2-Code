@@ -51,12 +51,30 @@ def _ohlc_response(n=60, start=100, step=1, span=2, base_time=1700000000, interv
     return OhlcResponse(committed=committed, forming=forming, last=committed[-1].time)
 
 
+def _reversing_daily_response(base_time=1700000000, interval_sec=86400):
+    # 55 rising then 30 falling daily bars: classifies + the DEC-124 reward replay finds reversals
+    # (a pure monotonic series never reverses -> empty seed), so reward_store actually populates.
+    closes = [100 + i * 2 for i in range(55)] + [210 - i * 3 for i in range(1, 31)]
+    prev = closes[0]
+    bars = []
+    for i, c in enumerate(closes):
+        o, cc = Decimal(prev), Decimal(c)
+        bars.append(RestOhlcBar(time=base_time + i * interval_sec, open=o,
+                                high=max(o, cc) + 1, low=min(o, cc) - 1, close=cc, volume=Decimal(1000)))
+        prev = c
+    forming = RestOhlcBar(time=base_time + len(closes) * interval_sec, open=Decimal(9),
+                          high=Decimal(9), low=Decimal(9), close=Decimal(9), volume=Decimal(1))
+    return OhlcResponse(committed=tuple(bars), forming=forming, last=bars[-1].time)
+
+
 class _FakeRest:
     def __init__(self) -> None:
         self.calls: list = []
 
     async def get_ohlc_data(self, pair, interval, *, since=None):
         self.calls.append((pair, interval))
+        if interval == 1440:  # the daily series the regime compute + DEC-124 reward seed read
+            return _reversing_daily_response()
         return _ohlc_response(interval_sec=interval * 60)
 
     async def get_ticker_liquidity(self, pair):
@@ -112,11 +130,9 @@ class _FakeWM:
 
 
 def _stores():
-    mpp = MppCapStore()
-    mpp.put("BTC/USD", PositionSide.LONG, "0.01")
-    reward = ExpectedRewardStore()
-    reward.put("BTC/USD", Regime.TRENDING_POS_NORMAL, "0.05")
-    return mpp, reward
+    # OPS-1: the stores are passed in EMPTY - assemble_operational seeds them from the historical
+    # bars the warm-up (5m -> mpp) + daily-regime (1440 -> expected_reward) phases fetch.
+    return MppCapStore(), ExpectedRewardStore()
 
 
 # --------------------------------------------------------------------------- handler_provider
@@ -189,11 +205,11 @@ def _assemble(universe=("BTC/USD", "ETH/USD")):
         rest_sleep=no_sleep,
         pace_sleep=no_sleep,
     ))
-    return system, rest, opened, wm
+    return system, rest, opened, wm, mpp, reward
 
 
 def test_assemble_runs_rest_phases_and_builds_layer():
-    system, rest, opened, wm = _assemble()
+    system, rest, opened, wm, _mpp, _reward = _assemble()
     # Warm-up (5m + 60m per pair) + daily regime (1440 per pair + BTC anchor) + liquidity all ran.
     assert ("BTC/USD", 5) in rest.calls and ("BTC/USD", 60) in rest.calls
     assert ("BTC/USD", 1440) in rest.calls and ("ETH/USD", 1440) in rest.calls
@@ -206,8 +222,18 @@ def test_assemble_runs_rest_phases_and_builds_layer():
     assert len(opened[0][0].sent) == system.data_layer.shards[0].assignment.subscribe_count
 
 
+def test_assemble_seeds_ciats_stores_at_load():
+    # OPS-1: the empty mpp + expected_reward stores are seeded in-line from the warm-up 5m series and
+    # the daily-regime 1440 series (no separate seeding pass) - CIATS owns the values from load.
+    _system, _rest, _opened, _wm, mpp, reward = _assemble()
+    assert mpp.get("BTC/USD", PositionSide.LONG) is not None     # DEC-128 Q95 cap seeded from 5m
+    assert mpp.get("ETH/USD", PositionSide.SHORT) is not None
+    # DEC-124 run-to-reversal seeds for at least one regime (the reversing daily series reverses).
+    assert any(reward.get("BTC/USD", r) is not None for r in Regime)
+
+
 def test_assemble_binds_handlers_into_dispatch():
-    system, _, _, _ = _assemble()
+    system, *_ = _assemble()
     shard0 = system.data_layer.shards[0]
     # An instrument frame routed through the shard's dispatch populates the shared instrument cache.
     shard0.dispatch.dispatch(PublicChannel.INSTRUMENT, {"data": {"pairs": [
@@ -221,7 +247,7 @@ def test_assemble_binds_handlers_into_dispatch():
 
 
 def test_assemble_shares_silent_pairs_behind_ws_state():
-    system, _, _, _ = _assemble()
+    system, *_ = _assemble()
     # The SAME machine instance backs the shard runtime and the ws_state provider (one registry).
     shard0 = system.data_layer.shards[0]
     for symbol, machine in shard0.silent_pairs.items():
