@@ -234,15 +234,18 @@ class SyntheticCapitalLedger:
         *,
         writer: str,
         exit_reason: str | None = None,
+        retain_fees_entry: bool = False,
     ) -> LedgerUpdate:
         """EXIT-FILL CREDIT (sec 12.4). On a simulated exit fill at FEE_TAKER_PCT (all
         exits close at taker - L1a run-to-reversal, L2 MAE, L3 emergSL):
             exit_proceeds = qty * exit_price
             fees_exit     = exit_proceeds * FEE_TAKER_PCT
             spot_usd_balance += (exit_proceeds - fees_exit)
-        Clears the symbol's retained entry fee and emits PAPER_LEDGER_UPDATED
-        (event_type=EXIT_FILL). Control then yields to the Exit Controller (sec 12.5)
-        which combines fees_entry + fees_exit into the TRADE_CLOSE net P&L (LATER)."""
+        Emits PAPER_LEDGER_UPDATED (event_type=EXIT_FILL). The symbol's retained entry
+        fee (pos.fees_entry_usd) is cleared here by default (the standalone exit fill);
+        BUT when this credit is step 2 of the sec-12.5 Exit-Controller close sequence,
+        retain_fees_entry=True keeps it so on_paper_close (step 5) can read it for the
+        TRADE_CLOSE net P&L - the close path then clears it via clear_fees_entry (step 7)."""
         self._guard_writer(writer, "exit_fill_credit")
         q = _dec(qty)
         price = _dec(exit_price)
@@ -251,7 +254,8 @@ class SyntheticCapitalLedger:
         prior = self._balance
         delta = exit_proceeds - fees_exit
         self._balance = prior + delta
-        self._fees_entry.pop(symbol, None)
+        if not retain_fees_entry:
+            self._fees_entry.pop(symbol, None)
         self._emit(
             PaperLedgerUpdated(
                 event_type=LedgerEventType.EXIT_FILL,
@@ -266,3 +270,11 @@ class SyntheticCapitalLedger:
             )
         )
         return LedgerUpdate(LedgerEventType.EXIT_FILL, self._balance, delta, fees_exit)
+
+    def clear_fees_entry(self, symbol: str, *, writer: str) -> None:
+        """Drop the symbol's retained entry fee (pos.fees_entry_usd) after the sec-12.5
+        close has consumed it for the TRADE_CLOSE net P&L (step 7, alongside the Position
+        Mirror clear). Sole-writer guarded (rule:HR-WM-032). Idempotent - a no-op if the
+        symbol carries no retained fee."""
+        self._guard_writer(writer, "clear_fees_entry")
+        self._fees_entry.pop(symbol, None)

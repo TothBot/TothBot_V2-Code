@@ -143,6 +143,12 @@ class Position:
     regime_at_entry: str | None = None
     exit_layer_armed: bool = False
     unrealized_pnl: Decimal = Decimal("0")
+    # Entry-time snapshot fields (D6 schema, dv1_242): captured ONCE at the opening
+    # fill, never live-recomputed. mod:Exit_Controller reads atr_14_entry for the
+    # layer:L2_MAE_Threshold trigger ((entry - bid) >= atr_14_entry * mae_mult, AR-048)
+    # and emergsl_price for the off-book layer:L3_Emergency_SL touch (bid <= emergsl_price).
+    atr_14_entry: Decimal | None = None
+    emergsl_price: Decimal | None = None
 
 
 class PositionAction(Enum):
@@ -300,11 +306,15 @@ class PositionMirror:
         writer: str,
         regime_at_entry: str | None = None,
         emergsl_id: str | None = None,
+        atr_14_entry: object | None = None,
+        emergsl_price: object | None = None,
     ) -> ExecOutcome:
         """Dispatch one executions-channel frame through the WS-EXE-009 exec_type
-        table and apply it to the store. regime_at_entry / emergsl_id are the
-        TothBot-internal context the sole writer attaches when OPENING a position
-        (they are not on the Kraken wire frame)."""
+        table and apply it to the store. regime_at_entry / emergsl_id / atr_14_entry /
+        emergsl_price are the TothBot-internal context the sole writer attaches when
+        OPENING a position (they are not on the Kraken wire frame); atr_14_entry +
+        emergsl_price are the D6 entry-time snapshot the Exit Controller reads for
+        L2 MAE / L3 emergSL detection (dv1_242)."""
         self._guard_writer(writer, "apply_execution", _opt_str(event.get("symbol")))
 
         exec_type = classify_exec_type(event.get("exec_type"))
@@ -317,7 +327,9 @@ class PositionMirror:
         if exec_type is ExecType.AMENDED:
             return self._handle_amended(event)
         if exec_type in _FILL_EXEC_TYPES:
-            return self._handle_fill(exec_type, event, regime_at_entry, emergsl_id)
+            return self._handle_fill(
+                exec_type, event, regime_at_entry, emergsl_id, atr_14_entry, emergsl_price
+            )
         # pending_new / new / canceled / expired / iceberg_refill / status:
         # acknowledged, no mirror position change (AR-053 registry is separate).
         return ExecOutcome(exec_type, PositionAction.IGNORED)
@@ -344,6 +356,8 @@ class PositionMirror:
         event: Mapping[str, object],
         regime_at_entry: str | None,
         emergsl_id: str | None,
+        atr_14_entry: object | None = None,
+        emergsl_price: object | None = None,
     ) -> ExecOutcome:
         """A trade/filled fill: open, update, or close the symbol's position from the
         authoritative cum_qty + avg_price (WS-EXE-012)."""
@@ -362,7 +376,7 @@ class PositionMirror:
 
         if existing is None:
             return self._open(symbol, fill_side, cum_qty, avg_price, event, seq,
-                              regime_at_entry, emergsl_id)
+                              regime_at_entry, emergsl_id, atr_14_entry, emergsl_price)
         if _closes(existing.side, fill_side):
             return self._close(existing, seq)
         # Same-side fill on an open position: cum_qty + avg_price are cumulative and
@@ -371,6 +385,7 @@ class PositionMirror:
 
     def _open(
         self, symbol, side, qty, avg_price, event, seq, regime_at_entry, emergsl_id,
+        atr_14_entry=None, emergsl_price=None,
     ) -> ExecOutcome:
         position = Position(
             symbol=symbol,
@@ -381,6 +396,8 @@ class PositionMirror:
             emergsl_id=emergsl_id,
             fill_sequence_id=seq,
             regime_at_entry=regime_at_entry,
+            atr_14_entry=_dec(atr_14_entry) if atr_14_entry is not None else None,
+            emergsl_price=_dec(emergsl_price) if emergsl_price is not None else None,
         )
         self._positions[symbol] = position
         self._emit(PositionStateWrite(symbol, PositionAction.OPENED, qty, avg_price, seq))
@@ -400,6 +417,25 @@ class PositionMirror:
             )
         )
         return ExecOutcome(ExecType.FILLED, PositionAction.CLOSED, None)
+
+    def close(self, symbol: str, *, writer: str) -> Position | None:
+        """Explicitly clear a symbol's open position (sec 12.5 step 7: the Exit Controller
+        clears the Position Mirror through the sole writer - rule:HR-PM-009). Distinct from
+        the executions-fill close (_close, an opposite-side fill): the sec-12.5 paper exit
+        is detected on the ticker bbo and routes through mod:Exit_Controller, which requests
+        the clear here rather than via a synthetic fill. Emits POSITION_STATE_WRITE(CLOSED);
+        returns the cleared Position, or None if the symbol held no open position."""
+        self._guard_writer(writer, "close", symbol)
+        existing = self._positions.pop(symbol, None)
+        if existing is None:
+            return None
+        self._emit(
+            PositionStateWrite(
+                symbol, PositionAction.CLOSED, existing.qty, existing.avg_entry_price,
+                existing.fill_sequence_id,
+            )
+        )
+        return existing
 
     def restore_from_snapshot(
         self,

@@ -277,3 +277,46 @@ def test_open_symbols_view():
     mirror.apply_execution(_fill(symbol="BTC/USD", side="buy"), writer=WRITER_ID)
     mirror.apply_execution(_fill(symbol="ETH/USD", side="sell"), writer=WRITER_ID)
     assert mirror.open_symbols() == frozenset({"BTC/USD", "ETH/USD"})
+
+
+# -- D6 entry-time snapshot fields (dv1_242) + the sole-writer close ----------
+
+def test_open_records_entry_time_snapshot_fields():
+    mirror, _ = _mirror()
+    mirror.apply_execution(
+        _fill(side="buy"), writer=WRITER_ID, atr_14_entry="2000.5", emergsl_price="54000",
+    )
+    pos = mirror.get("BTC/USD")
+    # Decimal-on-receipt (ar:AR-047), never live-recomputed
+    assert pos.atr_14_entry == Decimal("2000.5")
+    assert pos.emergsl_price == Decimal("54000")
+
+
+def test_snapshot_fields_default_none_when_not_supplied():
+    mirror, _ = _mirror()
+    mirror.apply_execution(_fill(side="buy"), writer=WRITER_ID)
+    pos = mirror.get("BTC/USD")
+    assert pos.atr_14_entry is None and pos.emergsl_price is None
+
+
+def test_close_clears_and_emits_state_write():
+    mirror, events = _mirror()
+    mirror.apply_execution(_fill(side="buy"), writer=WRITER_ID)
+    cleared = mirror.close("BTC/USD", writer=WRITER_ID)
+    assert cleared is not None and cleared.symbol == "BTC/USD"
+    assert not mirror.has_position("BTC/USD")
+    assert isinstance(events[-1], PositionStateWrite)
+    assert events[-1].action is PositionAction.CLOSED
+
+
+def test_close_absent_symbol_returns_none():
+    mirror, _ = _mirror()
+    assert mirror.close("BTC/USD", writer=WRITER_ID) is None
+
+
+def test_close_is_sole_writer_guarded():
+    mirror, _ = _mirror()
+    mirror.apply_execution(_fill(side="buy"), writer=WRITER_ID)
+    with pytest.raises(SoleWriterViolationError):
+        mirror.close("BTC/USD", writer="Exit_Controller")
+    assert mirror.has_position("BTC/USD")  # the guarded write never happened

@@ -35,7 +35,13 @@ from tothbot.exchange.seam import (
     PaperDispatchBlockedError,
     PaperOrderSimulated,
 )
-from tothbot.exchange.ws_manager import WSManager
+from tothbot.exchange.paper_exit import PaperEmergSlTriggered, PaperMaeDetected
+from tothbot.exchange.ws_manager import (
+    SelectionStateUpdated,
+    TickerTriggerSwitched,
+    WSManager,
+)
+from tothbot.execution.exit_controller import ExitReason, TradeClose
 
 
 # -- connection: endpoints + invariants ---------------------------------
@@ -412,3 +418,118 @@ def test_manager_mirror_events_routed_to_on_event_sink():
     m.record_execution({"exec_type": "trade", "symbol": "BTC/USD", "side": "buy",
                         "cum_qty": "0.5", "avg_price": "60000"})
     assert any(getattr(e, "code", None) == "POSITION_STATE_WRITE" for e in events)
+
+
+# -- WS_Manager paper EXIT lifecycle (sec 12.5: detect -> credit -> close) ----
+
+class _FakeSemaphore:
+    def __init__(self):
+        self.released = 0
+
+    def release(self):
+        self.released += 1
+
+
+def _open_paper_long(m, *, atr="2000", emergsl="54000"):
+    """Open a BTC/USD long paper position carrying the entry-time snapshot (the
+    sole-writer record_execution surface) + the synthetic entry-fill debit (fees_entry)."""
+    m.record_execution(
+        {"exec_type": "filled", "symbol": "BTC/USD", "side": "buy",
+         "cum_qty": "0.05", "avg_price": "60000", "cl_ord_id": "cl-1"},
+        regime_at_entry="TRENDING_POS_NORMAL", atr_14_entry=atr, emergsl_price=emergsl,
+    )
+    m.apply_paper_entry_fill("BTC/USD", "0.05", "60000")  # debit: fees_entry 7.8
+
+
+def _ticker(symbol, bid, ask):
+    return {"channel": "ticker", "type": "update",
+            "data": [{"symbol": symbol, "bid": bid, "ask": ask}]}
+
+
+def test_open_switches_ticker_trigger_to_bbo():
+    m = WSManager(Mode.PAPER)
+    assert m.ticker_event_trigger("BTC/USD") == "trades"  # WS-TKR-002 default
+    _open_paper_long(m)
+    assert m.ticker_event_trigger("BTC/USD") == "bbo"      # WS-TKR-003 on open
+
+
+def test_paper_exit_lifecycle_l2_mae_full_close():
+    events: list = []
+    sem = _FakeSemaphore()
+    m = WSManager(Mode.PAPER, on_event=events.append,
+                  now_monotonic=lambda: 1234.5, exit_semaphore=sem)
+    _open_paper_long(m)
+    assert m.spot_usd_balance == Decimal("1992.2")        # after entry debit
+
+    # adverse bbo: bid 57000 -> mae 3000 >= atr 2000 * 1.5 -> L2 breach at the bid.
+    m.handle_ticker(_ticker("BTC/USD", "57000", "57100"))
+
+    # mirror cleared (sec 12.5 step 7), entry fee cleared, exit credited.
+    assert not m.has_position("BTC/USD")
+    assert m.ledger.fees_entry_for("BTC/USD") is None
+    # exit credit at 57000: proceeds 2850 - taker 7.41 -> 1992.2 + 2842.59
+    assert m.spot_usd_balance == Decimal("4834.79")
+
+    # the TRADE_CLOSE record: net_pl = (57000-60000)*0.05 - 7.8 - 7.41 = -165.21 (loss)
+    closes = [e for e in events if isinstance(e, TradeClose)]
+    assert len(closes) == 1
+    rec = closes[0]
+    assert rec.exit_reason is ExitReason.MAE_THRESHOLD_BREACH
+    assert rec.net_pl_usd == Decimal("-165.21")
+    assert rec.net_loss_usd == Decimal("165.21")
+    # detection telemetry + AR-073 loss + ticker trades-mode + semaphore release.
+    assert any(isinstance(e, PaperMaeDetected) for e in events)
+    assert m.consecutive_loss_count("BTC/USD") == 1
+    assert m.exit_cooldown_at("BTC/USD") == 1234.5
+    assert m.ticker_event_trigger("BTC/USD") == "trades"   # step 10
+    assert sem.released == 1                                # step 9
+    assert any(isinstance(e, SelectionStateUpdated) and not e.is_win for e in events)
+
+
+def test_paper_exit_lifecycle_l3_emergsl_touch():
+    events: list = []
+    m = WSManager(Mode.PAPER, on_event=events.append)
+    _open_paper_long(m, atr=None, emergsl="54000")  # no MAE context -> emergSL backstop
+    m.handle_ticker(_ticker("BTC/USD", "53000", "53100"))  # bid <= emergsl 54000
+    assert not m.has_position("BTC/USD")
+    assert any(isinstance(e, PaperEmergSlTriggered) for e in events)
+    rec = next(e for e in events if isinstance(e, TradeClose))
+    assert rec.exit_reason is ExitReason.EMERGENCY_SL_FIRED
+    assert rec.exit_price == Decimal("54000")
+
+
+def test_paper_exit_win_resets_consecutive_loss_count():
+    m = WSManager(Mode.PAPER)
+    m._selection_consecutive_loss_count["BTC/USD"] = 2  # a prior streak
+    _open_paper_long(m, atr="500", emergsl=None)        # threshold 750
+    # bid 66000 is favorable for a long; force a regime-style profitable close directly.
+    m.update_selection_state_on_close("BTC/USD", is_win=True)
+    assert m.consecutive_loss_count("BTC/USD") == 0
+
+
+def test_non_adverse_ticker_leaves_position_open():
+    m = WSManager(Mode.PAPER)
+    _open_paper_long(m)
+    m.handle_ticker(_ticker("BTC/USD", "59000", "59100"))  # mae 1000 < 3000, bid > emergsl
+    assert m.has_position("BTC/USD")
+
+
+def test_handle_ticker_is_noop_in_live_mode():
+    m = WSManager(Mode.LIVE)
+    m.handle_ticker(_ticker("BTC/USD", "1", "2"))  # no exit_controller, must not raise
+    assert m.exit_controller is None
+
+
+def test_release_exit_semaphore_guarded_when_none():
+    m = WSManager(Mode.PAPER)                  # no semaphore injected
+    m.release_exit_semaphore()                 # must be a safe no-op
+    assert m._exit_semaphore is None
+
+
+def test_close_position_clears_mirror_and_fees_entry():
+    m = WSManager(Mode.PAPER)
+    _open_paper_long(m)
+    assert m.has_position("BTC/USD") and m.fees_entry_for("BTC/USD") == Decimal("7.8")
+    m.close_position("BTC/USD")
+    assert not m.has_position("BTC/USD")
+    assert m.fees_entry_for("BTC/USD") is None

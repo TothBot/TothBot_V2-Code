@@ -157,3 +157,29 @@ def test_exit_credit_rejects_foreign_writer():
     with pytest.raises(LedgerSoleWriterViolationError):
         led.exit_fill_credit("BTC/USD", "0.05", "66000", writer="Long_Module")
     assert led.balance == Decimal("5000")
+
+
+# -- sec-12.5 close: retain the entry fee through the credit, clear after ----
+
+def test_exit_credit_retains_entry_fee_for_close():
+    # The sec-12.5 close path applies the credit (step 2) BEFORE on_paper_close (step 5)
+    # reads pos.fees_entry_usd for the net P&L - so retain_fees_entry keeps it.
+    led = SyntheticCapitalLedger(5000)
+    led.entry_fill_debit("BTC/USD", "0.05", "60000", writer=WRITER)
+    led.exit_fill_credit("BTC/USD", "0.05", "57000", writer=WRITER, retain_fees_entry=True)
+    assert led.fees_entry_for("BTC/USD") == Decimal("7.8")
+
+
+def test_clear_fees_entry_drops_it_and_is_sole_writer_guarded():
+    led = SyntheticCapitalLedger(5000)
+    led.entry_fill_debit("BTC/USD", "0.05", "60000", writer=WRITER)
+    with pytest.raises(LedgerSoleWriterViolationError):
+        led.clear_fees_entry("BTC/USD", writer="Exit_Controller")
+    assert led.fees_entry_for("BTC/USD") == Decimal("7.8")  # guarded - not cleared
+    led.clear_fees_entry("BTC/USD", writer=WRITER)
+    assert led.fees_entry_for("BTC/USD") is None
+
+
+def test_clear_fees_entry_idempotent_for_unknown_symbol():
+    led = SyntheticCapitalLedger(5000)
+    led.clear_fees_entry("ETH/USD", writer=WRITER)  # no-op, must not raise
