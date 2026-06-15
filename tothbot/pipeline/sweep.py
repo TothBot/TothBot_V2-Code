@@ -54,6 +54,17 @@ def _dec(value: object) -> Decimal:
     return value if isinstance(value, Decimal) else Decimal(str(value))
 
 
+class ProviderNotReady(Exception):
+    """A live provider's cache does not hold this symbol yet (the instrument / bbo / liquidity
+    snapshot has not arrived). The (pair, side) candidate is SKIPPED this tick - exactly like a
+    WARM_UP pair - never a crash. Raised by the cache-backed providers (make_live_providers)."""
+
+    def __init__(self, symbol: str, what: str) -> None:
+        self.symbol = symbol
+        self.what = what
+        super().__init__(f"{symbol}: live provider not ready ({what})")
+
+
 @dataclass(frozen=True)
 class LiveProviders:
     """The injected live-layer plug-points (the values not held in the warm-up/regime/live caches).
@@ -231,10 +242,13 @@ async def sweep_pair(
     for side in permitted_sides(classification.regime):
         if wm.wallet_balance(side) is None:  # no module wired for this side
             continue
-        inputs, ctx = assemble_candidate(
-            candle.symbol, side, candle=candle, warmup=warmup, regime_cache=regime_cache,
-            providers=providers, wm=wm, now_monotonic=now_monotonic,
-        )
+        try:
+            inputs, ctx = assemble_candidate(
+                candle.symbol, side, candle=candle, warmup=warmup, regime_cache=regime_cache,
+                providers=providers, wm=wm, now_monotonic=now_monotonic,
+            )
+        except ProviderNotReady:
+            continue  # the pair's live caches are not populated yet - skip this (pair, side) tick
         result = await process_candidate(
             wm, logger, side, candle.symbol, inputs, ctx, sss_evaluator=evaluator
         )
