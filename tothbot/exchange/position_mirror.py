@@ -149,6 +149,13 @@ class Position:
     # and emergsl_price for the off-book layer:L3_Emergency_SL touch (bid <= emergsl_price).
     atr_14_entry: Decimal | None = None
     emergsl_price: Decimal | None = None
+    # Entry-side contract:TRADE_CLOSE producer fields (sec 7 Image6, fields 8/18/19): the
+    # per-trade SSS levels the entry was taken under (signal_params), the BTC/USD anchor regime
+    # at entry (market_regime, ar:AR-074), and the entry-trigger candle stamp (entry_timestamp_utc).
+    # Captured at the opening fill; mod:Exit_Controller reads them onto the TRADE_CLOSE on close.
+    signal_params: dict | None = None
+    market_regime: str | None = None
+    entry_timestamp_utc: str | None = None
 
 
 class PositionAction(Enum):
@@ -308,13 +315,18 @@ class PositionMirror:
         emergsl_id: str | None = None,
         atr_14_entry: object | None = None,
         emergsl_price: object | None = None,
+        signal_params: dict | None = None,
+        market_regime: str | None = None,
+        entry_timestamp_utc: str | None = None,
     ) -> ExecOutcome:
         """Dispatch one executions-channel frame through the WS-EXE-009 exec_type
         table and apply it to the store. regime_at_entry / emergsl_id / atr_14_entry /
         emergsl_price are the TothBot-internal context the sole writer attaches when
         OPENING a position (they are not on the Kraken wire frame); atr_14_entry +
         emergsl_price are the D6 entry-time snapshot the Exit Controller reads for
-        L2 MAE / L3 emergSL detection (dv1_242)."""
+        L2 MAE / L3 emergSL detection (dv1_242). signal_params / market_regime /
+        entry_timestamp_utc are the entry-side contract:TRADE_CLOSE producer fields the
+        close emits (the per-trade SSS levels + the entry context, sec 7)."""
         self._guard_writer(writer, "apply_execution", _opt_str(event.get("symbol")))
 
         exec_type = classify_exec_type(event.get("exec_type"))
@@ -328,7 +340,8 @@ class PositionMirror:
             return self._handle_amended(event)
         if exec_type in _FILL_EXEC_TYPES:
             return self._handle_fill(
-                exec_type, event, regime_at_entry, emergsl_id, atr_14_entry, emergsl_price
+                exec_type, event, regime_at_entry, emergsl_id, atr_14_entry, emergsl_price,
+                signal_params, market_regime, entry_timestamp_utc,
             )
         # pending_new / new / canceled / expired / iceberg_refill / status:
         # acknowledged, no mirror position change (AR-053 registry is separate).
@@ -358,6 +371,9 @@ class PositionMirror:
         emergsl_id: str | None,
         atr_14_entry: object | None = None,
         emergsl_price: object | None = None,
+        signal_params: dict | None = None,
+        market_regime: str | None = None,
+        entry_timestamp_utc: str | None = None,
     ) -> ExecOutcome:
         """A trade/filled fill: open, update, or close the symbol's position from the
         authoritative cum_qty + avg_price (WS-EXE-012)."""
@@ -376,7 +392,8 @@ class PositionMirror:
 
         if existing is None:
             return self._open(symbol, fill_side, cum_qty, avg_price, event, seq,
-                              regime_at_entry, emergsl_id, atr_14_entry, emergsl_price)
+                              regime_at_entry, emergsl_id, atr_14_entry, emergsl_price,
+                              signal_params, market_regime, entry_timestamp_utc)
         if _closes(existing.side, fill_side):
             return self._close(existing, seq)
         # Same-side fill on an open position: cum_qty + avg_price are cumulative and
@@ -386,6 +403,7 @@ class PositionMirror:
     def _open(
         self, symbol, side, qty, avg_price, event, seq, regime_at_entry, emergsl_id,
         atr_14_entry=None, emergsl_price=None,
+        signal_params=None, market_regime=None, entry_timestamp_utc=None,
     ) -> ExecOutcome:
         position = Position(
             symbol=symbol,
@@ -398,6 +416,9 @@ class PositionMirror:
             regime_at_entry=regime_at_entry,
             atr_14_entry=_dec(atr_14_entry) if atr_14_entry is not None else None,
             emergsl_price=_dec(emergsl_price) if emergsl_price is not None else None,
+            signal_params=signal_params,
+            market_regime=market_regime,
+            entry_timestamp_utc=entry_timestamp_utc,
         )
         self._positions[symbol] = position
         self._emit(PositionStateWrite(symbol, PositionAction.OPENED, qty, avg_price, seq))

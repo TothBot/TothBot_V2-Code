@@ -39,6 +39,9 @@ async def execute_entry(
     regime_at_entry: str | None = None,
     cl_ord_id: str,
     deadline: str,
+    signal_params: dict | None = None,
+    market_regime: str | None = None,
+    entry_timestamp_utc: str | None = None,
 ) -> bool:
     """Execute a G8-accepted entry: size the marketable-IOC order (MPP cap), derive the emergSL
     from the actual fill, and dispatch through mod:WS_Manager into THIS side's wallet. `sized` is
@@ -71,4 +74,7 @@ async def execute_entry(
         regime_at_entry=regime_at_entry,
         cl_ord_id=cl_ord_id,
         deadline=deadline,
+        signal_params=signal_params,
+        market_regime=market_regime,
+        entry_timestamp_utc=entry_timestamp_utc,
     )

@@ -201,6 +201,24 @@ class SssVerdict:
     def event_type(self) -> str:
         return "SIGNAL_PASS" if self.passed else "SIGNAL_REJECTED"
 
+    @property
+    def signal_params(self) -> dict:
+        """evt:TRADE_CLOSE field (19) signal_params - the SSS output dict the diagram names the
+        canonical schema source (0500000 schema_fields_canonical: {rsi_14, ema_9, ema_21,
+        volume_ratio, sss_pass}; the SSS q5_logs adds `side` for per-module routing). These are the
+        PER-TRADE SSS indicator LEVELS the entry was taken under - the per-trade parameter-level
+        series the CIATS Spearman PLAN-candidate gate reads. volume_ratio is the SC-SSS-3 ratio
+        current_volume / VolumeMA20 (the level the volume_sss_threshold gates; 0 when MA20 is 0)."""
+        ratio = self.volume / self.volume_ma20 if self.volume_ma20 != 0 else Decimal(0)
+        return {
+            "rsi_14": self.rsi_14,
+            "ema_9": self.ema9,
+            "ema_21": self.ema21,
+            "volume_ratio": ratio,
+            "sss_pass": self.passed,
+            "side": self.side.value,
+        }
+
 
 def _resolve_rsi_bounds(
     side: SignalSide, rsi_low: object | None, rsi_high: object | None

@@ -105,6 +105,33 @@ def test_buy_fill_opens_long_position():
     assert write.writer_id == "WS_Manager"
 
 
+def test_open_attaches_the_entry_side_producer_snapshot():
+    # The sole writer attaches the contract:TRADE_CLOSE entry-side producer fields at the open fill.
+    mirror, _events = _mirror()
+    sp = {"rsi_14": Decimal(42), "ema_9": Decimal(101), "sss_pass": True, "side": "long"}
+    outcome = mirror.apply_execution(
+        _fill(side="buy"),
+        writer=WRITER_ID,
+        signal_params=sp,
+        market_regime="TRENDING_POS_ELEVATED",
+        entry_timestamp_utc="2026-06-15T00:00:00+00:00",
+    )
+    assert outcome.action is PositionAction.OPENED
+    pos = mirror.get("BTC/USD")
+    assert pos.signal_params == sp
+    assert pos.market_regime == "TRENDING_POS_ELEVATED"
+    assert pos.entry_timestamp_utc == "2026-06-15T00:00:00+00:00"
+
+
+def test_open_without_producer_snapshot_defaults_to_none():
+    mirror, _events = _mirror()
+    mirror.apply_execution(_fill(side="buy"), writer=WRITER_ID)
+    pos = mirror.get("BTC/USD")
+    assert pos.signal_params is None
+    assert pos.market_regime is None
+    assert pos.entry_timestamp_utc is None
+
+
 def test_sell_fill_opens_short_position():
     mirror, _ = _mirror()
     mirror.apply_execution(_fill(symbol="ETH/USD", side="sell"), writer=WRITER_ID)

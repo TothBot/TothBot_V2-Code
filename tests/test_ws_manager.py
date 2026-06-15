@@ -805,6 +805,8 @@ def test_dispatch_entry_long_opens_position_places_emergsl_debits_long_wallet():
         order_qty="0.05", entry_limit_price="60000", emergsl_price="57000",
         atr_14_entry="1000", regime_at_entry="TRENDING_POS_NORMAL",
         cl_ord_id="cl-1", deadline="2026-06-15T07:30:00Z",
+        signal_params={"rsi_14": 42, "sss_pass": True, "side": "long"},
+        market_regime="TRENDING_POS_ELEVATED", entry_timestamp_utc="2026-06-15T07:25:00+00:00",
     ))
     assert filled is True
     pos = m.position("BTC/USD")
@@ -813,6 +815,10 @@ def test_dispatch_entry_long_opens_position_places_emergsl_debits_long_wallet():
     assert pos.emergsl_price == Decimal("57000")        # L3 stop below entry
     assert pos.atr_14_entry == Decimal("1000")          # L2 MAE basis
     assert pos.regime_at_entry == "TRENDING_POS_NORMAL"
+    # the contract:TRADE_CLOSE entry-side producer fields rode the Pending Order Registry too.
+    assert pos.signal_params == {"rsi_14": 42, "sss_pass": True, "side": "long"}
+    assert pos.market_regime == "TRENDING_POS_ELEVATED"
+    assert pos.entry_timestamp_utc == "2026-06-15T07:25:00+00:00"
     # the LONG wallet was debited (buy-to-open); the SHORT wallet is untouched.
     assert m.wallet_balance(PositionSide.LONG) < Decimal("5000.0")
     assert m.wallet_balance(PositionSide.SHORT) == Decimal("5000.0")

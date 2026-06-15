@@ -52,7 +52,8 @@ _CLOCK = lambda: datetime(2026, 6, 15, 0, 45, 0, tzinfo=timezone.utc)
 
 
 def _pos(side=PositionSide.LONG, entry="60000", qty="0.05", atr="2000",
-         regime="TRENDING_POS_NORMAL"):
+         regime="TRENDING_POS_NORMAL", signal_params=None, market_regime=None,
+         entry_timestamp_utc=None):
     return Position(
         symbol="BTC/USD",
         side=side,
@@ -60,6 +61,9 @@ def _pos(side=PositionSide.LONG, entry="60000", qty="0.05", atr="2000",
         avg_entry_price=Decimal(entry),
         atr_14_entry=Decimal(atr) if atr is not None else None,
         regime_at_entry=regime,
+        signal_params=signal_params,
+        market_regime=market_regime,
+        entry_timestamp_utc=entry_timestamp_utc,
     )
 
 
@@ -163,3 +167,53 @@ def test_missing_fees_entry_treated_as_zero():
     # gross 300 - 0 entry fee - 8.58 exit fee
     assert rec.net_pl_usd == Decimal("291.42")
     assert rec.fees_entry_usd == Decimal("0")
+
+
+# --- the entry-side producer fields emitted on the TRADE_CLOSE (sec 7 Image6 fields 8/10/18/19) ---
+
+_SIGNAL_PARAMS = {
+    "rsi_14": Decimal("42"), "ema_9": Decimal("60100"), "ema_21": Decimal("60000"),
+    "volume_ratio": Decimal("1.3"), "sss_pass": True, "side": "long",
+}
+
+
+def test_producer_fields_emitted_from_the_entry_snapshot():
+    # The D6 snapshot was captured on the position at entry; the close copies it onto the record.
+    pos = _pos(
+        signal_params=_SIGNAL_PARAMS, market_regime="TRENDING_POS_ELEVATED",
+        entry_timestamp_utc="2026-06-15T00:00:00+00:00",
+    )
+    wm = _FakeWM(pos, fees_entry=Decimal("7.8"))
+    rec = _ec([]).on_paper_close("BTC/USD", "66000", ExitReason.MAE_THRESHOLD_BREACH, "8.58", wm)
+    assert rec.signal_params == _SIGNAL_PARAMS         # (19) the per-trade SSS levels
+    assert rec.market_regime == "TRENDING_POS_ELEVATED"  # (18) the BTC anchor regime at entry
+    assert rec.entry_timestamp_utc == "2026-06-15T00:00:00+00:00"  # (8)
+    # (10) hold_candle_count = (00:45 exit - 00:00 entry) = 2700s // 300 = 9 committed 5m candles
+    assert rec.hold_candle_count == 9
+
+
+def test_hold_candle_count_none_without_entry_stamp():
+    # no entry stamp captured (e.g. a gap-closed / backfilled position) -> no fabricated count
+    wm = _FakeWM(_pos(), fees_entry=Decimal("7.8"))
+    rec = _ec([]).on_paper_close("BTC/USD", "66000", ExitReason.MAE_THRESHOLD_BREACH, "8.58", wm)
+    assert rec.hold_candle_count is None
+    assert rec.entry_timestamp_utc is None
+    assert rec.signal_params is None and rec.market_regime is None
+
+
+def test_hold_candle_count_none_without_exit_clock():
+    # no injected clock -> no exit stamp -> hold count is None (the entry stamp alone is not enough)
+    pos = _pos(entry_timestamp_utc="2026-06-15T00:00:00+00:00")
+    wm = _FakeWM(pos, fees_entry=Decimal("7.8"))
+    rec = ExitController(on_event=None).on_paper_close(
+        "BTC/USD", "66000", ExitReason.MAE_THRESHOLD_BREACH, "8.58", wm
+    )
+    assert rec.hold_candle_count is None
+    assert rec.exit_timestamp_utc is None
+
+
+def test_same_candle_exit_floors_hold_to_zero():
+    pos = _pos(entry_timestamp_utc="2026-06-15T00:45:00+00:00")   # == the exit clock instant
+    wm = _FakeWM(pos, fees_entry=Decimal("7.8"))
+    rec = _ec([]).on_paper_close("BTC/USD", "66000", ExitReason.MAE_THRESHOLD_BREACH, "8.58", wm)
+    assert rec.hold_candle_count == 0

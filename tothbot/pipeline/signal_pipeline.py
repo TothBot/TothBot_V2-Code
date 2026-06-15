@@ -99,6 +99,7 @@ class PipelineOutcome:
     reason: str         # the terminal code/disposition (e.g. "SIGNAL_REJECTED", "G8_SIZED")
     event: object | None
     sized: object | None  # G8Sized on ACCEPTED, else None
+    signal_params: dict | None = None  # (19) the entry-time SSS levels, carried on ACCEPTED only
     code: str = field(default="SIGNAL_PIPELINE_RESULT", init=False)
 
 
@@ -210,8 +211,11 @@ def run_pipeline(
 
     # ACCEPTED - the sized order (g8.event is the G8Sized) dispatches to mod:Execution_Engine.
     # g6 (the regime multiplier) is carried on the G8 path upstream; the accept observable is G8_SIZED.
+    # signal_params (the entry-time SSS levels) rides the accept so the entry-side producer can stash
+    # it on the position (the contract:TRADE_CLOSE field-19 per-trade level series, sec 7).
     return PipelineOutcome(
         accepted=True, side=side, stage="G8", reason="G8_SIZED", event=g8.event, sized=g8.event,
+        signal_params=getattr(sss, "signal_params", None),
     )
 
 

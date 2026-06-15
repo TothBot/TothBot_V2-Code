@@ -13,10 +13,16 @@ from tothbot.regime.taxonomy import Regime
 from tothbot.pipeline.signal_pipeline import PipelineInputs, run_pipeline
 
 
+_SIGNAL_PARAMS = {
+    "rsi_14": 42, "ema_9": 101, "ema_21": 100, "volume_ratio": 1.3, "sss_pass": True, "side": "long",
+}
+
+
 class _Verdict:
     def __init__(self, passed):
         self.passed = passed
         self.code = "SIGNAL_PASS" if passed else "SIGNAL_REJECTED"
+        self.signal_params = dict(_SIGNAL_PARAMS, sss_pass=passed)
 
 
 def _sss_pass(symbol, closes, volumes, *, side, **kw):
@@ -65,6 +71,14 @@ def test_long_candidate_passes_all_gates_and_is_accepted():
     assert out.reason == "G8_SIZED"
     assert out.sized is not None
     assert out.sized.code == "G8_SIZED"
+    # the entry-time SSS levels ride the accept (the contract:TRADE_CLOSE field-19 producer input)
+    assert out.signal_params == dict(_SIGNAL_PARAMS, sss_pass=True)
+
+
+def test_rejected_outcome_carries_no_signal_params():
+    out = _run(sss=_sss_fail)
+    assert out.accepted is False
+    assert out.signal_params is None   # only an ACCEPTED entry stashes the levels
 
 
 def test_short_candidate_passes_with_short_tests_throughout():

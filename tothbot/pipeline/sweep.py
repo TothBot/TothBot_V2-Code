@@ -34,6 +34,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from ..config import registry
@@ -52,6 +53,16 @@ _LEVERAGE_SHORT = Decimal(str(registry.value("leverage_cap_short")))  # 3x short
 
 def _dec(value: object) -> Decimal:
     return value if isinstance(value, Decimal) else Decimal(str(value))
+
+
+def _entry_timestamp_utc(candle) -> str | None:
+    """contract:TRADE_CLOSE field (8) entry_timestamp_utc - the ISO 8601 UTC stamp of the 5m candle
+    that triggered the entry (ar:AR-069 entry_ref). candle.interval_begin is the integer Unix-second
+    candle-start key (candle_close.to_interval_unix); None when absent."""
+    begin = getattr(candle, "interval_begin", None)
+    if begin is None:
+        return None
+    return datetime.fromtimestamp(int(begin), tz=timezone.utc).isoformat()
 
 
 class ProviderNotReady(Exception):
@@ -209,6 +220,9 @@ def assemble_candidate(
         atr_14=indicators.atr_14,                          # ar:AR-016 live 5m ATR(14)
         expected_reward=providers.expected_reward(symbol, regime),
     )
+    # market_regime = the ar:AR-074 BTC/USD anchor regime at entry (the daily scheduler computes it
+    # onto the RegimeCache); None before the anchor classifies.
+    market = getattr(regime_cache, "market_regime", None)
     ctx = ExecutionContext(
         sized_usd=sized_usd,
         best_bid=best_bid,
@@ -218,6 +232,8 @@ def assemble_candidate(
         regime_at_entry=regime.value,
         cl_ord_id=providers.new_cl_ord_id(),
         deadline=providers.new_deadline(),
+        market_regime=market.value if market is not None else None,
+        entry_timestamp_utc=_entry_timestamp_utc(candle),
     )
     return inputs, ctx
 

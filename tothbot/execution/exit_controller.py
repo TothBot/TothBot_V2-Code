@@ -33,13 +33,13 @@ NET P&L (D1 FEE-CALC-004, all Decimal, NO float per ar:AR-047), direction-symmet
 The figure writes the long form and states it is "applied identically to every exit
 path" (the four reasons); the short leg is the directional mirror (mod:Short_Module).
 
-PRODUCER-SOURCED record fields not yet wired (no inference loss - the schema is whole,
-the values fill in as their producers land): entry_timestamp_utc + hold_candle_count
-(no entry-time / candle-count writer yet), asset_regime + market_regime + signal_params
-(mod:Regime_Engine + mod:Signal_Pipeline are S3). vol_regime is derived from the
-position's regime_at_entry token when present. MAE_pct_reached is the adverse excursion
-AT THE EXIT TICK (the bbo bid/ask that fired the exit); a full max-over-life MAE wants
-the MTM tracker (carry-forward) - until then the at-exit value is the faithful floor.
+PRODUCER-SOURCED record fields, now wired off the entry-time D6 snapshot captured on the
+position at the opening fill: entry_timestamp_utc (the entry-trigger 5m candle stamp),
+hold_candle_count (the entry->exit span over the 5m period), market_regime (the ar:AR-074
+BTC/USD anchor regime at entry), and signal_params (the per-trade SSS levels). asset_regime
+carries the entry regime token; vol_regime is derived from it. MAE_pct_reached is the adverse
+excursion AT THE EXIT TICK (the bbo bid/ask that fired the exit); a full max-over-life MAE
+wants the MTM tracker (carry-forward) - until then the at-exit value is the faithful floor.
 
 This is a PURE close engine: no socket, no asyncio. It reads the Position Mirror + the
 synthetic ledger through the WSManager helper surfaces passed in as `wm`, and emits the
@@ -235,12 +235,18 @@ class ExitController:
         actual_rr = (net_pl / risk_exposed) if risk_exposed not in (None, Decimal("0")) else None
 
         # vol_regime derived from the entry regime token (NORMAL_VOL | ELEVATED_VOL);
-        # asset_regime carries the token verbatim; market_regime + signal_params are
-        # S3 producers (None until wired).
+        # asset_regime carries the token verbatim. market_regime + signal_params +
+        # entry_timestamp_utc are the entry-side producer fields captured on the position
+        # at the opening fill (the D6 snapshot); they fill in here on the close.
         regime = position.regime_at_entry
         vol_regime = _vol_regime_of(regime)
 
         now = self._now_iso()
+        # hold_candle_count (10): the number of committed 5m candles held = the entry->exit span
+        # over the 5m candle period (sec 7). Needs both the entry stamp (the D6 snapshot) and the
+        # exit clock; None when either is absent (no fabricated count).
+        entry_ts = getattr(position, "entry_timestamp_utc", None)
+        hold = _hold_candle_count(entry_ts, self._clock() if self._clock is not None else None)
         record = TradeClose(
             symbol=symbol,
             entry_fill_price=entry,
@@ -253,10 +259,14 @@ class ExitController:
             net_gain_usd=net_gain,
             net_loss_usd=net_loss,
             ts=now,
+            entry_timestamp_utc=entry_ts,
             exit_timestamp_utc=now,
+            hold_candle_count=hold,
             mae_pct_reached=mae_pct,
             asset_regime=regime,
             vol_regime=vol_regime,
+            market_regime=getattr(position, "market_regime", None),
+            signal_params=getattr(position, "signal_params", None),
             actual_rr=actual_rr,
         )
         # 6. emit TRADE_CLOSE (the canonical Stream-2 record).
@@ -268,6 +278,27 @@ class ExitController:
         # 9. release the G7 capital-commitment semaphore.
         wm.release_exit_semaphore()
         return record
+
+
+# The committed candle period the hold count is measured in (the contract:OHLC_5m_System_Clock tick).
+_CANDLE_PERIOD_SECONDS = 300
+
+
+def _hold_candle_count(entry_ts: str | None, exit_dt: datetime | None) -> int | None:
+    """contract:TRADE_CLOSE field (10) hold_candle_count - the number of 5m candles held, the
+    entry->exit span floor-divided by the 5m candle period. None when the entry stamp or the exit
+    clock is absent, or either ISO stamp is unparseable (no fabricated count). A non-positive span
+    (same-candle exit / clock skew) floors to 0."""
+    if entry_ts is None or exit_dt is None:
+        return None
+    try:
+        entry_dt = datetime.fromisoformat(entry_ts)
+    except (TypeError, ValueError):
+        return None
+    span = (exit_dt - entry_dt).total_seconds()
+    if span <= 0:
+        return 0
+    return int(span // _CANDLE_PERIOD_SECONDS)
 
 
 def _vol_regime_of(regime: str | None) -> str | None:

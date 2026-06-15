@@ -336,6 +336,7 @@ class WSManager:
         carries it."""
         symbol = _opt_str(event.get("symbol"))
         pending = self._pending_entries.get(symbol) if symbol is not None else None
+        signal_params = market_regime = entry_timestamp_utc = None
         if pending is not None:
             if regime_at_entry is None:
                 regime_at_entry = pending.get("regime_at_entry")
@@ -343,6 +344,9 @@ class WSManager:
                 atr_14_entry = pending.get("atr_14_entry")
             if emergsl_price is None:
                 emergsl_price = pending.get("emergsl_price")
+            signal_params = pending.get("signal_params")
+            market_regime = pending.get("market_regime")
+            entry_timestamp_utc = pending.get("entry_timestamp_utc")
         outcome = self.positions.apply_execution(
             event,
             writer=WRITER_ID,
@@ -350,6 +354,9 @@ class WSManager:
             emergsl_id=emergsl_id,
             atr_14_entry=atr_14_entry,
             emergsl_price=emergsl_price,
+            signal_params=signal_params,
+            market_regime=market_regime,
+            entry_timestamp_utc=entry_timestamp_utc,
         )
         # WS-TKR-003: a pair with an open position uses ticker event_trigger:bbo (faster
         # adverse-price detection); switch it on the opening fill (the close switches it
@@ -453,6 +460,9 @@ class WSManager:
         regime_at_entry: str | None = None,
         cl_ord_id: str,
         deadline: str,
+        signal_params: dict | None = None,
+        market_regime: str | None = None,
+        entry_timestamp_utc: str | None = None,
     ) -> bool:
         """Dispatch a gate:G8-accepted entry for THIS side through the shared seam, then place
         its on-fill emergSL. The marketable-IOC entry fills-or-kills atomically (AR-054): in
@@ -468,11 +478,16 @@ class WSManager:
             )
         module = self.modules[side]
         # Pending Order Registry (AR-053 / UT-EE-010): stash the entry-time D6 snapshot so the
-        # opening fill attaches it (emergsl_price for L3, atr_14_entry for L2, regime for tagging).
+        # opening fill attaches it (emergsl_price for L3, atr_14_entry for L2, regime for tagging,
+        # plus the contract:TRADE_CLOSE entry-side producer fields signal_params / market_regime /
+        # entry_timestamp_utc the close emits - the per-trade level + entry context, sec 7).
         self._pending_entries[symbol] = {
             "emergsl_price": emergsl_price,
             "atr_14_entry": atr_14_entry,
             "regime_at_entry": regime_at_entry,
+            "signal_params": signal_params,
+            "market_regime": market_regime,
+            "entry_timestamp_utc": entry_timestamp_utc,
         }
         try:
             # 1. ENTRY add_order (marketable IOC) -> the side's wallet + the opening position.

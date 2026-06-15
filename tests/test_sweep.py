@@ -98,9 +98,10 @@ class _FakeLogger:
         self.records.append((module, record))
 
 
-def _cache(regime=Regime.TRENDING_POS_NORMAL, ema20="105", ema50="100"):
+def _cache(regime=Regime.TRENDING_POS_NORMAL, ema20="105", ema50="100",
+           market_regime=Regime.NON_DIR_NORMAL):
     classification = SimpleNamespace(regime=regime, ema20=Decimal(ema20), ema50=Decimal(ema50))
-    return SimpleNamespace(get=lambda s: classification)
+    return SimpleNamespace(get=lambda s: classification, market_regime=market_regime)
 
 
 def _warmup(indicators=None, *, close_1h="106", ema20_1h="104"):
@@ -198,6 +199,9 @@ def test_assemble_sources_each_field():
     assert ctx.regime_at_entry == Regime.TRENDING_POS_NORMAL.value
     assert ctx.mpp_abs_cap_pct == Decimal("0.01")
     assert ctx.cl_ord_id == "cl-1"
+    # the entry-side producer context: the BTC anchor regime + the entry-trigger candle ISO stamp.
+    assert ctx.market_regime == Regime.NON_DIR_NORMAL.value
+    assert ctx.entry_timestamp_utc == "2023-11-14T22:18:20+00:00"   # interval_begin 1700000300 UTC
 
 
 # --------------------------------------------------------------------------- sweep_pair

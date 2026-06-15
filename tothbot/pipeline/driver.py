@@ -39,6 +39,8 @@ class ExecutionContext:
     regime_at_entry: str
     cl_ord_id: str
     deadline: str
+    market_regime: str | None = None       # (18) BTC/USD anchor regime at entry (ar:AR-074)
+    entry_timestamp_utc: str | None = None  # (8) ISO 8601 UTC of the entry-trigger 5m candle
 
 
 @dataclass(frozen=True)
@@ -86,5 +88,11 @@ async def process_candidate(
         regime_at_entry=exec_ctx.regime_at_entry,
         cl_ord_id=exec_ctx.cl_ord_id,
         deadline=exec_ctx.deadline,
+        # The entry-time D6 producer fields (contract:TRADE_CLOSE 8/18/19): signal_params rides the
+        # accepted pipeline outcome (the entry SSS levels); market_regime + entry_timestamp_utc ride
+        # the exec_ctx (assembled from the regime cache + the entry-trigger candle).
+        signal_params=outcome.signal_params,
+        market_regime=exec_ctx.market_regime,
+        entry_timestamp_utc=exec_ctx.entry_timestamp_utc,
     )
     return CandidateResult(outcome=outcome, dispatched=True, filled=filled)

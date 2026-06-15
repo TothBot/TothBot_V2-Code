@@ -89,6 +89,33 @@ def test_short_accepted_candidate_opens_short_in_short_wallet():
     assert wm.wallet_balance(PositionSide.LONG) == Decimal("5000.0")
 
 
+def test_accepted_candidate_stashes_the_producer_fields_on_the_position():
+    # the driver threads outcome.signal_params + ctx.market_regime/entry_timestamp_utc through
+    # execute_entry -> dispatch_entry -> the opening fill, so the position carries the entry context.
+    def _sss_with_params(symbol, closes, volumes, *, side, **kw):
+        return type("V", (), {
+            "passed": True, "code": "SIGNAL_PASS",
+            "signal_params": {"rsi_14": 40, "sss_pass": True, "side": "long"},
+        })()
+
+    wm = WSManager(Mode.PAPER)
+    logger = Logger()
+    ctx = ExecutionContext(
+        sized_usd="1000", best_bid="59990", best_ask="60000", mpp_abs_cap_pct="0.01",
+        atr_14_entry="1000", regime_at_entry="TRENDING_POS_NORMAL",
+        cl_ord_id="cl-1", deadline="2026-06-15T07:30:00Z",
+        market_regime="NON_DIR_NORMAL", entry_timestamp_utc="2026-06-15T07:25:00+00:00",
+    )
+    res = asyncio.run(process_candidate(
+        wm, logger, PositionSide.LONG, "BTC/USD", _inputs(), ctx, sss_evaluator=_sss_with_params,
+    ))
+    assert res.filled is True
+    pos = wm.position("BTC/USD")
+    assert pos.signal_params == {"rsi_14": 40, "sss_pass": True, "side": "long"}
+    assert pos.market_regime == "NON_DIR_NORMAL"
+    assert pos.entry_timestamp_utc == "2026-06-15T07:25:00+00:00"
+
+
 def test_rejected_candidate_is_logged_but_not_dispatched():
     # a LONG in a downtrend is blocked at G3 -> logged, no execution, no position.
     wm, logger, res = _run(PositionSide.LONG, _inputs(regime=Regime.TRENDING_NEG_NORMAL))

@@ -151,3 +151,26 @@ def test_verdict_score_counts_factors():
     assert v.sc_sss == (False, False, True)
     assert v.sss_score == 1
     assert v.passed is False
+
+
+def test_signal_params_is_the_canonical_trade_close_dict():
+    # contract:TRADE_CLOSE field (19): {rsi_14, ema_9, ema_21, volume_ratio, sss_pass, side}.
+    closes = [Decimal(100)] * 25
+    volumes = [Decimal(1000)] * 24 + [Decimal(5000)]
+    v = evaluate_sss("X", closes, volumes, side=SignalSide.LONG)
+    sp = v.signal_params
+    assert set(sp) == {"rsi_14", "ema_9", "ema_21", "volume_ratio", "sss_pass", "side"}
+    assert sp["rsi_14"] == v.rsi_14
+    assert sp["ema_9"] == v.ema9 and sp["ema_21"] == v.ema21
+    assert sp["volume_ratio"] == v.volume / v.volume_ma20   # the SC-SSS-3 ratio
+    assert sp["sss_pass"] is v.passed and sp["side"] == "long"
+
+
+def test_signal_params_volume_ratio_guards_zero_ma():
+    v = SssVerdict(
+        symbol="X", side=SignalSide.SHORT, rsi_14=Decimal(60), ema9=Decimal(1), ema21=Decimal(2),
+        ema_cross=True, volume=Decimal(5), volume_ma20=Decimal(0), volume_vs_ma20=True,
+        sc_sss=(True, True, True), passed=True,
+    )
+    assert v.signal_params["volume_ratio"] == Decimal(0)   # no division by a zero MA20
+    assert v.signal_params["side"] == "short"
