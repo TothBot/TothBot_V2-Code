@@ -30,18 +30,25 @@ the byte-identical record_execution surface (D-06) and debits/credits the synthe
 ledger through the sole-writer methods below. WSManager is the SOLE writer of BOTH the
 mirror (rule:HR-PM-009) and the ledger (rule:HR-WM-032).
 
-The paper EXIT lifecycle is now WIRED (sec 12.5). handle_ticker runs the ticker-bbo
-adverse-price detector (paper_exit.py, ar:AR-048 L2 MAE + the synthetic L3 emergSL
-touch) over each open position; a fired exit applies the synthetic ledger credit and
-routes through mod:Exit_Controller (execution/exit_controller.py) for the close
-sequence - the 23-field evt:TRADE_CLOSE record, the rule:HR-PM-009 mirror clear
-(close_position), the ar:AR-073 Selection-Controller state update, the semaphore
-release, and the WS-TKR-003 ticker trades-mode switch.
+The paper EXIT lifecycle is now WIRED (sec 12.5) across ALL THREE exit layers. handle_ticker
+runs the ticker-bbo adverse-price detector (paper_exit.py, ar:AR-048 L2 MAE + the synthetic
+L3 emergSL touch) over each open position; on_regime_classified + on_htf_ohlc_close run the
+layer:L1a regime-reversal detector (regime_exit.py, the EC-L1A-002 daily downgrade + the
+EC-L1A-001 1H HTF reversal, ar:AR-062) with the rule:HR-EC-016(a) pair-status precondition.
+Any fired exit applies the synthetic ledger credit and routes through mod:Exit_Controller
+(execution/exit_controller.py) for the SAME close sequence - the 23-field evt:TRADE_CLOSE
+record, the rule:HR-PM-009 mirror clear (close_position), the ar:AR-073 Selection-Controller
+state update, the semaphore release, and the WS-TKR-003 ticker trades-mode switch. The L1a
+sell is the SAME on_paper_close mechanism (a cleared mirror makes any follow-on detection a
+surfaced PAPER_CLOSE_SKIPPED, never a double-close).
 
-DEFERRED: the layer:L1a regime-reversal exits (mod:Regime_Engine-driven, S3); the
-producer-sourced TRADE_CLOSE fields (entry/exit timestamps, hold_candle_count, the
-regime tags, signal_params, a max-over-life MAE tracker); the G7 BoundedSemaphore
-acquire side (mod:Risk_Engine); and the REST contract:Reconciliation_REST fallback.
+DEFERRED: the daily-compute ORCHESTRATOR that calls on_regime_classified / on_htf_ohlc_close
+on the 00:00 UTC tick + every 1H close (the REST GetOHLCData edges, path C) - these handlers
+are driven directly for now; the producer-sourced TRADE_CLOSE fields (entry/exit timestamps,
+hold_candle_count, market_regime + signal_params - entry-side producers; a max-over-life MAE
+tracker); the live instrument-status channel feeding the pair-status precondition (the status
+is passed in for now); the G7 BoundedSemaphore acquire side (mod:Risk_Engine); and the REST
+contract:Reconciliation_REST fallback.
 """
 
 from __future__ import annotations
@@ -58,6 +65,16 @@ from .ledger import LedgerUpdate, SyntheticCapitalLedger
 from .outbound import PaperDispatchSimulator, PrivateTransmitter
 from .paper_exit import PaperEmergSlTriggered, PaperMaeDetected, detect_paper_exit
 from .paper_fill import PaperFillSimulator
+from .regime_exit import (
+    L1aExitHeld,
+    PairStatus,
+    PaperRegimeExitDetected,
+    RegimeExitNoQuote,
+    RegimeExitSignal,
+    detect_daily_regime_downgrade,
+    detect_htf_regime_reversal,
+    l1a_precondition_blocks,
+)
 from .position_mirror import (
     WRITER_ID,
     ExecOutcome,
@@ -65,11 +82,13 @@ from .position_mirror import (
     PositionAction,
     PositionClosedDuringGap,
     PositionMirror,
+    PositionSide,
 )
 from .seam import DispatchSeam, EventSink, LiveSender, PaperSimulator
 from ..config import registry
 from ..config.settings import Mode
 from ..execution.exit_controller import ExitController, ExitReason
+from ..regime.engine import RegimeClassification
 
 # Per-symbol ticker event_trigger modes (D1 WS-TKR-002/003): a pair WITH an open position
 # uses bbo (faster adverse-price detection - for a long, bid = realizable exit price); a
@@ -423,6 +442,102 @@ class WSManager:
         # 4-9. the Exit Controller close path (TRADE_CLOSE + clear mirror + AR-073 + sem).
         self.exit_controller.on_paper_close(
             symbol, signal.exit_price, ExitReason(signal.exit_reason), update.fee_usd, self
+        )
+        # 10. switch the symbol's ticker event_trigger to trades-mode (position closed).
+        self._update_ticker_event_trigger(symbol, has_position=False)
+
+    # --- layer:L1a regime-reversal exit drive (EC-L1A-001 / EC-L1A-002) ----------------
+    def on_regime_classified(
+        self,
+        symbol: str,
+        classification: RegimeClassification,
+        *,
+        bid: object | None = None,
+        ask: object | None = None,
+        pair_status: PairStatus = PairStatus.ONLINE,
+    ) -> None:
+        """EC-L1A-002 Daily Regime Downgrade (ar:AR-062): run the L1a daily-downgrade check on
+        a fresh mod:Regime_Engine classification for an open-position pair, immediately after
+        the 00:00 UTC compute_regime. Paper-mode close routing; a no-op in live (exit detection
+        is executions-driven there, a later slice). bid/ask are the realizable market-sell fill
+        prices (ar:AR-048: bid for a long, ask for a short), supplied from the latest ticker by
+        the daily-compute orchestrator (path C); pair_status feeds the rule:HR-EC-016(a)
+        Step-1 precondition (the live instrument-status channel is a later slice)."""
+        if not self.is_paper:
+            return
+        position = self.positions.get(symbol)
+        if position is None:
+            return
+        signal = detect_daily_regime_downgrade(position, classification)
+        if signal is not None:
+            self._drive_regime_exit(position, signal, bid, ask, pair_status)
+
+    def on_htf_ohlc_close(
+        self,
+        symbol: str,
+        htf_ema_short: object,
+        htf_ema_long: object,
+        *,
+        bid: object | None = None,
+        ask: object | None = None,
+        pair_status: PairStatus = PairStatus.ONLINE,
+    ) -> None:
+        """EC-L1A-001 HTF Regime Reversal (ar:AR-062): run the L1a 1H-EMA-reversal check on
+        every 1H ohlc(60) close for an open-position pair. htf_ema_short / htf_ema_long are the
+        current 1H EMA(20) / EMA(50). Paper-mode close routing; a no-op in live. bid/ask +
+        pair_status as on_regime_classified."""
+        if not self.is_paper:
+            return
+        position = self.positions.get(symbol)
+        if position is None:
+            return
+        signal = detect_htf_regime_reversal(position, htf_ema_short, htf_ema_long)
+        if signal is not None:
+            self._drive_regime_exit(position, signal, bid, ask, pair_status)
+
+    def _drive_regime_exit(
+        self,
+        position: Position,
+        signal: RegimeExitSignal,
+        bid: object | None,
+        ask: object | None,
+        pair_status: PairStatus,
+    ) -> None:
+        """The sec-12.5 paper EXIT FLOW for a fired layer:L1a regime exit. rule:HR-EC-016(a)
+        Step 1 (pair-status precondition) runs FIRST - BEFORE the ledger credit - so a HELD
+        exit never moves the synthetic ledger. Then the same sec-12.5 sequence as the ticker
+        path: (2) ledger credit (retain entry fee); (3) PAPER_REGIME_EXIT_DETECTED; (4-9) the
+        Exit Controller close; (10) ticker trades-mode."""
+        symbol = position.symbol
+        # 1. rule:HR-EC-016(a) Step 1: pair-status precondition. cancel_only / maintenance ->
+        # HOLD + CRITICAL alert + NO order (the resting emergSL is the only protection).
+        if l1a_precondition_blocks(pair_status):
+            self._emit_event(
+                L1aExitHeld(symbol, pair_status.value, signal.exit_reason, signal.trigger)
+            )
+            return
+        # The realizable market-sell fill price (ar:AR-048: bid for a long, ask for a short).
+        quote = bid if position.side is PositionSide.LONG else ask
+        if quote is None:
+            self._emit_event(RegimeExitNoQuote(symbol, signal.exit_reason, signal.trigger))
+            return
+        exit_price = Decimal(str(quote))
+        # 2. WSManager applies the HR-WM-032 ledger credit (retain the entry fee for net P&L).
+        update = self.apply_paper_exit_fill(
+            symbol,
+            position.qty,
+            exit_price,
+            exit_reason=signal.exit_reason,
+            retain_fees_entry=True,
+        )
+        # 3. log PAPER_REGIME_EXIT_DETECTED (sec 12.6).
+        self._emit_event(
+            PaperRegimeExitDetected(symbol, exit_price, signal.exit_reason, signal.trigger)
+        )
+        # 4-9. the Exit Controller close path (the SAME on_paper_close - no double-close: a
+        # cleared mirror makes any follow-on ticker detection a surfaced PAPER_CLOSE_SKIPPED).
+        self.exit_controller.on_paper_close(
+            symbol, exit_price, ExitReason(signal.exit_reason), update.fee_usd, self
         )
         # 10. switch the symbol's ticker event_trigger to trades-mode (position closed).
         self._update_ticker_event_trigger(symbol, has_position=False)

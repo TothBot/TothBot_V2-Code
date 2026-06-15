@@ -36,12 +36,20 @@ from tothbot.exchange.seam import (
     PaperOrderSimulated,
 )
 from tothbot.exchange.paper_exit import PaperEmergSlTriggered, PaperMaeDetected
+from tothbot.exchange.regime_exit import (
+    L1aExitHeld,
+    PairStatus,
+    PaperRegimeExitDetected,
+    RegimeExitNoQuote,
+)
+from tothbot.regime.engine import classify_from_indicators
+from tothbot.regime.taxonomy import Regime
 from tothbot.exchange.ws_manager import (
     SelectionStateUpdated,
     TickerTriggerSwitched,
     WSManager,
 )
-from tothbot.execution.exit_controller import ExitReason, TradeClose
+from tothbot.execution.exit_controller import ExitReason, PaperCloseSkipped, TradeClose
 
 
 # -- connection: endpoints + invariants ---------------------------------
@@ -533,3 +541,125 @@ def test_close_position_clears_mirror_and_fees_entry():
     m.close_position("BTC/USD")
     assert not m.has_position("BTC/USD")
     assert m.fees_entry_for("BTC/USD") is None
+
+
+# -- layer:L1a regime-reversal exit drive (EC-L1A-001 / EC-L1A-002) ------------
+
+def _trending_neg():
+    """A daily classification landing TRENDING_NEG_NORMAL (a long-blocking downgrade)."""
+    return classify_from_indicators("BTC/USD", "40", "95", "100", "1000", "50")
+
+
+def test_l1a_daily_downgrade_full_close():
+    events: list = []
+    sem = _FakeSemaphore()
+    m = WSManager(Mode.PAPER, on_event=events.append,
+                  now_monotonic=lambda: 999.0, exit_semaphore=sem)
+    _open_paper_long(m)
+    assert m.spot_usd_balance == Decimal("1992.2")
+
+    # 00:00 UTC regime refresh downgrades the pair; run-to-reversal close at the bid 61000.
+    m.on_regime_classified("BTC/USD", _trending_neg(), bid="61000", ask="61100")
+
+    assert not m.has_position("BTC/USD")               # mirror cleared (step 7)
+    assert m.ledger.fees_entry_for("BTC/USD") is None  # entry fee cleared
+    assert m.spot_usd_balance == Decimal("5034.27")    # 1992.2 + (3050 - 7.93)
+
+    closes = [e for e in events if isinstance(e, TradeClose)]
+    assert len(closes) == 1
+    rec = closes[0]
+    assert rec.exit_reason is ExitReason.DAILY_REGIME_DOWNGRADE
+    assert rec.exit_price == Decimal("61000")          # ar:AR-048 bid for a long
+    assert rec.net_pl_usd == Decimal("34.27")          # run-to-reversal in profit (a win)
+    assert rec.net_gain_usd == Decimal("34.27")
+    # detection telemetry + AR-073 win-reset + ticker trades-mode + semaphore release.
+    det = [e for e in events if isinstance(e, PaperRegimeExitDetected)]
+    assert len(det) == 1 and det[0].trigger == "EC-L1A-002"
+    assert m.consecutive_loss_count("BTC/USD") == 0     # win path
+    assert m.ticker_event_trigger("BTC/USD") == "trades"
+    assert sem.released == 1
+    assert any(isinstance(e, SelectionStateUpdated) and e.is_win for e in events)
+
+
+def test_l1a_htf_reversal_full_close():
+    events: list = []
+    m = WSManager(Mode.PAPER, on_event=events.append)
+    _open_paper_long(m)
+    # 1H close: EMA20 < EMA50 -> HTF reversal; sell at the bid.
+    m.on_htf_ohlc_close("BTC/USD", "99", "100", bid="61000", ask="61100")
+    assert not m.has_position("BTC/USD")
+    rec = next(e for e in events if isinstance(e, TradeClose))
+    assert rec.exit_reason is ExitReason.HTF_REGIME_REVERSAL
+    det = next(e for e in events if isinstance(e, PaperRegimeExitDetected))
+    assert det.trigger == "EC-L1A-001"
+
+
+def test_l1a_held_on_cancel_only_pair_status():
+    # rule:HR-EC-016(a): cancel_only -> HOLD, CRITICAL alert, NO order, ledger untouched.
+    events: list = []
+    m = WSManager(Mode.PAPER, on_event=events.append)
+    _open_paper_long(m)
+    balance_before = m.spot_usd_balance
+    m.on_regime_classified("BTC/USD", _trending_neg(), bid="61000", ask="61100",
+                           pair_status=PairStatus.CANCEL_ONLY)
+    assert m.has_position("BTC/USD")                   # position retained
+    assert m.spot_usd_balance == balance_before        # ledger NOT moved
+    held = [e for e in events if isinstance(e, L1aExitHeld)]
+    assert len(held) == 1 and held[0].pair_status == "cancel_only"
+    assert not any(isinstance(e, TradeClose) for e in events)
+
+
+def test_l1a_no_double_close_against_ticker_path():
+    # carry-forward (f): the L1a close is the SAME on_paper_close; a follow-on ticker
+    # detection on the cleared mirror is a surfaced PAPER_CLOSE_SKIPPED, never a 2nd close.
+    events: list = []
+    m = WSManager(Mode.PAPER, on_event=events.append)
+    _open_paper_long(m)                                 # atr 2000 -> L2 threshold 3000
+    m.on_regime_classified("BTC/USD", _trending_neg(), bid="56000", ask="56100")
+    assert not m.has_position("BTC/USD")
+    # an adverse ticker arrives AFTER the L1a close: handle_ticker skips the now-empty symbol
+    # (no detection, no second close); the single TRADE_CLOSE stands.
+    m.handle_ticker(_ticker("BTC/USD", "56000", "56100"))
+    assert len([e for e in events if isinstance(e, TradeClose)]) == 1
+    # and the on_paper_close guard itself: a direct second close on the cleared symbol is a
+    # surfaced PAPER_CLOSE_SKIPPED, never a duplicate TRADE_CLOSE record.
+    assert m.exit_controller.on_paper_close(
+        "BTC/USD", "56000", ExitReason.MAE_THRESHOLD_BREACH, "0", m
+    ) is None
+    assert any(isinstance(e, PaperCloseSkipped) for e in events)
+    assert len([e for e in events if isinstance(e, TradeClose)]) == 1
+
+
+def test_l1a_defers_when_no_realizable_quote():
+    events: list = []
+    m = WSManager(Mode.PAPER, on_event=events.append)
+    _open_paper_long(m)
+    # fired, precondition ok, but no bid for the long market sell -> deferred, position kept.
+    m.on_regime_classified("BTC/USD", _trending_neg(), bid=None, ask="61100")
+    assert m.has_position("BTC/USD")
+    assert any(isinstance(e, RegimeExitNoQuote) for e in events)
+    assert not any(isinstance(e, TradeClose) for e in events)
+
+
+def test_l1a_holds_when_regime_still_supports_long():
+    m = WSManager(Mode.PAPER)
+    _open_paper_long(m)
+    pos_regime = classify_from_indicators("BTC/USD", "40", "105", "100", "1000", "50")
+    assert pos_regime.regime is Regime.TRENDING_POS_NORMAL
+    m.on_regime_classified("BTC/USD", pos_regime, bid="61000", ask="61100")
+    assert m.has_position("BTC/USD")                   # no downgrade -> no exit
+
+
+def test_l1a_no_open_position_is_noop():
+    events: list = []
+    m = WSManager(Mode.PAPER, on_event=events.append)
+    m.on_regime_classified("BTC/USD", _trending_neg(), bid="61000", ask="61100")
+    assert not any(isinstance(e, (TradeClose, PaperRegimeExitDetected)) for e in events)
+
+
+def test_l1a_is_noop_in_live_mode():
+    m = WSManager(Mode.LIVE)
+    # no exit_controller in live; the L1a handlers must be inert, not raise.
+    m.on_regime_classified("BTC/USD", _trending_neg(), bid="61000", ask="61100")
+    m.on_htf_ohlc_close("BTC/USD", "99", "100", bid="61000", ask="61100")
+    assert m.exit_controller is None
