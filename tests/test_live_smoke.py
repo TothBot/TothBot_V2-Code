@@ -437,3 +437,60 @@ def test_running_closes_report_a_stop_width_loosen_without_alerting():
     assert any(getattr(e, "code", None) == "PDCA_CHECK_RESULT" and getattr(e, "passed", None) is False
                for e in logger.operational)                # the disproven theory is reported
     assert not _mae_alert(logger)                          # never brought to Bill
+
+
+# ------------------------------------------------ TB00752 (c): the C4 MONTHLY PULL report VIEW over
+# the captured record - a degrading run -> the reported theory surfaces in the view, no new capture,
+# no C1 alert (the email track stays separate from the periodic pull report)
+
+def _close_at(net, when, *, heat=None):
+    """A schema-valid 23-field TRADE_CLOSE stamped with an exit instant (so the report windowing has
+    a wall-clock to bucket on - in the running organism the exit_controller sets exit_timestamp_utc)."""
+    n = Decimal(net)
+    win = n > 0
+    return TradeClose(
+        symbol="BTC/USD", entry_fill_price=Decimal("60000"), exit_price=Decimal("66000"),
+        exit_reason=ExitReason.HTF_REGIME_REVERSAL,
+        fees_entry_usd=Decimal("0"), fees_exit_usd=Decimal("0"), fees_total_usd=Decimal("1"),
+        net_pl_usd=n, net_gain_usd=(n if win else Decimal("0")),
+        net_loss_usd=(Decimal("0") if win else -n), asset_regime="TRENDING_POS_NORMAL",
+        exit_timestamp_utc=when, actual_rr=(Decimal("1.6") if win else Decimal("-1")),
+        mae_pct_reached=(Decimal(str(heat)) if heat is not None else None),
+    )
+
+
+def test_monthly_report_view_surfaces_the_reported_theory_no_new_capture():
+    # The capstone for the report VIEWS: a degrading run through the wired ciats_sink (winners hot,
+    # losers cool -> a stop-width LOOSEN the replay cannot credit -> a CHECK-failed CheckResult
+    # REPORTED into Stream-1, NO C1 alert) -> the C4 MONTHLY report VIEW, built purely from the
+    # captured record, surfaces that reported theory + the realized trade performance for the LONG
+    # module, with NO new capture and NO email-track alert for the reported item.
+    from tothbot.recorder.reporting import ReportCategory, build_operator_report
+
+    system, _wm, logger = _assemble_real_wm()
+    sink = system.ciats_sinks[PositionSide.LONG]
+    for _ in range(120):
+        sink(_close_at("5", "2026-06-10T12:00:00+00:00", heat=5))   # winners, hot
+    for _ in range(80):
+        sink(_close_at("-10", "2026-06-12T12:00:00+00:00", heat=1))  # losers, cool -> 200 + CUSUM breach
+
+    stores = {s.value: system.conductors[s].parameter_store for s in (PositionSide.LONG, PositionSide.SHORT)}
+    report = build_operator_report(
+        logger, stores, category=ReportCategory.C4_MONTHLY,
+        as_of=datetime(2026, 6, 15, 18, 0, tzinfo=timezone.utc),
+    )
+    lm = report.per_module["long"]
+    # the realized trade performance for June is the full degrading run (120*5 + 80*-10 = -200).
+    assert lm.performance.trade_count == 200
+    assert lm.performance.net_pl_usd == Decimal("-200")
+    assert lm.performance.inference_valid is True            # the 200-trade floor is reached
+    assert lm.progress_to_inference_floor == "200/200 (reached)"
+    # the disproven stop-width theory is REPORTED in the view (the SAME object captured in Stream-1 -
+    # a VIEW, not a re-derivation -> no new capture).
+    assert lm.reported_theories
+    assert all(getattr(t, "passed", None) is False for t in lm.reported_theories)
+    assert all(t in logger.operational for t in lm.reported_theories)
+    # the email track stays separate: NO C1 mae_mult alert was raised for the reported item.
+    assert not _mae_alert(logger)
+    # the short module is isolated (no closes flowed to it) - per-module, sec 7.
+    assert report.per_module["short"].performance.trade_count == 0
