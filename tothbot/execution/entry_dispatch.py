@@ -97,8 +97,10 @@ def build_emergsl_order(
         "order_qty": _s(order_qty),
         # The stop trigger: BELOW entry for a long, ABOVE entry for a short (the G8 emergsl_price
         # already carries the correct side of entry). triggers.reference="last" is mandatory on
-        # every emergSL (UT-EE-004 / rule:HR-EI) - trigger on the last trade price.
-        "triggers": {"reference": "last", "price": _s(emergsl_price)},
+        # every emergSL (UT-EE-004 / WS-BA-003); triggers.price_type="static" MUST be set
+        # explicitly (WS-BA-002) - a fixed-price crash stop, NOT trailing; omitting it lets Kraken
+        # default to the wrong stop semantics.
+        "triggers": {"reference": "last", "price": _s(emergsl_price), "price_type": "static"},
         "cl_ord_id": cl_ord_id,
         "stp_type": _STP_CANCEL_NEWEST,         # A-4 / UT-EE-002
         "deadline": deadline,                   # now+5s / UT-EE-003

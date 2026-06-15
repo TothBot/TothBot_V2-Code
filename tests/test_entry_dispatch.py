@@ -66,7 +66,7 @@ def test_long_emergsl_is_a_sell_stop_below_entry():
     leg = msg["params"]["orders"][0]
     assert leg["side"] == "sell"               # close a long by selling
     assert leg["order_type"] == "stop-loss"
-    assert leg["triggers"] == {"reference": "last", "price": "57000"}  # UT-EE-004
+    assert leg["triggers"] == {"reference": "last", "price": "57000", "price_type": "static"}  # UT-EE-004
     assert "reduce_only" not in leg            # spot long SL carries NO reduce_only (margin-only flag)
     assert leg["stp_type"] == "cancel_newest"
 
@@ -80,7 +80,7 @@ def test_short_emergsl_is_a_buy_to_cover_reduce_only_above_entry():
     assert leg["side"] == "buy"                 # buy-to-cover (ar:AR-009)
     assert leg["reduce_only"] is True           # mandatory on the short margin cover
     assert leg["order_type"] == "stop-loss"
-    assert leg["triggers"] == {"reference": "last", "price": "63000"}  # UT-EE-004
+    assert leg["triggers"] == {"reference": "last", "price": "63000", "price_type": "static"}  # UT-EE-004
 
 
 def test_emergsl_single_leg():
