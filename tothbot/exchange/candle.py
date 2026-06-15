@@ -22,7 +22,7 @@ from enum import Enum
 _FRACTION = re.compile(r"\.(\d+)")
 
 
-def _parse_interval_begin(value: str | datetime) -> datetime:
+def parse_interval_begin(value: str | datetime) -> datetime:
     """Parse an RFC3339 (nanosecond) candle-start string to a UTC datetime.
 
     Accepts a trailing 'Z' and any fractional-second precision (truncated to
@@ -38,6 +38,10 @@ def _parse_interval_begin(value: str | datetime) -> datetime:
         s = s[: m.start()] + "." + m.group(1)[:6] + s[m.end() :]
     dt = datetime.fromisoformat(s)
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+# Back-compat internal alias (the original private name); prefer parse_interval_begin.
+_parse_interval_begin = parse_interval_begin
 
 
 class Interval(Enum):
