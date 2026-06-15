@@ -141,6 +141,10 @@ def test_profiles_match_d4_policy():
     assert p(Regime.TRENDING_POS_NORMAL).long_entry_permitted is True
     assert p(Regime.NON_DIR_NORMAL).size_multiplier == Decimal("0.5")
     assert p(Regime.NON_DIR_NORMAL).long_entry_permitted is True
+    # DEC-B SYMMETRIC (Image4 R10): NON_DIR_NORMAL admits SHORT too, both at half size.
+    assert p(Regime.NON_DIR_NORMAL).short_entry_permitted is True
+    assert p(Regime.NON_DIR_NORMAL).entry_permitted(is_long=False) is True
+    assert p(Regime.NON_DIR_NORMAL).cascade is False
     # Regime 4: no entry either side (HR-REGIME-008).
     assert p(Regime.NON_DIR_ELEVATED).long_entry_permitted is False
     assert p(Regime.NON_DIR_ELEVATED).short_entry_permitted is False

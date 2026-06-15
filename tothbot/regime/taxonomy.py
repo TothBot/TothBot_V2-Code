@@ -97,8 +97,11 @@ PROFILES: dict[Regime, RegimeProfile] = {
         VolatilityState.ELEVATED_VOL, True, False, _FULL,
     ),
     Regime.NON_DIR_NORMAL: RegimeProfile(
+        # Bill ruling DEC-B SYMMETRIC (0500000 Image4 R10): a non-directional NORMAL-vol
+        # market admits BOTH sides at HALF size (the full mirror of Long) - long_entry +
+        # short_entry both permitted, size_multiplier 0.5 each. No directional cascade.
         Regime.NON_DIR_NORMAL, DirectionalState.NON_DIRECTIONAL,
-        VolatilityState.NORMAL_VOL, True, False, _HALF,
+        VolatilityState.NORMAL_VOL, True, True, _HALF,
     ),
     Regime.NON_DIR_ELEVATED: RegimeProfile(
         Regime.NON_DIR_ELEVATED, DirectionalState.NON_DIRECTIONAL,

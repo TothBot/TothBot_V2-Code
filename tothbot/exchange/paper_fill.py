@@ -171,10 +171,17 @@ class PaperFillSimulator:
         self._record_execution(frame)
         # 2) Apply the synthetic ledger debit/credit through the single owner (sec 12.4).
         if kind is PaperFillKind.ENTRY:
-            self._apply_entry_fill(symbol, qty, fill_price)
+            self._apply_entry_fill(symbol, qty, fill_price, is_short=(side == "sell"))
         else:
+            # A long CLOSE is a sell-to-close (side="sell"); a short CLOSE is a
+            # buy-to-cover (side="buy", ar:AR-009) - so the exit's short flag is the
+            # mirror of the entry's: is_short when the closing fill is a BUY.
             self._apply_exit_fill(
-                symbol, qty, fill_price, exit_reason=_opt_str(params.get("exit_reason"))
+                symbol,
+                qty,
+                fill_price,
+                exit_reason=_opt_str(params.get("exit_reason")),
+                is_short=(side == "buy"),
             )
         self._emit(
             PaperFillSimulated(

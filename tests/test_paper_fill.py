@@ -29,11 +29,11 @@ def _sim(events: list | None = None):
         frames.append(dict(frame))
         return None
 
-    def _entry(symbol, qty, price):
+    def _entry(symbol, qty, price, *, is_short=False):
         entries.append((symbol, qty, price))
         return None
 
-    def _exit(symbol, qty, price, *, exit_reason=None):
+    def _exit(symbol, qty, price, *, exit_reason=None, is_short=False):
         exits.append((symbol, qty, price, exit_reason))
         return None
 
@@ -117,6 +117,48 @@ def test_exit_produces_closing_frame_and_credits_ledger():
     assert any(
         isinstance(e, PaperFillSimulated) and e.kind is PaperFillKind.EXIT for e in events
     )
+
+
+# -- SHORT direction: side -> is_short threading (ar:AR-009) ------------
+
+def test_short_entry_and_exit_thread_is_short_to_the_ledger():
+    # The simulator derives the ledger's short flag from the fill side: a sell-to-open
+    # ENTRY and a buy-to-cover EXIT are both is_short=True (the spot-long mirror).
+    entry_calls: list = []
+    exit_calls: list = []
+
+    def _entry(symbol, qty, price, *, is_short=False):
+        entry_calls.append((symbol, is_short))
+
+    def _exit(symbol, qty, price, *, exit_reason=None, is_short=False):
+        exit_calls.append((symbol, is_short))
+
+    sim = PaperFillSimulator(
+        record_execution=lambda frame: None,
+        apply_entry_fill=_entry,
+        apply_exit_fill=_exit,
+    )
+    short_entry = {"symbol": "BTC/USD", "side": "sell", "order_qty": "0.05", "limit_price": "60000"}
+    short_cover = {"symbol": "BTC/USD", "side": "buy", "order_qty": "0.05", "limit_price": "54000"}
+    asyncio.run(sim(OutboundOp.ADD_ORDER, short_entry))
+    asyncio.run(sim(OutboundOp.DISPATCH_MARKET_SELL, short_cover))
+
+    assert entry_calls == [("BTC/USD", True)]   # sell-to-open -> short
+    assert exit_calls == [("BTC/USD", True)]    # buy-to-cover -> short
+
+
+def test_long_entry_and_exit_stay_is_short_false():
+    entry_calls: list = []
+    exit_calls: list = []
+    sim = PaperFillSimulator(
+        record_execution=lambda frame: None,
+        apply_entry_fill=lambda s, q, p, *, is_short=False: entry_calls.append(is_short),
+        apply_exit_fill=lambda s, q, p, *, exit_reason=None, is_short=False: exit_calls.append(is_short),
+    )
+    asyncio.run(sim(OutboundOp.ADD_ORDER, _ENTRY_MSG))            # buy-to-open
+    asyncio.run(sim(OutboundOp.DISPATCH_MARKET_SELL, _EXIT_MSG))  # sell-to-close
+    assert entry_calls == [False]
+    assert exit_calls == [False]
 
 
 # -- non-fill ops (clean no-op) -----------------------------------------

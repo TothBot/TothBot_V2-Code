@@ -11,6 +11,7 @@ from decimal import Decimal
 
 import pytest
 
+from tothbot.config import registry
 from tothbot.config.fees import FEE_TAKER_PCT
 from tothbot.exchange.ledger import (
     LedgerEventType,
@@ -22,6 +23,7 @@ from tothbot.exchange.ledger import (
 
 WRITER = "WS_Manager"
 _TAKER = Decimal(str(FEE_TAKER_PCT))
+_MARGIN_OPEN = Decimal(str(registry.value("margin_open_fee_pct")))
 
 
 # -- initialization (sec 12.4 INIT) -------------------------------------
@@ -135,6 +137,72 @@ def test_round_trip_profit_and_loss_shape():
     loss.entry_fill_debit("BTC/USD", "0.05", "60000", writer=WRITER)
     loss.exit_fill_credit("BTC/USD", "0.05", "54000", writer=WRITER)
     assert loss.balance < Decimal("5000")
+
+
+# -- SHORT direction (ar:AR-009 Kraken margin, DEC-A margin fees) -------
+# A spot LONG buys-to-open (DEBIT) / sells-to-close (CREDIT). A margin SHORT is the
+# mirror: sell-to-open CREDITS proceeds net of taker + margin_open_fee_pct; buy-to-cover
+# DEBITS the cover cost + taker + the accrued margin_rollover. Short net P&L on a round
+# trip is (entry - exit) * qty - fees (profit when price FALLS).
+
+def test_short_entry_credits_proceeds_net_of_taker_and_margin_open():
+    events: list = []
+    led = SyntheticCapitalLedger(5000, on_event=events.append)
+    upd = led.entry_fill_debit("BTC/USD", "0.05", "60000", writer=WRITER, is_short=True)
+
+    entry_proceeds = Decimal("0.05") * Decimal("60000")              # 3000
+    fees_entry = entry_proceeds * _TAKER + entry_proceeds * _MARGIN_OPEN  # 7.8 + 0.6 = 8.4
+    assert fees_entry == Decimal("8.4")
+    # sell-to-open is a CREDIT: balance RISES by proceeds - fees.
+    assert upd.delta_usd == entry_proceeds - fees_entry              # +2991.6
+    assert led.balance == Decimal("5000") + (entry_proceeds - fees_entry)
+    assert led.balance == Decimal("7991.6")
+    assert upd.fee_usd == fees_entry
+    # the entry-side cost retained for net P&L on close includes the margin open fee.
+    assert led.fees_entry_for("BTC/USD") == Decimal("8.4")
+
+
+def test_short_exit_debits_cover_cost_plus_taker_and_rollover():
+    led = SyntheticCapitalLedger(5000)
+    led.entry_fill_debit("BTC/USD", "0.05", "60000", writer=WRITER, is_short=True)  # 7991.6
+    upd = led.exit_fill_credit(
+        "BTC/USD", "0.05", "54000", writer=WRITER, is_short=True,
+        margin_rollover_usd="1.20", exit_reason="L1A",
+    )
+    exit_proceeds = Decimal("0.05") * Decimal("54000")              # 2700 (cover cost)
+    fees_exit = exit_proceeds * _TAKER + Decimal("1.20")           # 7.02 + 1.20 = 8.22
+    assert fees_exit == Decimal("8.22")
+    # buy-to-cover is a DEBIT: balance FALLS by cover cost + fees.
+    assert upd.delta_usd == -(exit_proceeds + fees_exit)           # -2708.22
+    assert led.balance == Decimal("7991.6") - (exit_proceeds + fees_exit)
+    assert led.balance == Decimal("5283.38")
+    assert upd.fee_usd == fees_exit
+
+
+def test_short_round_trip_profits_when_price_falls():
+    # SHORT wins on a DROP (60000 -> 54000) and loses on a RISE (60000 -> 66000),
+    # the exact mirror of the long round-trip shape - after both fee legs.
+    win = SyntheticCapitalLedger(5000)
+    win.entry_fill_debit("BTC/USD", "0.05", "60000", writer=WRITER, is_short=True)
+    win.exit_fill_credit("BTC/USD", "0.05", "54000", writer=WRITER, is_short=True)
+    assert win.balance > Decimal("5000")
+
+    loss = SyntheticCapitalLedger(5000)
+    loss.entry_fill_debit("BTC/USD", "0.05", "60000", writer=WRITER, is_short=True)
+    loss.exit_fill_credit("BTC/USD", "0.05", "66000", writer=WRITER, is_short=True)
+    assert loss.balance < Decimal("5000")
+
+
+def test_short_net_pnl_equals_entry_minus_exit_times_qty_minus_fees():
+    # net = (entry - exit) * qty - (fees_entry + fees_exit), no margin rollover.
+    led = SyntheticCapitalLedger(5000)
+    led.entry_fill_debit("BTC/USD", "0.05", "60000", writer=WRITER, is_short=True)
+    led.exit_fill_credit("BTC/USD", "0.05", "54000", writer=WRITER, is_short=True)
+    gross = (Decimal("60000") - Decimal("54000")) * Decimal("0.05")  # 300
+    entry_proceeds = Decimal("0.05") * Decimal("60000")
+    exit_proceeds = Decimal("0.05") * Decimal("54000")
+    fees = (entry_proceeds * _TAKER + entry_proceeds * _MARGIN_OPEN) + exit_proceeds * _TAKER
+    assert led.balance == Decimal("5000") + gross - fees
 
 
 # -- single-owner guard (rule:HR-WM-032) --------------------------------

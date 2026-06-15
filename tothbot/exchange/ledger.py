@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
 
+from ..config import registry
 from ..config.fees import FEE_TAKER_PCT
 
 # rule:HR-WM-032 / sec 12.4 OWNERSHIP - the ONLY identity permitted to write the
@@ -53,6 +54,12 @@ WRITER_ID = "WS_Manager"
 # The marketable-IOC entry fills at taker and ALL exits close at taker (sec 12.4),
 # so the synthetic ledger uses the taker rate on both legs.
 _FEE_TAKER = Decimal(str(FEE_TAKER_PCT))
+
+# param:margin_open_fee_pct (Short only; Kraken spot-margin OPEN fee, ar:AR-009; TB00000
+# v2_100 sec 8) as Decimal once. A spot LONG pays neither margin fee. The per-4h ROLLOVER
+# fee (param:margin_rollover_fee_pct) is accrued from hold time and passed in at close as
+# margin_rollover_usd (0 until the entry-time / hold-count producer lands).
+_MARGIN_OPEN_FEE = Decimal(str(registry.value("margin_open_fee_pct")))
 
 EventSink = Callable[[object], None]
 
@@ -195,6 +202,7 @@ class SyntheticCapitalLedger:
         entry_fill_price: object,
         *,
         writer: str,
+        is_short: bool = False,
     ) -> LedgerUpdate:
         """ENTRY-FILL DEBIT (sec 12.4). On a simulated entry fill at FEE_TAKER_PCT (the
         marketable-IOC entry fills at taker):
@@ -207,9 +215,18 @@ class SyntheticCapitalLedger:
         q = _dec(qty)
         price = _dec(entry_fill_price)
         entry_proceeds = q * price
-        fees_entry = entry_proceeds * _FEE_TAKER
+        taker_fee = entry_proceeds * _FEE_TAKER
+        if is_short:
+            # SELL-to-open (Kraken margin, ar:AR-009): receive proceeds, pay the taker fee +
+            # the margin OPEN fee -> CREDIT. fees_entry (the entry-side cost the Exit
+            # Controller subtracts for net P&L) = taker + margin_open.
+            fees_entry = taker_fee + entry_proceeds * _MARGIN_OPEN_FEE
+            delta = entry_proceeds - fees_entry
+        else:
+            # BUY-to-open (spot long): pay proceeds + taker fee -> DEBIT.
+            fees_entry = taker_fee
+            delta = -(entry_proceeds + fees_entry)
         prior = self._balance
-        delta = -(entry_proceeds + fees_entry)
         self._balance = prior + delta
         self._fees_entry[symbol] = fees_entry
         self._emit(
@@ -233,6 +250,8 @@ class SyntheticCapitalLedger:
         exit_price: object,
         *,
         writer: str,
+        is_short: bool = False,
+        margin_rollover_usd: object = Decimal("0"),
         exit_reason: str | None = None,
         retain_fees_entry: bool = False,
     ) -> LedgerUpdate:
@@ -250,9 +269,17 @@ class SyntheticCapitalLedger:
         q = _dec(qty)
         price = _dec(exit_price)
         exit_proceeds = q * price
-        fees_exit = exit_proceeds * _FEE_TAKER
+        taker_fee = exit_proceeds * _FEE_TAKER
+        if is_short:
+            # BUY-to-cover (Kraken margin close): pay the cover cost + taker fee + the
+            # accrued margin ROLLOVER fee -> DEBIT.
+            fees_exit = taker_fee + _dec(margin_rollover_usd)
+            delta = -(exit_proceeds + fees_exit)
+        else:
+            # SELL-to-close (spot long): receive proceeds net of the taker fee -> CREDIT.
+            fees_exit = taker_fee
+            delta = exit_proceeds - fees_exit
         prior = self._balance
-        delta = exit_proceeds - fees_exit
         self._balance = prior + delta
         if not retain_fees_entry:
             self._fees_entry.pop(symbol, None)

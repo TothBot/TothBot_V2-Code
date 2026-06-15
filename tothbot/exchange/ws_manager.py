@@ -303,16 +303,19 @@ class WSManager:
     # callers that tag a ledger write with WRITER_ID (sec 12.4 single-owner). Paper
     # mode only - in live the ledger is None (real Kraken balances are authoritative).
     def apply_paper_entry_fill(
-        self, symbol: str, qty: object, entry_fill_price: object
+        self, symbol: str, qty: object, entry_fill_price: object, *, is_short: bool = False
     ) -> LedgerUpdate:
-        """Debit the synthetic spot_usd_balance for a simulated entry fill (sec 12.4
-        ENTRY-FILL DEBIT, FEE_TAKER_PCT). Paper mode only."""
+        """Apply the synthetic entry-fill cash flow (sec 12.4), direction-aware: a LONG
+        (default) buy-to-open DEBITS; a SHORT sell-to-open CREDITS net of the taker + margin
+        OPEN fee (ar:AR-009). Paper mode only."""
         if self.ledger is None:
             raise RuntimeError(
                 "apply_paper_entry_fill called with no synthetic ledger (live mode - "
                 "real Kraken balances are authoritative; HR-WM-032 paper-only)"
             )
-        return self.ledger.entry_fill_debit(symbol, qty, entry_fill_price, writer=WRITER_ID)
+        return self.ledger.entry_fill_debit(
+            symbol, qty, entry_fill_price, writer=WRITER_ID, is_short=is_short
+        )
 
     def apply_paper_exit_fill(
         self,
@@ -320,6 +323,7 @@ class WSManager:
         qty: object,
         exit_price: object,
         *,
+        is_short: bool = False,
         exit_reason: str | None = None,
         retain_fees_entry: bool = False,
     ) -> LedgerUpdate:
@@ -337,6 +341,7 @@ class WSManager:
             qty,
             exit_price,
             writer=WRITER_ID,
+            is_short=is_short,
             exit_reason=exit_reason,
             retain_fees_entry=retain_fees_entry,
         )
@@ -431,6 +436,7 @@ class WSManager:
             symbol,
             position.qty,
             signal.exit_price,
+            is_short=position.side is PositionSide.SHORT,
             exit_reason=signal.exit_reason,
             retain_fees_entry=True,
         )
@@ -527,6 +533,7 @@ class WSManager:
             symbol,
             position.qty,
             exit_price,
+            is_short=position.side is PositionSide.SHORT,
             exit_reason=signal.exit_reason,
             retain_fees_entry=True,
         )
