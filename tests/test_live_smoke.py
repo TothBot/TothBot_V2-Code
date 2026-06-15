@@ -328,3 +328,70 @@ def test_running_exit_applies_an_inbox_approved_change_at_the_boundary():
     wm.handle_ticker(_adverse_ticker())
     assert conductor.parameter_store.get("per_trade_size_usd") is not None   # applied at the real close
     assert conductor.trade_count == 201                    # the boundary close was the 201st learned trade
+
+
+# --------------------------------------------------------------------------- TB00749 (c): the running
+# close DRIVES the propose/detect cadence (stage to Bill + the drift trigger), through the wired sink
+
+def _close_record(net):
+    """A schema-valid 23-field TRADE_CLOSE for the corpus; net>0 = a win, net<0 = a loss."""
+    n = Decimal(net)
+    win = n > 0
+    return TradeClose(
+        symbol="BTC/USD", entry_fill_price=Decimal("60000"), exit_price=Decimal("66000"),
+        exit_reason=ExitReason.HTF_REGIME_REVERSAL,
+        fees_entry_usd=Decimal("0"), fees_exit_usd=Decimal("0"), fees_total_usd=Decimal("0"),
+        net_pl_usd=n, net_gain_usd=(n if win else Decimal("0")),
+        net_loss_usd=(Decimal("0") if win else -n), asset_regime="TRENDING_POS_NORMAL",
+    )
+
+
+def test_running_closes_stage_a_half_kelly_proposal_at_activation():
+    # TB00749: closes flowing THROUGH the wired sink reach the 200-trade activation and STAGE the
+    # Half-Kelly per_trade_size proposal to Bill (the alert reaches mod:Logger.alerts) with NO manual
+    # recompute_kelly - the sink's on_close reads wm.wallet_balance(LONG) for the sizing.
+    system, _wm, logger = _assemble_real_wm()
+    side = PositionSide.LONG
+    sink, conductor = system.ciats_sinks[side], system.conductors[side]
+    for _ in range(120):
+        sink(_close_record("2"))                           # wins
+    for _ in range(80):
+        sink(_close_record("-1"))                          # losses -> 200: W=0.6, R=2, K_full=0.4 > 0
+    assert conductor.trade_count == 200
+    assert len(logger.corpus_for("long")) == 200           # every close entered the Stream-2 corpus
+    assert conductor.pending                               # a proposal was STAGED off the running close
+    assert any(getattr(a, "code", None) == "CIATS_APPROVAL_REQUESTED" for a in logger.alerts)
+    # the SHORT module is isolated - its loop staged nothing (per-module, sec 7).
+    assert system.conductors[PositionSide.SHORT].pending == ()
+
+
+def test_running_closes_then_approval_applies_at_the_next_close():
+    # the full PROPOSE->APPROVE->APPLY loop on the organism, all through the wired sink (no manual
+    # call): stage at the 200-trade activation -> Bill approves into the inbox -> the next close (the
+    # HR-CI-003 boundary) APPLIES it.
+    system, _wm, _logger = _assemble_real_wm()
+    side = PositionSide.LONG
+    sink = system.ciats_sinks[side]
+    conductor, inbox = system.conductors[side], system.approval_inboxes[side]
+    for _ in range(120):
+        sink(_close_record("2"))
+    for _ in range(80):
+        sink(_close_record("-1"))                          # 200th close stages the proposal
+    req = conductor.pending[0]
+    inbox.submit(req.request_id, approved=True)
+    assert conductor.parameter_store.get("per_trade_size_usd") is None   # staged, not yet applied
+    sink(_close_record("2"))                               # the 201st close = the boundary -> applies
+    assert conductor.parameter_store.get("per_trade_size_usd") is not None
+
+
+def test_running_closes_emit_a_drift_signal_on_degradation():
+    # a degrading net-P/L run drives scan_drift (the HR-CI-007 out-of-cycle PLAN trigger) at each
+    # close; the DriftSignal is emitted into the module's Stream-1. (The drift-triggered candidate
+    # PLAN awaits the per-trade param-level signal_params producer - not fabricated here.)
+    system, _wm, logger = _assemble_real_wm()
+    sink = system.ciats_sinks[PositionSide.LONG]
+    for _ in range(30):
+        sink(_close_record("2"))
+    for _ in range(10):
+        sink(_close_record("-10"))                         # a sharp drop -> the net-P/L CUSUM breaches
+    assert any(getattr(e, "code", None) == "CIATS_DRIFT_SIGNAL" for e in logger.operational)
