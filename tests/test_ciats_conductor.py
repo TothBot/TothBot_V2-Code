@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 from tothbot.ciats.conductor import (
+    ApprovalInbox,
     ApprovalRequested,
     CiatsConductor,
     DriftSignal,
@@ -236,6 +237,53 @@ def test_submit_approval_unknown_request_raises():
     conductor, _, _ = _make()
     with pytest.raises(ValueError):
         conductor.submit_approval(999, approved=True, at_inter_trade_boundary=True)
+
+
+# --------------------------------------------------------------------------- the approval inbox + boundary
+def test_inbox_records_and_clears_an_operator_decision():
+    inbox = ApprovalInbox()
+    assert inbox.decision(1) is None             # undecided
+    inbox.submit(1, approved=True)
+    assert inbox.decision(1) is True
+    inbox.clear(1)
+    assert inbox.decision(1) is None
+
+
+def test_boundary_applies_a_bill_approved_change():
+    conductor, _, approvals = _make()
+    _seed_pool(conductor, wins=120, losses=80)   # 200 trades; no prior change -> interval met
+    conductor.recompute_kelly(wallet_balance=Decimal("1000"))
+    req = approvals[-1]
+    inbox = ApprovalInbox()
+    inbox.submit(req.request_id, approved=True)   # Bill approves (the injected operator edge)
+    outcomes = conductor.on_inter_trade_boundary(inbox)
+    assert len(outcomes) == 1 and isinstance(outcomes[0], ParameterWritten)
+    assert conductor.pending == ()                # applied + consumed
+    assert inbox.decision(req.request_id) is None  # the decision was cleared
+
+
+def test_boundary_is_a_no_op_without_a_decision():
+    conductor, _, approvals = _make()
+    _seed_pool(conductor, wins=120, losses=80)
+    conductor.recompute_kelly(wallet_balance=Decimal("1000"))
+    req = approvals[-1]
+    assert conductor.on_inter_trade_boundary(ApprovalInbox()) == []  # Bill has not decided
+    assert len(conductor.pending) == 1            # left pending, re-polled next boundary
+    # this is the never-auto-apply invariant: no decision -> no write
+    assert conductor._store.get("per_trade_size_usd") is None
+
+
+def test_boundary_consumes_a_bill_rejection():
+    conductor, _, approvals = _make()
+    _seed_pool(conductor, wins=120, losses=80)
+    conductor.recompute_kelly(wallet_balance=Decimal("1000"))
+    req = approvals[-1]
+    inbox = ApprovalInbox()
+    inbox.submit(req.request_id, approved=False)  # Bill rejects
+    outcomes = conductor.on_inter_trade_boundary(inbox)
+    assert len(outcomes) == 1 and isinstance(outcomes[0], PlanBlocked)
+    assert inbox.decision(req.request_id) is None  # the rejection was consumed (not re-applied)
+    assert conductor._store.get("per_trade_size_usd") is None  # never written
 
 
 # --------------------------------------------------------------------------- the Gate-3 protective feed

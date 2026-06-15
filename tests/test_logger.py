@@ -109,3 +109,15 @@ def test_info_trade_close_is_not_an_alert():
     log = Logger()
     log.record(_trade_close(), module="long")
     assert log.alerts == []                    # INFO-level TRADE_CLOSE is not escalated
+
+
+def test_alert_seam_routes_a_non_critical_record_to_the_operator():
+    # HR-LG-009 explicit operator-surface push: a [HIGH] record (e.g. an HR-CI-011 approval request)
+    # reaches the operator even though it is not CRITICAL (the level-driven path would miss it).
+    alerts: list = []
+    log = Logger(on_alert=alerts.append)
+    req = type("ApprovalRequested", (), {"level": "HIGH", "code": "CIATS_APPROVAL_REQUESTED"})()
+    log.alert(req)
+    assert req in log.alerts
+    assert req in alerts
+    assert req not in log.operational          # the alert seam is the operator push, not a Stream-1 write

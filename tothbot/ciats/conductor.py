@@ -23,6 +23,9 @@ THE LOOP (one CiatsConductor per wallet, like every other CIATS unit - NO cross-
                       apply the staged change to the Parameter Store (which owns the HR-CI-005 50-trade
                       interval) + log the parameter-evolution entry. A failed gate keeps the pending
                       request retryable at the next boundary.
+  on_inter_trade_boundary - the HR-CI-003 boundary edge (driven off the exit path's confirmed close):
+                      poll the operator ApprovalInbox + submit_approval any change Bill has decided on
+                      at THIS boundary. Never auto-applies - it acts only on Bill's recorded decision.
   disallowed_regimes- the Regime Library's protective param:disallowed_regimes list (the ACTIVE,
                       negative-edge regimes) surfaced for gate:G3_Regime_Filter to read.
 
@@ -95,6 +98,36 @@ class _Pending:
     proposal: object
     check: object | None
     kind: str
+
+
+class ApprovalInbox:
+    """The operator's HR-CI-011 approval inbox: where Bill's yes/no decision on a staged parameter
+    change lands (keyed by the ApprovalRequested.request_id). The approval RETURN is an INJECTED
+    operator edge - the organism never decides for Bill; it polls this inbox at each inter-trade
+    boundary. submit() is the operator surface (Bill records a decision); decision() is the conductor's
+    read; clear() drops a resolved decision. PURE state (no I/O)."""
+
+    def __init__(self) -> None:
+        self._decisions: dict[int, bool] = {}
+
+    def submit(self, request_id: int, *, approved: bool) -> None:
+        """Bill's decision for a staged change (the operator edge). A later submit overrides an
+        undecided one (Bill may change his mind before the boundary applies it)."""
+        self._decisions[request_id] = bool(approved)
+
+    def decision(self, request_id: int) -> bool | None:
+        """The operator's decision for a request, or None if Bill has not decided yet (the conductor
+        leaves the change pending and re-polls at the next boundary). A read, never a pop."""
+        return self._decisions.get(request_id)
+
+    def clear(self, request_id: int) -> None:
+        """Drop a resolved decision (the change was applied, or Bill's rejection was consumed)."""
+        self._decisions.pop(request_id, None)
+
+    @property
+    def pending_decisions(self) -> dict[int, bool]:
+        """The outstanding operator decisions (for inspection/telemetry)."""
+        return dict(self._decisions)
 
 
 def shadow_cohorts(
@@ -316,6 +349,29 @@ class CiatsConductor:
         self._emit(written)
         self._pending.pop(request_id, None)
         return written
+
+    def on_inter_trade_boundary(self, inbox: "ApprovalInbox") -> list:
+        """The HR-CI-003 inter-trade-boundary edge: at a confirmed close with no order pending, poll
+        the operator approval inbox and APPLY any staged change Bill has decided on. For each pending
+        request with an inbox decision, run submit_approval at this boundary (at_inter_trade_boundary=
+        True). A successful write drops the request (the decision is cleared); a Bill REJECTION is
+        consumed (cleared); a change still gated (e.g. the HR-CI-005 50-trade interval not yet met)
+        stays pending WITH its decision so it retries at the next boundary. NEVER auto-applies - it
+        only acts on Bill's recorded decision. Returns the list of submit_approval outcomes."""
+        outcomes: list = []
+        for request_id in list(self._pending):
+            decided = inbox.decision(request_id)
+            if decided is None:
+                continue  # Bill has not decided - leave it pending, re-poll next boundary
+            outcome = self.submit_approval(
+                request_id, approved=decided, at_inter_trade_boundary=True
+            )
+            outcomes.append(outcome)
+            # Resolve the inbox decision once it is applied (no longer pending) or on a rejection;
+            # a still-pending APPROVAL (an interval/gate not yet met) keeps its decision to retry.
+            if request_id not in self._pending or decided is False:
+                inbox.clear(request_id)
+        return outcomes
 
     # --- the Gate-3 protective feed --------------------------------------------------------------
     def disallowed_regimes(self) -> list:

@@ -37,7 +37,7 @@ def _own(store, name, value, *, at=300):
 
 # --------------------------------------------------------------------------- assemble_ciats_modules
 def test_assemble_ciats_modules_builds_one_conductor_and_sink_per_side():
-    conductors, sinks = assemble_ciats_modules(Logger())
+    conductors, sinks, _ = assemble_ciats_modules(Logger())
     assert set(conductors) == {PositionSide.LONG, PositionSide.SHORT}
     assert set(sinks) == {PositionSide.LONG, PositionSide.SHORT}
     assert conductors[PositionSide.LONG].module == "long"
@@ -48,7 +48,7 @@ def test_assemble_ciats_modules_builds_one_conductor_and_sink_per_side():
 
 def test_ciats_sink_feeds_the_matching_module_conductor():
     logger = Logger()
-    conductors, sinks = assemble_ciats_modules(logger)
+    conductors, sinks, _ = assemble_ciats_modules(logger)
     tc = SimpleNamespace(event="TRADE_CLOSE", net_pl_usd=Decimal("10"), net_gain_usd=Decimal("10"),
                          net_loss_usd=Decimal("0"), asset_regime="TRENDING_POS_NORMAL")
     sinks[PositionSide.LONG](tc)
@@ -59,7 +59,7 @@ def test_ciats_sink_feeds_the_matching_module_conductor():
 
 # ------------------------------------------------------------------ make_cycle_parameters_provider
 def test_provider_is_seed_only_until_the_store_owns_a_value():
-    conductors, _ = assemble_ciats_modules(Logger())
+    conductors, _, _ = assemble_ciats_modules(Logger())
     provider = make_cycle_parameters_provider(conductors)
     params = provider(PositionSide.LONG)
     assert params.get("mae_mult") == registry.value("mae_mult")        # the seed (no owned value yet)
@@ -67,7 +67,7 @@ def test_provider_is_seed_only_until_the_store_owns_a_value():
 
 
 def test_provider_flows_an_owned_value_into_the_cycle_view():
-    conductors, _ = assemble_ciats_modules(Logger())
+    conductors, _, _ = assemble_ciats_modules(Logger())
     _own(conductors[PositionSide.LONG].parameter_store, "mae_mult", Decimal("3.0"))
     provider = make_cycle_parameters_provider(conductors)
     assert provider(PositionSide.LONG).get("mae_mult") == Decimal("3.0")   # the owned value flows
@@ -76,7 +76,7 @@ def test_provider_flows_an_owned_value_into_the_cycle_view():
 
 
 def test_provider_snapshot_is_frozen_against_a_mid_cycle_write():
-    conductors, _ = assemble_ciats_modules(Logger())
+    conductors, _, _ = assemble_ciats_modules(Logger())
     provider = make_cycle_parameters_provider(conductors)
     params = provider(PositionSide.LONG)                       # the frozen read for this cycle
     _own(conductors[PositionSide.LONG].parameter_store, "mae_mult", Decimal("9.0"))
@@ -84,7 +84,7 @@ def test_provider_snapshot_is_frozen_against_a_mid_cycle_write():
 
 
 def test_provider_surfaces_the_conductor_disallowed_regimes():
-    conductors, _ = assemble_ciats_modules(Logger())
+    conductors, _, _ = assemble_ciats_modules(Logger())
     conductor = conductors[PositionSide.LONG]
     bad = Regime.NON_DIR_NORMAL
     win = SimpleNamespace(net_pl_usd=Decimal("1"), net_gain_usd=Decimal("1"), net_loss_usd=Decimal("0"))
@@ -163,26 +163,65 @@ def _assemble():
 
     from tothbot.ciats.expected_reward import ExpectedRewardStore
     from tothbot.ciats.seed_estimators import MppCapStore
-    return asyncio.run(assemble_operational(
+    logger = Logger()
+    system = asyncio.run(assemble_operational(
         universe=["BTC/USD"], rest_client=_FakeRest(), open_socket=opener,
         bucket=SubscribeTokenBucket(rate_per_sec=1000.0, burst_capacity=100000.0),
-        wm=_WM(), logger=Logger(), mpp_store=MppCapStore(), reward_store=ExpectedRewardStore(),
+        wm=_WM(), logger=logger, mpp_store=MppCapStore(), reward_store=ExpectedRewardStore(),
         mode=Mode.PAPER, now_utc=lambda: datetime(2026, 6, 15, 7, 30, tzinfo=timezone.utc),
         rest_sleep=no_sleep, pace_sleep=no_sleep,
     ))
+    return system, logger
 
 
 def test_assemble_operational_exposes_the_per_module_conductors():
-    system = _assemble()
+    system, _ = _assemble()
     assert set(system.conductors) == {PositionSide.LONG, PositionSide.SHORT}
     assert set(system.ciats_sinks) == {PositionSide.LONG, PositionSide.SHORT}
+    assert set(system.approval_inboxes) == {PositionSide.LONG, PositionSide.SHORT}
 
 
 def test_assemble_operational_backs_the_cycle_parameters_provider_with_the_store():
-    system = _assemble()
+    system, _ = _assemble()
     # the providers' per-cycle snapshot is LIVE (not None / seed-only-by-default): an owned store
     # value flows through the provider the sweep reads each cycle.
     assert system.providers.cycle_parameters is not None
     _own(system.conductors[PositionSide.LONG].parameter_store, "min_volume_usd_daily", Decimal("123"))
     params = system.providers.cycle_parameters(PositionSide.LONG)
     assert params.get("min_volume_usd_daily") == Decimal("123")
+
+
+def test_assemble_operational_routes_a_staged_approval_to_the_logger_alert_seam():
+    system, logger = _assemble()
+    conductor = system.conductors[PositionSide.LONG]
+    win = SimpleNamespace(net_pl_usd=Decimal("2"), net_gain_usd=Decimal("2"), net_loss_usd=Decimal("0"))
+    loss = SimpleNamespace(net_pl_usd=Decimal("-1"), net_gain_usd=Decimal("0"), net_loss_usd=Decimal("1"))
+    for _ in range(120):
+        conductor.ingest_close(win)
+    for _ in range(80):
+        conductor.ingest_close(loss)                     # 200 trades: W=0.6, R=2 -> K_full=0.4 > 0
+    conductor.recompute_kelly(wallet_balance=Decimal("5000"))
+    # the HR-CI-011 ApprovalRequested reached the mod:Logger operator-alert seam (HR-LG-009).
+    assert any(getattr(a, "code", None) == "CIATS_APPROVAL_REQUESTED" for a in logger.alerts)
+
+
+def test_assemble_operational_applies_an_inbox_approved_change_through_the_sink():
+    system, _ = _assemble()
+    side = PositionSide.LONG
+    conductor = system.conductors[side]
+    win = SimpleNamespace(net_pl_usd=Decimal("2"), net_gain_usd=Decimal("2"), net_loss_usd=Decimal("0"),
+                          event="TRADE_CLOSE", asset_regime="TRENDING_POS_NORMAL")
+    loss = SimpleNamespace(net_pl_usd=Decimal("-1"), net_gain_usd=Decimal("0"), net_loss_usd=Decimal("1"),
+                           event="TRADE_CLOSE", asset_regime="TRENDING_POS_NORMAL")
+    for _ in range(119):
+        conductor.ingest_close(win)
+    for _ in range(80):
+        conductor.ingest_close(loss)                     # 199 trades, just below the cadence boundary
+    # the 200th close arrives THROUGH the wired sink (the exit-path membrane): it ingests, but the
+    # proposal is staged explicitly here (the sink does not recompute Kelly) - then Bill approves.
+    system.ciats_sinks[side](win)                        # 200th -> learning close + (empty) boundary
+    conductor.recompute_kelly(wallet_balance=Decimal("5000"))
+    req = conductor.pending[0]
+    system.approval_inboxes[side].submit(req.request_id, approved=True)
+    system.ciats_sinks[side](win)                        # next confirmed close = the boundary -> apply
+    assert conductor.parameter_store.get("per_trade_size_usd") is not None

@@ -79,8 +79,26 @@ def make_ciats_sink(logger, module: str, pool, *, downstream: Callable[[object],
     return sink
 
 
+def make_approval_alert_sink(logger) -> Callable[[object], None]:
+    """The conductor's on_approval edge -> the mod:Logger HR-LG-009 operator-alert seam. A staged
+    HR-CI-011 evt:CIATS_APPROVAL_REQUESTED is routed to the operator surface (the C1 IMMEDIATE / SMTP
+    push) so Bill SEES the change awaiting his decision - even though the event is [HIGH], not
+    [CRITICAL] (the level-driven auto-escalation would miss it). The conductor already records the
+    request to Stream-1 via its on_event sink; this edge is the operator alert ONLY."""
+
+    def on_approval(event: object) -> None:
+        logger.alert(event)
+
+    return on_approval
+
+
 def make_ciats_learning_sink(
-    logger, module: str, conductor, *, downstream: Callable[[object], None] | None = None
+    logger,
+    module: str,
+    conductor,
+    *,
+    inbox=None,
+    downstream: Callable[[object], None] | None = None,
 ):
     """The per-module CIATS LEARNING sink: record every event to mod:Logger (Stream-1, tagged
     `module`, and a schema-valid TRADE_CLOSE additionally into that module's Stream-2 corpus), and
@@ -89,13 +107,20 @@ def make_ciats_learning_sink(
     known asset_regime) the Regime Library bucket. This is the same membrane make_ciats_sink wires,
     but the CIATS target is the whole conductor (the learning loop), not a bare pool - so a closed
     trade reaches conductor.ingest_close, per module. `module` is the side name (the TRADE_CLOSE
-    record carries no side field; the partition IS the emitting wallet). An optional `downstream`
-    sink chains (e.g. alerting)."""
+    record carries no side field; the partition IS the emitting wallet).
+
+    A TRADE_CLOSE is also the HR-CI-003 inter-trade boundary (a confirmed close, no order pending):
+    when an `inbox` (the operator ApprovalInbox) is wired, after the learning close the conductor
+    polls it and APPLIES any change Bill has decided on (conductor.on_inter_trade_boundary) - so an
+    approved change reaches the Parameter Store at the right moment, never auto-applied. An optional
+    `downstream` sink chains (e.g. alerting)."""
 
     def sink(event: object) -> None:
         logger.record(event, module=module)
         if _is_trade_close(event):
             conductor.ingest_close(event, regime=_regime_of(event))
+            if inbox is not None:
+                conductor.on_inter_trade_boundary(inbox)
         if downstream is not None:
             downstream(event)
 

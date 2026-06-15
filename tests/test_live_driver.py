@@ -15,18 +15,20 @@ import asyncio
 from decimal import Decimal
 from types import SimpleNamespace
 
+from tothbot.ciats.conductor import ApprovalInbox, CiatsConductor
+from tothbot.ciats.parameter_store import ParameterStore
 from tothbot.ciats.pool import CiatsPool
+from tothbot.ciats.regime_library import RegimeLibrary
 from tothbot.exchange.position_mirror import PositionSide
 from tothbot.exchange.warmup import WarmupOrchestrator
-from tothbot.ciats.conductor import CiatsConductor
-from tothbot.ciats.parameter_store import ParameterStore
-from tothbot.ciats.regime_library import RegimeLibrary
 from tothbot.pipeline.live_driver import (
     LiveSweepDriver,
+    make_approval_alert_sink,
     make_ciats_learning_sink,
     make_ciats_sink,
 )
 from tothbot.pipeline.sweep import LiveProviders
+from tothbot.recorder.logger import Logger
 from tothbot.regime.taxonomy import Regime
 from tothbot.rest.client import OhlcResponse, RestOhlcBar
 
@@ -209,6 +211,50 @@ def test_learning_sink_chains_downstream():
     evt = SimpleNamespace(code="X")
     sink(evt)
     assert seen == [evt]
+
+
+# --------------------------------------------------------------------------- approval + boundary edges
+def test_approval_alert_sink_routes_to_the_logger_operator_seam():
+    logger = Logger()
+    on_approval = make_approval_alert_sink(logger)
+    req = SimpleNamespace(code="CIATS_APPROVAL_REQUESTED", level="HIGH")
+    on_approval(req)
+    assert req in logger.alerts                       # the HR-LG-009 operator surface received it
+
+
+def test_learning_sink_applies_an_inbox_approved_change_at_the_boundary():
+    pool = CiatsPool(trade_floor=4)
+    conductor = CiatsConductor(module="long", pool=pool, regime_library=RegimeLibrary(),
+                               parameter_store=ParameterStore())
+    for _ in range(3):
+        conductor.ingest_close(_tc(net="2"))          # 3 wins
+    conductor.ingest_close(SimpleNamespace(event="TRADE_CLOSE", net_pl_usd=Decimal("-1"),
+                                           net_gain_usd=Decimal("0"), net_loss_usd=Decimal("1"),
+                                           asset_regime=None))                          # 1 loss -> 4
+    conductor.recompute_kelly(wallet_balance=Decimal("1000"))   # at the floor -> stages a proposal
+    req = conductor.pending[0]
+    inbox = ApprovalInbox()
+    inbox.submit(req.request_id, approved=True)        # Bill approves (the injected operator edge)
+    sink = make_ciats_learning_sink(Logger(), "long", conductor, inbox=inbox)
+    sink(_tc(net="2"))                                 # a confirmed close = the HR-CI-003 boundary
+    assert conductor.parameter_store.get("per_trade_size_usd") is not None  # applied at the boundary
+    assert conductor.pending == ()
+
+
+def test_learning_sink_never_applies_without_an_inbox_decision():
+    pool = CiatsPool(trade_floor=4)
+    conductor = CiatsConductor(module="long", pool=pool, regime_library=RegimeLibrary(),
+                               parameter_store=ParameterStore())
+    for _ in range(3):
+        conductor.ingest_close(_tc(net="2"))
+    conductor.ingest_close(SimpleNamespace(event="TRADE_CLOSE", net_pl_usd=Decimal("-1"),
+                                           net_gain_usd=Decimal("0"), net_loss_usd=Decimal("1"),
+                                           asset_regime=None))
+    conductor.recompute_kelly(wallet_balance=Decimal("1000"))
+    sink = make_ciats_learning_sink(Logger(), "long", conductor, inbox=ApprovalInbox())
+    sink(_tc(net="2"))                                 # boundary fires but Bill never decided
+    assert conductor.parameter_store.get("per_trade_size_usd") is None  # NEVER auto-applied
+    assert len(conductor.pending) == 1                 # still pending, re-polled next boundary
 
 
 # --------------------------------------------------------------------------- on_ohlc_5m

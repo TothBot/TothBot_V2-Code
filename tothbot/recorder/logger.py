@@ -118,6 +118,17 @@ class Logger:
             if self._on_alert is not None:
                 self._on_alert(record)
 
+    def alert(self, record: object) -> None:
+        """The HR-LG-009 operator-alert seam (the contract:Operator_Reporting_Hierarchy C1 IMMEDIATE
+        surface -> SMTP to the operator). Routes a record to the operator REGARDLESS of its level -
+        the level-driven CRITICAL auto-escalation in record() is the passive path; this is the
+        EXPLICIT operator-surface push for an event that needs the operator's attention even though it
+        is not CRITICAL (e.g. an HR-CI-011 evt:CIATS_APPROVAL_REQUESTED [HIGH] awaiting Bill's
+        decision). Surfaced, never dropped."""
+        self.alerts.append(record)
+        if self._on_alert is not None:
+            self._on_alert(record)
+
     def corpus_for(self, module: str) -> list:
         """The module's Stream-2 CIATS corpus (the closed-trade outcomes that side has produced).
         Empty if the module has no closed trades yet. No cross-module pooling (sec 7)."""
