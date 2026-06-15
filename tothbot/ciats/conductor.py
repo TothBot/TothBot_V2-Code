@@ -33,9 +33,10 @@ EVERYTHING here is PROPOSE/DETECT only: the conductor STAGES proposals and route
 approved change at an inter-trade boundary reaches the Parameter Store, and the sacred 1:1.5 R:R is
 never a candidate. The two injected edges are the approval surface (`on_approval`, the mod:Logger
 HR-LG-009 SMTP alert seam) + the inter-trade-boundary + approval signals (passed to submit_approval).
-The shadow replay's per-trade counterfactual is the injected `evaluator` (a fuller build replaces it
-with a real gate/exit replay; the seed-then-correct discipline). PURE state + Decimal-only (ar:AR-047)
-apart from the injected sync edges.
+The PDCA DO phase replays the REAL gate/exit counterfactual over this module's corpus by default
+(ciats/shadow_replay.build_shadow_evaluator: a gating change includes/excludes a trade, a sizing/exit
+change scales it; an `evaluator` may still be injected). PURE state + Decimal-only (ar:AR-047) apart
+from the injected sync edges.
 """
 
 from __future__ import annotations
@@ -52,6 +53,7 @@ from .proposal_engine import (
     ParameterChangeProposal,
     ProposalEngine,
 )
+from .shadow_replay import build_shadow_evaluator
 from .statistical_engine import cusum_lower
 
 
@@ -268,11 +270,18 @@ class CiatsConductor:
             return signal
         return None
 
+    def _current_value(self, proposal: object) -> object:
+        """The candidate parameter's current (pre-change) value the DO replay's scale ratio needs:
+        the live store-owned value if CIATS has written it, else the proposal's own current_value."""
+        name = str(getattr(proposal, "param_name", "") or getattr(proposal, "param", ""))
+        owned = self._store.get(name)
+        return owned if owned is not None else getattr(proposal, "current_value", None)
+
     def open_pdca(
         self,
         proposal: object,
         *,
-        evaluator: Callable[[object], object | None],
+        evaluator: "Callable[[object], object | None] | None" = None,
         spearman_xy: "tuple[Sequence[object], Sequence[object]] | None" = None,
         out_of_cycle: bool = False,
     ) -> object:
@@ -280,7 +289,14 @@ class CiatsConductor:
         (shadow_cohorts replays `evaluator` over THIS module's corpus -> candidate vs baseline) ->
         CHECK (the absolute Mann-Whitney gate). On a CHECK pass STAGE the proposal for the HR-CI-011
         approval surface (returns the ApprovalRequested); on a fail returns the CheckResult (REJECTED);
-        a blocked PLAN / an empty candidate cohort returns a PlanBlocked. NEVER auto-applies."""
+        a blocked PLAN / an empty candidate cohort returns a PlanBlocked. NEVER auto-applies.
+
+        `evaluator` defaults to the REAL gate/exit corpus replay (build_shadow_evaluator over the
+        proposal + this module's current parameter value): a gating change includes/excludes a record,
+        a sizing/exit change scales its outcome. An evaluator may still be injected (tests / a custom
+        counterfactual)."""
+        if evaluator is None:
+            evaluator = build_shadow_evaluator(proposal, current_value=self._current_value(proposal))
         candidate, baseline = shadow_cohorts(self._records, evaluator)
         if not candidate or not baseline:
             blocked = PlanBlocked("shadow-eval produced an empty cohort (no replayable corpus)")

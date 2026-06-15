@@ -191,6 +191,49 @@ def test_open_pdca_blocks_an_empty_candidate_cohort():
     assert "empty" in out.reason
 
 
+# --------------------------------------------------------------------- the REAL replay (default evaluator)
+def _winr(regime, gain="2"):
+    return SimpleNamespace(net_pl_usd=Decimal(gain), net_gain_usd=Decimal(gain), net_loss_usd=Decimal("0"),
+                           asset_regime=regime.value)
+
+
+def _lossr(regime, loss="1"):
+    return SimpleNamespace(net_pl_usd=Decimal(f"-{loss}"), net_gain_usd=Decimal("0"),
+                           net_loss_usd=Decimal(loss), asset_regime=regime.value)
+
+
+def test_open_pdca_default_replay_gates_out_a_losing_regime():
+    # No injected evaluator -> the conductor uses the REAL gate/exit corpus replay. A disallowed-regime
+    # candidate excludes the losers booked in that regime, so the candidate cohort clearly out-ranks
+    # the realized baseline -> CHECK passes and it stages for approval.
+    conductor, _, approvals = _make()
+    for i in range(120):                                      # varied winner gains (non-degenerate)
+        conductor.ingest_close(_winr(Regime.TRENDING_POS_NORMAL, gain="2" if i % 2 else "3"),
+                               regime=Regime.TRENDING_POS_NORMAL)
+    for i in range(80):
+        conductor.ingest_close(_lossr(Regime.NON_DIR_NORMAL, loss="1" if i % 2 else "2"),
+                               regime=Regime.NON_DIR_NORMAL)
+    proposal = SimpleNamespace(param_name="disallowed_regimes", current_value=None,
+                               proposed_value=Regime.NON_DIR_NORMAL)
+    out = conductor.open_pdca(proposal)                       # default = build_shadow_evaluator
+    assert isinstance(out, ApprovalRequested) and out.check.passed is True
+    assert approvals[-1] is out
+
+
+def test_open_pdca_default_replay_rejects_a_no_op_gating_candidate():
+    # Blocking a regime that booked NO trades changes nothing -> candidate == baseline -> CHECK fails.
+    conductor, _, approvals = _make()
+    for _ in range(120):
+        conductor.ingest_close(_winr(Regime.TRENDING_POS_NORMAL), regime=Regime.TRENDING_POS_NORMAL)
+    for _ in range(80):
+        conductor.ingest_close(_lossr(Regime.TRENDING_POS_NORMAL), regime=Regime.TRENDING_POS_NORMAL)
+    proposal = SimpleNamespace(param_name="disallowed_regimes", current_value=None,
+                               proposed_value=Regime.NON_DIR_ELEVATED)   # no trades booked here
+    out = conductor.open_pdca(proposal)
+    assert isinstance(out, CheckResult) and out.passed is False
+    assert conductor.pending == () and approvals == []
+
+
 # --------------------------------------------------------------------------- the approval surface
 def test_submit_approval_kelly_writes_the_store_on_approval_at_a_boundary():
     conductor, _, approvals = _make()
