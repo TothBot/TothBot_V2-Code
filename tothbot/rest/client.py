@@ -31,6 +31,7 @@ from .auth import Credentials, NonceGenerator, auth_headers, sign
 # --- Kraken Spot REST endpoint paths (wire facts) ----------------------------
 PATH_WS_TOKEN = "/0/private/GetWebSocketsToken"   # channel:kraken_rest_GetWebSocketsToken
 PATH_OHLC = "/0/public/OHLC"                      # channel:kraken_rest_GetOHLCData
+PATH_TICKER = "/0/public/Ticker"                  # channel:kraken_rest_Ticker (liquidity probe)
 PATH_OPEN_ORDERS = "/0/private/OpenOrders"        # channel:kraken_rest_GetOpenOrders
 PATH_BALANCE = "/0/private/Balance"               # channel:kraken_rest_GetAccountBalance
 
@@ -139,6 +140,24 @@ def parse_ohlc(payload: Mapping[str, object], pair: str | None = None) -> OhlcRe
         return OhlcResponse(committed=(), forming=None, last=last)
     # AR-017: the LAST bar is the current forming candle - split it off, never seed it.
     return OhlcResponse(committed=tuple(bars[:-1]), forming=bars[-1], last=last)
+
+
+def parse_ticker_liquidity(payload: Mapping[str, object]) -> dict[str, Decimal]:
+    """GetTicker -> {pair_key: vol_24h_usd} - the D1 liquidity_24h probe (channel:kraken_rest_
+    Ticker; liquidity_refresh_hours=4 cache TTL). Kraken returns result = {<pair_key>: {a, b, c,
+    v:[today, last24h], p:[today, last24h], t, l, h, o}}. The 24h USD volume = v[1] * p[1] (the
+    last-24h base volume times the last-24h vwap). A key missing the v/p arrays is skipped."""
+    result = raise_for_error(payload)
+    out: dict[str, Decimal] = {}
+    for key, ticker in result.items():
+        if not isinstance(ticker, Mapping):
+            continue
+        v = ticker.get("v")
+        p = ticker.get("p")
+        if not (isinstance(v, Sequence) and isinstance(p, Sequence) and len(v) > 1 and len(p) > 1):
+            continue
+        out[str(key)] = _dec(v[1]) * _dec(p[1])
+    return out
 
 
 def parse_open_orders(payload: Mapping[str, object]) -> list[dict]:
@@ -265,6 +284,18 @@ class KrakenRestClient:
             params["since"] = since
         payload = await self._public(PATH_OHLC, params)
         return parse_ohlc(payload, pair)
+
+    async def get_ticker_liquidity(self, pair: str) -> Decimal:
+        """GetTicker (public) -> the pair's 24h USD volume (the D1 liquidity_24h probe; Gate-2).
+        Called one pair at a time at universe load + the liquidity_refresh_hours=4 refresh; the
+        result key may be the altname, so the single returned ticker's vol_24h_usd is taken."""
+        payload = await self._public(PATH_TICKER, {"pair": pair})
+        liquidity = parse_ticker_liquidity(payload)
+        if pair in liquidity:
+            return liquidity[pair]
+        for vol in liquidity.values():
+            return vol
+        raise KrakenRestError([f"GetTicker returned no ticker for {pair}"])
 
     async def get_open_orders(self) -> list[dict]:
         """GetOpenOrders (private). The AR-021 reconcile fallback / snap_orders source."""
