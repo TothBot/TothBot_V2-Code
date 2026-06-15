@@ -134,7 +134,11 @@ def make_public_handler_provider(
 
 
 def assemble_ciats_modules(
-    logger, *, on_event: EventSink | None = None, on_approval: "Callable | None" = None
+    logger,
+    *,
+    on_event: EventSink | None = None,
+    on_approval: "Callable | None" = None,
+    wallet_balance: "Callable[[PositionSide], object] | None" = None,
 ) -> "tuple[dict[PositionSide, CiatsConductor], dict[PositionSide, Callable[[object], None]], dict[PositionSide, ApprovalInbox]]":
     """Construct the per-MODULE CIATS brain (one CiatsConductor + one TRADE_CLOSE learning sink + one
     operator ApprovalInbox per wallet, Long + Short - NO cross-module pooling, sec 7). Each conductor
@@ -148,9 +152,13 @@ def assemble_ciats_modules(
 
     THE LEARNING + BOUNDARY MEMBRANE: the learning sink (make_ciats_learning_sink) is the per-module
     membrane the exit path emits a TRADE_CLOSE through - it records to mod:Logger (Stream-1 + the
-    module's Stream-2 corpus), drives conductor.ingest_close (the learning-loop close), AND - because a
-    confirmed close is the HR-CI-003 inter-trade boundary - polls the inbox so an approved change
-    reaches the Parameter Store at the right moment (never auto-applied). Returns (conductors, sinks,
+    module's Stream-2 corpus) and drives conductor.on_close, the full per-close cadence (sec 7): the
+    learning-loop accumulate, the Half-Kelly recompute at the cadence boundary (STAGES a per_trade_size
+    proposal to Bill), the HR-CI-007 net-P/L CUSUM out-of-cycle PLAN trigger (scan_drift detect/emit),
+    and - because a confirmed close is the HR-CI-003 inter-trade boundary - the inbox poll that APPLIES
+    an approved change at the right moment (never auto-applied). `wallet_balance` is the per-side
+    current-balance read (e.g. wm.wallet_balance) the Half-Kelly recompute needs; None -> the sizing
+    recompute is skipped per side (the seed sizing stands, e.g. live mode). Returns (conductors, sinks,
     inboxes) keyed by side."""
     approval_edge = on_approval or make_approval_alert_sink(logger)
     conductors: dict[PositionSide, CiatsConductor] = {}
@@ -168,7 +176,14 @@ def assemble_ciats_modules(
         inbox = ApprovalInbox()
         conductors[side] = conductor
         inboxes[side] = inbox
-        sinks[side] = make_ciats_learning_sink(logger, side.value, conductor, inbox=inbox)
+        # Bind the side's wallet-balance read into the sink so the Half-Kelly recompute (driven off
+        # each close) sizes against THIS module's wallet. side=side binds the loop var per iteration.
+        side_balance = (
+            (lambda s=side: wallet_balance(s)) if wallet_balance is not None else None
+        )
+        sinks[side] = make_ciats_learning_sink(
+            logger, side.value, conductor, inbox=inbox, wallet_balance=side_balance
+        )
     return conductors, sinks, inboxes
 
 
@@ -285,7 +300,9 @@ async def assemble_operational(
     #    The cycle_parameters provider is BACKED by the per-module Parameter Stores + the conductors'
     #    disallowed_regimes (CI-IF-003): a CIATS-tuned value + the protective block list now FLOW
     #    into the gates per cycle (no longer seed-only). The conductors' CIATS events sink to Stream-1.
-    conductors, ciats_sinks, approval_inboxes = assemble_ciats_modules(logger, on_event=event_sink)
+    conductors, ciats_sinks, approval_inboxes = assemble_ciats_modules(
+        logger, on_event=event_sink, wallet_balance=getattr(wm, "wallet_balance", None)
+    )
     # THE ASSEMBLY TIE-IN (TB00748 (b)): wire each side's CIATS learning sink into the injected wm's
     # per-module Exit_Controller, so a paper close emits its evt:TRADE_CLOSE THROUGH the emitting
     # side's ciats_sink in the running organism (the learning close + the HR-CI-003 inbox boundary

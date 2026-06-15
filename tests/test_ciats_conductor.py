@@ -145,6 +145,59 @@ def test_scan_drift_fires_a_cusum_lower_breach_on_degradation():
     assert signal in events
 
 
+# ------------------------------------------------------ the full per-close cadence (on_close, TB00749)
+def test_on_close_runs_the_full_cadence_below_the_floor():
+    # below the 200-trade activation: on_close ingests + scans (quiet) but stages nothing.
+    conductor, _, approvals = _make()
+    k, d, applied = conductor.on_close(_win(), wallet_balance=Decimal("1000"))
+    assert conductor.trade_count == 1
+    assert k is None and d is None and applied == []     # off cadence, no drift, no inbox
+    assert approvals == []
+
+
+def test_on_close_skips_the_kelly_recompute_when_no_wallet_balance():
+    # live mode has no synthetic wallet (wallet_balance None): the recompute is skipped at the
+    # cadence boundary (no _dec(None) crash) and the seed sizing stands.
+    conductor, _, approvals = _make()
+    _seed_pool(conductor, wins=119, losses=80)           # 199
+    k, _d, _a = conductor.on_close(_win())               # 200th, wallet_balance None
+    assert conductor.trade_count == 200
+    assert k is None and conductor.pending == () and approvals == []
+
+
+def test_on_close_stages_kelly_at_the_cadence_then_applies_at_the_next_boundary():
+    # the running close drives the WHOLE PROPOSE->APPLY loop with no manual recompute: the 200th
+    # close STAGES the Half-Kelly per_trade_size proposal; Bill approves it into the inbox; the next
+    # confirmed close (the HR-CI-003 boundary) APPLIES it.
+    conductor, _, approvals = _make()
+    inbox = ApprovalInbox()
+    _seed_pool(conductor, wins=119, losses=80)           # 199: W=0.6, R=2 -> K_full=0.4 > 0
+    k, _d, applied = conductor.on_close(_win(), wallet_balance=Decimal("1000"), inbox=inbox)
+    assert isinstance(k, KellyUpdate)                    # staged off the close, not a manual call
+    assert len(conductor.pending) == 1 and applied == [] # pending, not applied (no decision yet)
+    req = conductor.pending[0]
+    assert isinstance(approvals[-1], ApprovalRequested) and approvals[-1].kind == "kelly"
+    inbox.submit(req.request_id, approved=True)
+    _k2, _d2, applied2 = conductor.on_close(_win(), wallet_balance=Decimal("1000"), inbox=inbox)
+    assert conductor.parameter_store.get("per_trade_size_usd") == Decimal("200")  # K_half 0.2 * 1000
+    assert applied2 and isinstance(applied2[0], ParameterWritten)
+
+
+def test_on_close_drives_the_drift_scan():
+    # on_close runs scan_drift (the HR-CI-007 out-of-cycle PLAN trigger) at each close and surfaces
+    # the DriftSignal. (The drift-triggered candidate PLAN awaits the per-trade param-level producer.)
+    class _Mon:
+        sustained = True
+
+        def update(self, _x):
+            pass
+
+    conductor, events, _ = _make(drift_monitor=_Mon())
+    _k, drift, _a = conductor.on_close(_win())
+    assert isinstance(drift, DriftSignal) and drift.kind == "ewma_sustained"
+    assert drift in events
+
+
 # --------------------------------------------------------------------------- the PDCA cycle (open_pdca)
 def _candidate(param="mae_mult", proposed="0.9"):
     return SimpleNamespace(param_name=param, current_value=Decimal("0.8"), proposed_value=Decimal(proposed))

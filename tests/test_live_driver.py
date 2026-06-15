@@ -257,6 +257,42 @@ def test_learning_sink_never_applies_without_an_inbox_decision():
     assert len(conductor.pending) == 1                 # still pending, re-polled next boundary
 
 
+def test_learning_sink_stages_kelly_off_the_close_with_a_wallet_balance():
+    # TB00749: the running close drives the Half-Kelly recompute THROUGH the sink (no manual call) -
+    # when wallet_balance is wired, the cadence boundary STAGES the per_trade_size proposal to Bill.
+    approvals: list = []
+    pool = CiatsPool(trade_floor=4)
+    conductor = CiatsConductor(module="long", pool=pool, regime_library=RegimeLibrary(),
+                               parameter_store=ParameterStore(), on_approval=approvals.append)
+    conductor.ingest_close(_tc(net="2"))
+    conductor.ingest_close(_tc(net="2"))
+    conductor.ingest_close(SimpleNamespace(event="TRADE_CLOSE", net_pl_usd=Decimal("-1"),
+                                           net_gain_usd=Decimal("0"), net_loss_usd=Decimal("1"),
+                                           asset_regime=None))                  # 2 wins, 1 loss = 3
+    sink = make_ciats_learning_sink(Logger(), "long", conductor,
+                                    wallet_balance=lambda: Decimal("1000"))
+    sink(_tc(net="2"))                                 # the 4th close = the cadence boundary -> stages
+    assert len(conductor.pending) == 1
+    assert approvals and approvals[-1].kind == "kelly"   # the proposal reached the HR-CI-011 surface
+
+
+def test_learning_sink_without_wallet_balance_does_not_recompute_kelly():
+    # the live-mode guard: no wallet_balance thunk -> the sink never drives the Half-Kelly recompute
+    # (no _dec(None) crash at the cadence boundary), the seed sizing stands.
+    approvals: list = []
+    pool = CiatsPool(trade_floor=4)
+    conductor = CiatsConductor(module="short", pool=pool, regime_library=RegimeLibrary(),
+                               parameter_store=ParameterStore(), on_approval=approvals.append)
+    conductor.ingest_close(_tc(net="2"))
+    conductor.ingest_close(_tc(net="2"))
+    conductor.ingest_close(SimpleNamespace(event="TRADE_CLOSE", net_pl_usd=Decimal("-1"),
+                                           net_gain_usd=Decimal("0"), net_loss_usd=Decimal("1"),
+                                           asset_regime=None))                  # 3
+    sink = make_ciats_learning_sink(Logger(), "short", conductor)   # no wallet_balance
+    sink(_tc(net="2"))                                 # the 4th close = the cadence boundary
+    assert conductor.pending == () and approvals == []   # nothing staged (recompute skipped)
+
+
 # --------------------------------------------------------------------------- on_ohlc_5m
 def test_in_progress_candle_does_not_fire():
     pw = _warm()

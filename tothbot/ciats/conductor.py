@@ -224,6 +224,46 @@ class CiatsConductor:
         if self._drift is not None:
             self._drift.update(_net_pl(record))
 
+    # --- the full per-close cadence (driven off the running TRADE_CLOSE, sec 7 / HR-CI-003) -------
+    def on_close(
+        self,
+        record: object,
+        *,
+        regime: object = None,
+        wallet_balance: object = None,
+        inbox: "ApprovalInbox | None" = None,
+    ) -> "tuple[object, object, list]":
+        """The complete per-close PROPOSE/DETECT cadence the running exit path drives at each
+        confirmed TRADE_CLOSE (the close IS the cadence clock + the HR-CI-003 inter-trade boundary):
+
+          1. ingest_close      - the learning-loop accumulate (pool + drift series + regime bucket).
+          2. recompute_kelly    - at the 50-trade Half-Kelly boundary (after the 200-trade activation)
+                                  STAGE the per_trade_size_usd proposal to Bill; SKIPPED when
+                                  wallet_balance is None (live mode has no synthetic wallet; the seed
+                                  sizing stands). current_size is read from THIS module's store.
+          3. scan_drift         - the HR-CI-007 net-P/L CUSUM out-of-cycle PLAN trigger (DETECT/emit
+                                  only). The drift-triggered open_pdca CANDIDATE-parameter PLAN is NOT
+                                  run here: the diagram identifies the candidate via the Spearman gate
+                                  over the per-trade parameter levels, and that series awaits the
+                                  contract:TRADE_CLOSE signal_params producer (carry-forward) - so the
+                                  trigger fires + is logged, and the candidate PLAN lands when the
+                                  producer does (never a fabricated candidate).
+          4. on_inter_trade_boundary - poll the operator inbox + APPLY any Bill-approved change at this
+                                  confirmed boundary (never auto-applied).
+
+        Returns (kelly_outcome, drift_signal, applied_outcomes). PROPOSE/DETECT only - the sacred R:R
+        is never a candidate and nothing is applied without Bill's recorded approval at the boundary."""
+        self.ingest_close(record, regime=regime)
+        kelly = None
+        if wallet_balance is not None:
+            kelly = self.recompute_kelly(
+                wallet_balance=wallet_balance,
+                current_size=self._store.get(PER_TRADE_SIZE_PARAM),
+            )
+        drift = self.scan_drift()
+        applied = self.on_inter_trade_boundary(inbox) if inbox is not None else []
+        return kelly, drift, applied
+
     # --- the Half-Kelly cadence ------------------------------------------------------------------
     def recompute_kelly(
         self, *, wallet_balance: object, current_size: object = None

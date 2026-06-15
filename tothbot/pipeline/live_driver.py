@@ -98,29 +98,33 @@ def make_ciats_learning_sink(
     conductor,
     *,
     inbox=None,
+    wallet_balance: Callable[[], object] | None = None,
     downstream: Callable[[object], None] | None = None,
 ):
     """The per-module CIATS LEARNING sink: record every event to mod:Logger (Stream-1, tagged
     `module`, and a schema-valid TRADE_CLOSE additionally into that module's Stream-2 corpus), and
-    drive a TRADE_CLOSE into the module's CiatsConductor.ingest_close - the full learning-loop close
-    (sec 7): the conductor's pool + the per-trade net-P/L drift series + (when the record carries a
-    known asset_regime) the Regime Library bucket. This is the same membrane make_ciats_sink wires,
-    but the CIATS target is the whole conductor (the learning loop), not a bare pool - so a closed
-    trade reaches conductor.ingest_close, per module. `module` is the side name (the TRADE_CLOSE
-    record carries no side field; the partition IS the emitting wallet).
+    drive a TRADE_CLOSE into the module's CiatsConductor as the FULL per-close cadence (sec 7):
+    conductor.on_close runs the learning-loop accumulate (pool + the net-P/L drift series + the
+    asset_regime bucket), the Half-Kelly recompute at the cadence boundary (STAGES the
+    per_trade_size_usd proposal to Bill - the HR-CI-011 alert seam fires through the conductor's
+    on_approval edge), the HR-CI-007 net-P/L CUSUM out-of-cycle PLAN trigger (scan_drift DETECT/emit;
+    the candidate-parameter PLAN awaits the per-trade param-level producer), and the HR-CI-003
+    inter-trade boundary poll (APPLY any Bill-approved change at this confirmed close, never auto-
+    applied). `module` is the side name (the TRADE_CLOSE record carries no side field; the partition
+    IS the emitting wallet).
 
-    A TRADE_CLOSE is also the HR-CI-003 inter-trade boundary (a confirmed close, no order pending):
-    when an `inbox` (the operator ApprovalInbox) is wired, after the learning close the conductor
-    polls it and APPLIES any change Bill has decided on (conductor.on_inter_trade_boundary) - so an
-    approved change reaches the Parameter Store at the right moment, never auto-applied. An optional
-    `downstream` sink chains (e.g. alerting)."""
+    `wallet_balance` is the side's current-balance read (a zero-arg thunk, e.g. wm.wallet_balance
+    bound to this side) the Half-Kelly recompute needs; when None (live mode has no synthetic wallet)
+    the sizing recompute is skipped and the seed sizing stands. `inbox` is the operator ApprovalInbox
+    (the boundary poll is skipped when absent). An optional `downstream` sink chains (e.g. alerting)."""
 
     def sink(event: object) -> None:
         logger.record(event, module=module)
         if _is_trade_close(event):
-            conductor.ingest_close(event, regime=_regime_of(event))
-            if inbox is not None:
-                conductor.on_inter_trade_boundary(inbox)
+            balance = wallet_balance() if wallet_balance is not None else None
+            conductor.on_close(
+                event, regime=_regime_of(event), wallet_balance=balance, inbox=inbox
+            )
         if downstream is not None:
             downstream(event)
 
