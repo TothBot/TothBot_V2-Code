@@ -34,6 +34,7 @@ from tothbot.config.settings import Mode
 from tothbot.exchange.channels import PublicChannel
 from tothbot.exchange.pacing import SubscribeTokenBucket
 from tothbot.exchange.position_mirror import PositionSide
+from tothbot.exchange.ws_manager import WSManager
 from tothbot.execution.exit_controller import ExitReason, TradeClose
 from tothbot.pipeline.live_driver import make_ciats_sink
 from tothbot.pipeline.operational import assemble_operational
@@ -248,3 +249,82 @@ def test_trade_close_closes_the_ciats_learning_loop():
     assert pool.trade_count == 1
     assert len(logger.corpus_for("long")) == 1            # the 23-field record entered the corpus
     assert conductor.trade_count == 1                     # the conductor's per-module pool learned it
+
+
+# --------------------------------------------------------------------------- TB00748 (c): the
+# RUNNING wm emits each exit THROUGH the side's CIATS sink (no manual sink call)
+
+def _assemble_real_wm():
+    """Assemble the paper organism over a REAL WSManager (not the decide-size stand-in), so the
+    exit path is wired end-to-end: assemble_operational hands the per-side ciats_sinks to the wm's
+    per-module Exit Controllers (TB00748 (b)). Returns (system, wm, logger)."""
+    wm, logger = WSManager(Mode.PAPER, now_monotonic=lambda: 1.0), Logger()
+
+    async def no_sleep(_s):
+        return None
+
+    system = asyncio.run(assemble_operational(
+        universe=["BTC/USD"], rest_client=_FakeRest(), open_socket=_opener(),
+        bucket=SubscribeTokenBucket(rate_per_sec=1000.0, burst_capacity=100000.0),
+        wm=wm, logger=logger, mpp_store=MppCapStore(), reward_store=ExpectedRewardStore(),
+        mode=Mode.PAPER, now_utc=lambda: datetime(2026, 6, 15, 7, 30, tzinfo=timezone.utc),
+        rest_sleep=no_sleep, pace_sleep=no_sleep,
+    ))
+    return system, wm, logger
+
+
+def _open_real_long(wm, *, atr="2000", emergsl="54000"):
+    """Open a BTC/USD long paper position on the REAL wm (the sole-writer record_execution surface
+    + the synthetic entry-fill debit), carrying the entry-time D6 snapshot for the L2 MAE detector."""
+    wm.record_execution(
+        {"exec_type": "filled", "symbol": "BTC/USD", "side": "buy",
+         "cum_qty": "0.05", "avg_price": "60000", "cl_ord_id": "cl-1"},
+        regime_at_entry="TRENDING_POS_NORMAL", atr_14_entry=atr, emergsl_price=emergsl,
+    )
+    wm.apply_paper_entry_fill("BTC/USD", "0.05", "60000")
+
+
+def _adverse_ticker():
+    # bid 57000 -> long MAE 3000 >= atr 2000 * mae_mult 1.5 = 3000 -> L2 threshold breach at the bid.
+    return {"channel": "ticker", "type": "update",
+            "data": [{"symbol": "BTC/USD", "bid": "57000", "ask": "57100"}]}
+
+
+def test_running_exit_drives_the_trade_close_through_the_wired_sink():
+    # The capstone: a REAL ticker-bbo exit on the assembled organism drives a schema-valid
+    # TRADE_CLOSE THROUGH the LONG module's wired ciats_sink into that side's conductor - the
+    # learning close (trade_count++, the Stream-2 corpus grows) - with NO manual sink call.
+    system, wm, logger = _assemble_real_wm()
+    conductor = system.conductors[PositionSide.LONG]
+    assert conductor.trade_count == 0
+    _open_real_long(wm)
+    wm.handle_ticker(_adverse_ticker())                    # detect -> the per-module close path
+    assert not wm.has_position("BTC/USD")                  # the mirror cleared (the close ran)
+    assert conductor.trade_count == 1                      # the LONG conductor learned the close
+    assert system.conductors[PositionSide.SHORT].trade_count == 0   # the short loop did NOT (per-module)
+    assert len(logger.corpus_for("long")) == 1             # the 23-field record entered the Stream-2 corpus
+
+
+def test_running_exit_applies_an_inbox_approved_change_at_the_boundary():
+    # The HR-CI-003 boundary, end-to-end: a Bill-approved change in the side's inbox is APPLIED by
+    # the REAL exit close (the confirmed inter-trade boundary the wired sink polls) - never auto-
+    # applied, never a manual sink call. Stage a Half-Kelly proposal (200-trade activation), Bill
+    # approves it into the inbox, then a running paper exit closes the boundary and applies it.
+    system, wm, _ = _assemble_real_wm()
+    side = PositionSide.LONG
+    conductor = system.conductors[side]
+    win = SimpleNamespace(net_pl_usd=Decimal("2"), net_gain_usd=Decimal("2"), net_loss_usd=Decimal("0"))
+    loss = SimpleNamespace(net_pl_usd=Decimal("-1"), net_gain_usd=Decimal("0"), net_loss_usd=Decimal("1"))
+    for _ in range(120):
+        conductor.ingest_close(win)
+    for _ in range(80):
+        conductor.ingest_close(loss)                       # 200 trades: W=0.6, R=2 -> K_full=0.4 > 0
+    conductor.recompute_kelly(wallet_balance=Decimal("5000"))
+    req = conductor.pending[0]
+    system.approval_inboxes[side].submit(req.request_id, approved=True)
+    assert conductor.parameter_store.get("per_trade_size_usd") is None   # not applied yet (no boundary)
+    # the running exit IS the confirmed inter-trade boundary: it ingests the close AND polls the inbox.
+    _open_real_long(wm)
+    wm.handle_ticker(_adverse_ticker())
+    assert conductor.parameter_store.get("per_trade_size_usd") is not None   # applied at the real close
+    assert conductor.trade_count == 201                    # the boundary close was the 201st learned trade
