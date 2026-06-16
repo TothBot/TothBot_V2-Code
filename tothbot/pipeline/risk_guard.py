@@ -82,7 +82,13 @@ class G7DrawdownHalt:
     """evt:G7_DRAWDOWN_HALT [HIGH] (Image8 CHECK 1) - the per-wallet drawdown breached a
     threshold. threshold_crossed names which (full_halt -> HALT, session_pause -> PAUSE);
     disposition carries the resulting stop. Per-wallet: the Long wallet is spot USD, the
-    Short wallet is Kraken margin equity (ar:AR-052)."""
+    Short wallet is Kraken margin equity (ar:AR-052).
+
+    wallet_balance is the REALIZED-cash sizing read (ar:AR-051; logged for the audit trail);
+    current_portfolio is the ar:AR-052 MARK-TO-MARKET value the drawdown actually measured (Long
+    = spot cash + bid MTM, Short = the reconstructed margin equity at the ask) - the numerator of
+    drawdown_pct. They DIVERGE once a position is open (the real Long/Short asymmetry); equal at
+    a flat wallet or when no MTM was supplied (the pre-MTM fallback)."""
 
     side: PositionSide
     wallet_balance: Decimal
@@ -90,6 +96,7 @@ class G7DrawdownHalt:
     drawdown_pct: Decimal
     threshold_crossed: str   # "full_halt" | "session_pause"
     disposition: str         # "HALT" | "PAUSE"
+    current_portfolio: Decimal | None = None  # the ar:AR-052 MTM value the drawdown measured (CHECK 1)
     code: str = field(default="G7_DRAWDOWN_HALT", init=False)
 
 
@@ -148,6 +155,7 @@ def evaluate_risk_guard(
     candidate_committed_usd: object,
     total_committed_usd: object,
     semaphore_locked: bool,
+    current_portfolio: object | None = None,
     full_halt_drawdown_pct: object | None = None,
     session_pause_drawdown_pct: object | None = None,
     concentration_limit: object | None = None,
@@ -158,7 +166,14 @@ def evaluate_risk_guard(
     wallet_balance / portfolio_baseline / committed amounts are the MODULE's own (Long spot
     wallet / Short Kraken-margin-equity wallet); semaphore_locked is the non-blocking probe of
     the module's BoundedSemaphore. The four CIATS-owned limits default to their registry seeds
-    and may be overridden per module. PURE - emits nothing; the caller logs the returned event."""
+    and may be overridden per module. PURE - emits nothing; the caller logs the returned event.
+
+    current_portfolio is the ar:AR-052 MARK-TO-MARKET drawdown numerator for CHECK 1 (the DISTINCT
+    computation from the realized-cash SIZING reads): Long = spot cash + bid MTM, Short = the
+    reconstructed Kraken margin equity (collateral + short MTM at the ask - borrow rollover). CHECK 1
+    measures drawdown against it; CHECK 2/3 stay on the realized wallet_balance (ar:AR-051 cash, the
+    sizing collateral). None falls back to wallet_balance - the pre-MTM simplification (paper / a tick
+    with no marks supplied) where realized cash IS the drawdown current term."""
     wallet = _dec(wallet_balance)
     baseline = _dec(portfolio_baseline)
     if baseline <= 0:
@@ -174,18 +189,27 @@ def evaluate_risk_guard(
     exp_limit = _EXPOSURE_LIMIT if exposure_limit_pct is None else _dec(exposure_limit_pct)
 
     # --- CHECK 1: per-wallet drawdown (two-threshold cascade) ------------------------------
-    drawdown_pct = (baseline - wallet) / baseline
+    # ar:AR-052: the drawdown current term is the MARK-TO-MARKET current_portfolio, NOT the realized
+    # sizing wallet (the Short's open-position MTM is exactly the FALSE NEGATIVE the cash basis would
+    # miss). None -> the pre-MTM fallback (realized cash is the current term).
+    current = wallet if current_portfolio is None else _dec(current_portfolio)
+    drawdown_pct = (baseline - current) / baseline
     if drawdown_pct >= full_halt:
         return RiskGuardOutcome(
             passed=False,
             disposition=RiskDisposition.HALT,
-            event=G7DrawdownHalt(side, wallet, baseline, drawdown_pct, "full_halt", "HALT"),
+            event=G7DrawdownHalt(
+                side, wallet, baseline, drawdown_pct, "full_halt", "HALT", current_portfolio=current
+            ),
         )
     if drawdown_pct >= session_pause:
         return RiskGuardOutcome(
             passed=False,
             disposition=RiskDisposition.PAUSE,
-            event=G7DrawdownHalt(side, wallet, baseline, drawdown_pct, "session_pause", "PAUSE"),
+            event=G7DrawdownHalt(
+                side, wallet, baseline, drawdown_pct, "session_pause", "PAUSE",
+                current_portfolio=current,
+            ),
         )
 
     # --- CHECK 2: concentration (candidate committed / wallet, a CAPITAL fraction) ---------

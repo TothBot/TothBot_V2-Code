@@ -85,6 +85,11 @@ class PipelineInputs:
     entry_fill_price: object
     atr_14: object
     expected_reward: object
+    # Gate 7 CHECK 1 (the ar:AR-052 MARK-TO-MARKET drawdown numerator - DISTINCT from the realized
+    # wallet_balance sizing read). Long = spot cash + bid MTM; Short = the reconstructed margin equity
+    # (collateral + short MTM at the ask - borrow rollover). Trailing + defaulted: None -> CHECK 1 falls
+    # back to wallet_balance (the pre-MTM simplification), so a caller that supplies no marks is unchanged.
+    current_portfolio: object = None
 
 
 @dataclass(frozen=True)
@@ -190,6 +195,7 @@ def run_pipeline(
     g7 = evaluate_risk_guard(
         side,
         wallet_balance=inputs.wallet_balance, portfolio_baseline=inputs.portfolio_baseline,
+        current_portfolio=inputs.current_portfolio,  # ar:AR-052 MTM drawdown numerator (CHECK 1)
         candidate_committed_usd=inputs.candidate_committed_usd,
         total_committed_usd=inputs.total_committed_usd,
         semaphore_locked=inputs.semaphore_locked,

@@ -60,8 +60,10 @@ class _FakeIndicators:
 
 
 class _Pos:
-    def __init__(self, side, qty, price) -> None:
+    def __init__(self, side, qty, price, *, symbol="X/USD", entry_timestamp_utc=None) -> None:
         self.side, self.qty, self.avg_entry_price = side, Decimal(qty), Decimal(price)
+        self.symbol = symbol
+        self.entry_timestamp_utc = entry_timestamp_utc
 
 
 class _FakeWM:
@@ -261,6 +263,43 @@ def test_sweep_skips_side_without_module():
         regime_cache=_cache(regime=Regime.NON_DIR_NORMAL), providers=_providers(),
     ))
     assert [r.outcome.side for r in results] == [PositionSide.LONG]
+
+
+def test_assemble_feeds_ar052_mark_to_market_current_portfolio():
+    # the candidate's PipelineInputs.current_portfolio is the MTM value (cash + bid MTM for a long),
+    # DISTINCT from wallet_balance (realized cash). 5000 cash + 0.1 BTC * bid 59990 = 10999.
+    wm = _FakeWM(positions={"BTC/USD": _Pos(PositionSide.LONG, "0.1", "55000", symbol="BTC/USD")})
+    inputs, _ctx = assemble_candidate(
+        "BTC/USD", PositionSide.LONG, candle=_candle(), warmup=_warmup(), regime_cache=_cache(),
+        providers=_providers(), wm=wm,
+    )
+    assert inputs.wallet_balance == Decimal("5000")                       # ar:AR-051 realized cash
+    assert inputs.current_portfolio == Decimal("5000") + Decimal("0.1") * Decimal("59990")  # ar:AR-052
+
+
+def test_sweep_short_bleed_drawdown_halt_the_fn_case():
+    # END-TO-END FALSE-NEGATIVE case (SAFETY): an OPEN short bleeding (price ROSE far above entry) ->
+    # the ar:AR-052 equity drawdown FIRES at G7 CHECK 1; the realized margin CASH (flat at baseline)
+    # would NOT have fired. NON_DIR_NORMAL so the SHORT side is swept; the bbo ask is well above entry.
+    # the bleeding short is on ETH/USD (a DIFFERENT symbol than the BTC/USD candle) so the BTC/USD
+    # candidate clears the Gate-5 same-side guard and reaches G7, where the module-wide equity
+    # drawdown (driven by the ETH/USD short) halts it.
+    short = _Pos(PositionSide.SHORT, "0.5", "60000", symbol="ETH/USD")
+    wm = _FakeWM(positions={"ETH/USD": short})
+    # MTM: 5000 collateral + (60000 - 75000)*0.5 = 5000 - 7500 = -2500 -> a massive drawdown (>10%).
+    providers = _providers(bbo=lambda s: (Decimal("74990"), Decimal("75000")))
+    logger = _FakeLogger()
+    results = asyncio.run(sweep_pair(
+        wm, logger, candle=_candle(), warmup=_warmup(_FakeIndicators(passing=True)),
+        regime_cache=_cache(regime=Regime.NON_DIR_NORMAL), providers=providers,
+    ))
+    short_res = [r for r in results if r.outcome.side is PositionSide.SHORT]
+    assert len(short_res) == 1
+    out = short_res[0].outcome
+    assert out.accepted is False
+    assert out.stage == "G7"
+    assert out.reason == "HALT"                       # full_halt drawdown -> module HALT
+    assert short_res[0].dispatched is False           # no entry while the wallet is bleeding
 
 
 def test_sweep_no_regime_is_skipped():

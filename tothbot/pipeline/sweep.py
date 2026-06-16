@@ -43,6 +43,7 @@ from ..exchange.position_mirror import PositionSide
 from ..regime.sss import SignalSide
 from ..regime.taxonomy import Regime, profile
 from .driver import ExecutionContext, process_candidate
+from .portfolio import current_portfolio_usd
 from .regime_sizer import size_regime
 from .signal_pipeline import PipelineInputs
 
@@ -211,8 +212,12 @@ def assemble_candidate(
         consecutive_loss_count=wm.consecutive_loss_count(symbol, side),
         has_active_same_side_position=has_same_side,
         base_per_trade_size_usd=base,
-        wallet_balance=wm.wallet_balance(side),
+        wallet_balance=wm.wallet_balance(side),          # ar:AR-051 realized cash (G7 CHECK 2/3 + G8 sizing)
         portfolio_baseline=wm.portfolio_baseline(side),  # mode-aware (paper ledger / live REST-BAL-004)
+        # ar:AR-052 MARK-TO-MARKET drawdown numerator (G7 CHECK 1): Long = spot cash + bid MTM, Short =
+        # the reconstructed margin equity (collateral + short MTM at the ask - borrow rollover). bbo over
+        # the open same-side positions; a missing open-position quote raises ProviderNotReady -> skip tick.
+        current_portfolio=current_portfolio_usd(wm, side, bbo=providers.bbo),
         candidate_committed_usd=candidate_committed_usd(side, sized_usd),
         total_committed_usd=total_committed_usd(wm, side),
         semaphore_locked=providers.semaphore_locked(side),

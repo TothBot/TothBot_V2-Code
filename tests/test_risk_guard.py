@@ -164,6 +164,51 @@ def test_long_and_short_evaluate_identically():
     assert lng_b.event.side is PositionSide.SHORT
 
 
+# -- CHECK 1: the ar:AR-052 MARK-TO-MARKET current_portfolio (the FALSE-NEGATIVE fix) ----
+
+def test_check1_measures_drawdown_against_current_portfolio_not_wallet():
+    # wallet (realized cash) is FLAT at baseline, but the MTM current_portfolio bled to 4400 (an open
+    # short bleeding -> equity -12%). CHECK 1 fires on the MTM value -> HALT. The cash basis would PASS
+    # (this is the structural false negative the equity basis eliminates).
+    out = _healthy(wallet_balance="5000", current_portfolio="4400")
+    assert out.disposition is RiskDisposition.HALT
+    assert out.event.drawdown_pct == Decimal("0.12")
+    assert out.event.current_portfolio == Decimal("4400")
+    assert out.event.wallet_balance == Decimal("5000")   # the realized cash, logged for the audit trail
+
+
+def test_check1_cash_basis_would_be_a_false_negative():
+    # the SAME bleed, but with NO MTM supplied (current_portfolio=None) -> CHECK 1 falls back to the
+    # realized wallet (flat at baseline) -> drawdown 0 -> PASS. Proves the cash basis sleeps on it.
+    out = _healthy(wallet_balance="5000")  # current_portfolio defaults None
+    assert out.disposition is RiskDisposition.PASS
+
+
+def test_check1_session_pause_on_mtm():
+    # MTM at 4650 -> 7% drawdown -> PAUSE, while CHECK 2/3 still read the (flat) realized wallet.
+    out = _healthy(wallet_balance="5000", current_portfolio="4650")
+    assert out.disposition is RiskDisposition.PAUSE
+    assert out.event.threshold_crossed == "session_pause"
+
+
+def test_check2_3_stay_on_realized_wallet_not_mtm():
+    # MTM gain (current_portfolio 9000) does NOT widen the concentration/exposure denominators -
+    # those stay on the realized sizing wallet (ar:AR-051). 3000/5000 = 0.6 > 0.5 cap -> BLOCK
+    # (it would PASS at 3000/9000 if CHECK 2 wrongly used the MTM value).
+    out = _healthy(
+        wallet_balance="5000", current_portfolio="9000",
+        candidate_committed_usd="3000", concentration_limit="0.5",
+    )
+    assert out.disposition is RiskDisposition.BLOCK
+    assert out.event.concentration_ratio == Decimal("0.6")
+
+
+def test_check1_mtm_gain_passes():
+    # an MTM gain above baseline is not a drawdown -> PASS (gains never trip the breaker).
+    out = _healthy(wallet_balance="5000", current_portfolio="6000")
+    assert out.disposition is RiskDisposition.PASS
+
+
 # -- guards / AR-047 ----------------------------------------------------
 
 def test_non_positive_baseline_is_a_loud_defect():
