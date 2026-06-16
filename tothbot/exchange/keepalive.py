@@ -38,10 +38,12 @@ ZOMBIE_THRESHOLD_SEC = 90.0  # no real data beyond this = zombie (A-8 / WS-ZOM-0
 # which is disabled (rule:HR-WM-002 ping_interval=None).
 PING_MESSAGE: dict[str, str] = {"method": "ping"}
 
-# Canonical log keys the read loop emits on a liveness failure (the diagram
-# names ZOMBIE_CONNECTION_DETECTED explicitly; the dead-pong key mirrors it).
+# Canonical log keys the read loop emits on a liveness failure - the exact sec-7
+# mod:Logger event_registry codes: ZOMBIE_CONNECTION_DETECTED + PING_TIMEOUT. (The
+# dead-pong limb's REGISTERED code is PING_TIMEOUT, which the receive loop emits; the
+# prior "WS_PONG_TIMEOUT" spelling was unregistered - an LG-EVT-001 violation.)
 ZOMBIE_LOG_KEY = "ZOMBIE_CONNECTION_DETECTED"  # WS-ZOM-003
-DEAD_CONNECTION_LOG_KEY = "WS_PONG_TIMEOUT"    # WS-PING-002 dead-connection limb
+DEAD_CONNECTION_LOG_KEY = "PING_TIMEOUT"        # WS-PING-002 dead-connection limb (event_registry)
 
 # An injectable monotonic clock (time.monotonic by default; never wall-clock -
 # the timers measure elapsed intervals, so a clock that can jump backwards or

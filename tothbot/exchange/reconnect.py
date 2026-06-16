@@ -162,7 +162,8 @@ def select_scenario(reason: DisconnectReason) -> ReconnectScenario:
 def is_immediate_attempt(attempt: int) -> bool:
     """True while a Scenario-A attempt is still in the immediate (zero-delay)
     phase. attempt is 1-based; the first SCENARIO_A_IMMEDIATE_ATTEMPTS are
-    immediate (WS-REC-003), after which the BLOCKED exponential backoff begins."""
+    immediate (WS-REC-003), after which the exponential backoff begins
+    (RECONNECT_BACKOFF_SEED_SEC, built TB00712 - no longer the prior unbuilt limb)."""
     if attempt < 1:
         raise ValueError(f"attempt must be >= 1, got {attempt}")
     return attempt <= SCENARIO_A_IMMEDIATE_ATTEMPTS
