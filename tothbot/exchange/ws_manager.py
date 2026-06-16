@@ -431,6 +431,14 @@ class WSManager:
         # paper path never feeds it (HR-WM-022: no private channel in paper); constructed in both modes
         # but inert in paper. WSManager is its sole writer (the sec-12.4 single-owner property).
         self._balances_cache = BalancesCache()
+        # The LIVE drawdown baseline (sec 12.4 / ar:AR-052 / REST-BAL-004): portfolio_baseline_USD is
+        # the GetAccountBalance USD captured ONCE at startup (after Step 6 snap_orders) - LONG the
+        # spot/main USD, SHORT the margin-account USD - assigned directly as the baseline. HR-WM-011:
+        # captured once, NEVER updated, NEVER reset on mid-session reconnect (AR-056); resets only on a
+        # full process restart (a fresh WSManager). The live G7 CHECK-1 drawdown reads it via the
+        # portfolio_baseline(side) accessor (paper reads the module ledger's captured baseline). Empty
+        # until set_live_portfolio_baseline records it - the sweep skips the side until then.
+        self._live_portfolio_baseline: dict[PositionSide, Decimal] = {}
         # LIVE exit bookkeeping (sec 12.5 LIVE FLOW). _pending_exit_reason: the exit_reason stamped
         # by a TothBot-dispatched live exit (L1a/L2 market sell) at dispatch, read when the executions
         # close fill confirms (an un-stamped close IS the off-book emergSL backstop firing - mod:Exit_
@@ -1613,10 +1621,42 @@ class WSManager:
         return None if self.modules is None else self.modules[PositionSide.LONG].wallet_balance
 
     def wallet_balance(self, side: PositionSide) -> Decimal | None:
-        """THIS SIDE's synthetic wallet balance (paper): the Long wallet is spot USD, the Short
-        wallet is Kraken margin equity (sec 7 per-module). None in live mode (the live G8 sizer reads
-        the balances cache via live_spot_wallet_usd / live_margin_wallet_usd - a later wiring slice)."""
-        return None if self.modules is None else self.modules[side].wallet_balance
+        """THIS side's G8-sizer wallet read (gate:G7 CHECK 2/3 + gate:G8, ar:AR-051 REALIZED CAPITAL /
+        cash-in-hand - NO open-position MTM). PAPER: the module's synthetic wallet (Long spot USD /
+        Short Kraken margin equity, sec 7 per-module). LIVE: the real Kraken balance from the live
+        BalancesCache (sec 12.4 authoritative) - LONG the spot/main USD (WS-BAL-002), SHORT the margin-
+        account cash balance (WS-BAL-002 / ar:AR-050). None before the first balances frame (the sweep
+        skips the side that tick, like a not-yet-ready wallet). The open-margin-position equity AR-050
+        adds for the SHORT is the ar:AR-052 drawdown current_portfolio (MTM), a DISTINCT computation -
+        never layered onto this realized-cash sizing read."""
+        if self.modules is None:  # live - the synthetic ledger is bypassed (sec 12.4)
+            return (
+                self.live_margin_wallet_usd() if side is PositionSide.SHORT
+                else self.live_spot_wallet_usd()
+            )
+        return self.modules[side].wallet_balance
+
+    def portfolio_baseline(self, side: PositionSide) -> Decimal | None:
+        """THIS side's drawdown baseline (gate:G7 CHECK 1, ar:AR-052 / rule:HR-WM-011): the portfolio
+        USD captured ONCE at startup, never updated, never reset on reconnect. PAPER: the module
+        ledger's captured baseline (the synthetic starting wallet). LIVE: the REST-BAL-004
+        GetAccountBalance USD captured once at startup Step 6 (LONG spot, SHORT margin-account) - None
+        until set_live_portfolio_baseline records it (the sweep skips the side until then). Per-module
+        isolated: one side's baseline never feeds the other (sec 7)."""
+        if self.modules is None:  # live - the baseline is the REST-BAL-004 startup capture
+            return self._live_portfolio_baseline.get(side)
+        return self.modules[side].portfolio_baseline
+
+    def set_live_portfolio_baseline(self, side: PositionSide, portfolio_usd: object) -> None:
+        """REST-BAL-004 (ar:AR-052 / rule:HR-WM-011): capture THIS side's LIVE drawdown baseline ONCE
+        at startup (after Step 6 snap_orders), from the GetAccountBalance USD assigned directly as
+        portfolio_baseline_USD - LONG the spot/main USD, SHORT the margin-account USD. Captured ONCE: a
+        subsequent call (a mid-session reconnect re-running startup, AR-056) is IGNORED so the first
+        startup capture stays authoritative; the baseline resets only on a full process restart (a
+        fresh WSManager). Live only - paper's baseline lives on the synthetic ledger."""
+        if side in self._live_portfolio_baseline:
+            return  # HR-WM-011 / AR-056: captured once at startup, never overwritten on reconnect
+        self._live_portfolio_baseline[side] = _dec(portfolio_usd)
 
     # --- the LIVE wallet cache (sec 12.4 / WS-BAL-002/003 - real Kraken balances authoritative) -----
     def ingest_balances(self, frame: Mapping[str, object]) -> object:

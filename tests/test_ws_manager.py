@@ -1742,10 +1742,43 @@ def test_reset_balances_cache_drops_stale_for_reconnect_reseed():
     assert m.live_spot_wallet_usd() is None and m.live_margin_wallet_usd() is None
 
 
-def test_paper_wallet_balance_unchanged_live_uses_the_cache():
-    # paper still reads the synthetic per-module wallet; live wallet_balance stays None (the live
-    # sizer reads live_spot_wallet_usd / live_margin_wallet_usd - the cache, not wallet_balance).
+def test_paper_wallet_balance_unchanged_live_reads_the_cache():
+    # paper still reads the synthetic per-module wallet; live wallet_balance(side) now reads the live
+    # BalancesCache (AR-051 realized cash) - None before the first balances frame, the cache value
+    # after (LONG spot/main, SHORT margin - symmetric WS-BAL-002).
     p = WSManager(Mode.PAPER, paper_starting_balance="5000")
     assert p.wallet_balance(PositionSide.LONG) == Decimal("5000")
     m, _, _ = _live_manager()
-    assert m.wallet_balance(PositionSide.LONG) is None
+    assert m.wallet_balance(PositionSide.LONG) is None     # no balances frame yet
+    assert m.wallet_balance(PositionSide.SHORT) is None
+    m.ingest_balances({"type": "snapshot", "data": [
+        {"asset": "USD", "wallets": [
+            {"type": "spot", "id": "main", "balance": "5000.0"},
+            {"type": "margin", "id": "m1", "balance": "3000.0"}]}]})
+    assert m.wallet_balance(PositionSide.LONG) == Decimal("5000.0")    # spot/main (AR-050 long)
+    assert m.wallet_balance(PositionSide.SHORT) == Decimal("3000.0")   # margin cash (AR-050 short)
+
+
+def test_live_portfolio_baseline_captured_once_paper_reads_the_ledger():
+    # PAPER: portfolio_baseline(side) reads the module ledger's captured baseline (the starting wallet).
+    p = WSManager(Mode.PAPER, paper_starting_balance="5000")
+    assert p.portfolio_baseline(PositionSide.LONG) == Decimal("5000")
+    assert p.portfolio_baseline(PositionSide.SHORT) == Decimal("5000")
+    # LIVE: None until the REST-BAL-004 startup capture; then the captured USD, per-module symmetric.
+    m, _, _ = _live_manager()
+    assert m.portfolio_baseline(PositionSide.LONG) is None
+    m.set_live_portfolio_baseline(PositionSide.LONG, "5000")     # REST-BAL-004 spot
+    m.set_live_portfolio_baseline(PositionSide.SHORT, "3000")    # REST-BAL-004 margin-account
+    assert m.portfolio_baseline(PositionSide.LONG) == Decimal("5000")
+    assert m.portfolio_baseline(PositionSide.SHORT) == Decimal("3000")
+
+
+def test_live_portfolio_baseline_not_overwritten_on_reconnect_recapture():
+    # HR-WM-011 / AR-056: captured ONCE at startup; a reconnect re-running the capture is IGNORED, and
+    # reset_balances_cache (the WS-REC-004 wallet drop) NEVER touches the baseline.
+    m, _, _ = _live_manager()
+    m.set_live_portfolio_baseline(PositionSide.LONG, "5000")
+    m.set_live_portfolio_baseline(PositionSide.LONG, "4200")   # a later recapture - ignored
+    assert m.portfolio_baseline(PositionSide.LONG) == Decimal("5000")
+    m.reset_balances_cache()                                    # reconnect drops the wallet cache...
+    assert m.portfolio_baseline(PositionSide.LONG) == Decimal("5000")   # ...but not the baseline
