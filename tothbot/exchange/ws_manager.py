@@ -93,6 +93,7 @@ from .seam import DispatchSeam, EventSink, LiveSender, PaperSimulator
 from ..config import registry
 from ..config.settings import Mode
 from ..execution.exit_controller import ExitController, ExitReason
+from ..risk.dispatch_semaphore import DispatchSemaphore
 from ..modules.trading_module import TradingModule
 from ..regime.engine import RegimeClassification
 
@@ -160,9 +161,14 @@ class WSManager:
         # MONOTONIC clock (rule:HR-SC-006); the TRADE_CLOSE ts uses UTC wall time.
         self._now_monotonic: MonotonicClock = now_monotonic or time.monotonic
         self._now_utc: UtcClock = now_utc or (lambda: datetime.now(timezone.utc))
-        # The G7 capital-commitment BoundedSemaphore (acquired at entry, released on close,
-        # sec 12.5 step 9). Injected; None until mod:Risk_Engine wires the acquire side.
+        # The G7 capital-commitment BoundedSemaphore (ar:AR-043), POSITION-LIFETIME per the TB00758 D2
+        # ruling: per-module, acquired at entry ON A FILL + released on close (max one open commitment
+        # per module). G7 CHECK 4 probes dispatch_semaphore_locked(side). `exit_semaphore` stays as an
+        # optional legacy injected override for the no-side release_exit_semaphore() path (back-compat).
         self._exit_semaphore = exit_semaphore
+        self._dispatch_sem: dict[PositionSide, DispatchSemaphore] = {
+            PositionSide.LONG: DispatchSemaphore(), PositionSide.SHORT: DispatchSemaphore(),
+        }
         # mod:Selection_Controller state, updated ONLY by the Exit Controller via the AR-073
         # path (rule:HR-EC-014), PER-MODULE - each side carries its OWN consecutive-loss counter
         # + cooldown log (G5 SC-Gate-3/2 read "this side's" state; sec 7 per-module rule). Keyed
@@ -372,6 +378,11 @@ class WSManager:
         # back to trades in the sec-12.5 step 10 / the DISPATCH-path executions close).
         if outcome.action is PositionAction.OPENED and outcome.position is not None:
             self._update_ticker_event_trigger(outcome.position.symbol, has_position=True)
+            # ar:AR-043 (D2 position-lifetime): the capital commitment opened -> ACQUIRE this module's
+            # dispatch semaphore (held until close). G7 CHECK 4 SKIPs the module's next candidate while
+            # held. acquire() is False only if already held (a gate-bypass defect, the position still
+            # opened) - the defensive no-double-commit marker; the close releases once.
+            self._dispatch_sem[outcome.position.side].acquire()
         elif outcome.action is PositionAction.CLOSED:
             closed_symbol = _opt_str(event.get("symbol"))
             if closed_symbol is not None:
@@ -564,17 +575,26 @@ class WSManager:
             self._selection_cooldown[side][symbol] = self._now_monotonic()
         self._emit_event(SelectionStateUpdated(symbol, is_win, losses[symbol]))
 
-    def release_exit_semaphore(self) -> None:
-        """sec 12.5 step 9: release the G7 capital-commitment BoundedSemaphore acquired at
-        entry. A no-op until mod:Risk_Engine wires the acquire side (the semaphore stays
-        None); guarded so a spurious release on an un-acquired semaphore cannot raise."""
-        if self._exit_semaphore is None:
+    def release_exit_semaphore(self, side: PositionSide | None = None) -> None:
+        """sec 12.5 step 9: release the G7 capital-commitment dispatch semaphore acquired at entry
+        (ar:AR-043, D2 position-lifetime). `side` releases THAT module's per-side semaphore (the Exit
+        Controller passes the closing position's side); guarded so a spurious release (no commitment
+        held) cannot crash the close path. side=None is the legacy path -> the optional injected
+        _exit_semaphore (back-compat)."""
+        target = self._dispatch_sem[side] if side is not None else self._exit_semaphore
+        if target is None:
             return
         try:
-            self._exit_semaphore.release()
+            target.release()
         except ValueError:
-            # BoundedSemaphore.release() past its initial value - nothing was acquired.
+            # BoundedSemaphore over-release (nothing was acquired) - benign, never raises out.
             pass
+
+    def dispatch_semaphore_locked(self, side: PositionSide) -> bool:
+        """gate:G7 CHECK 4 - the non-blocking probe of THIS module's capital-commitment dispatch
+        semaphore (ar:AR-043). True while the module holds an open commitment (D2 position-lifetime);
+        the gate SKIPs a new candidate while locked. Does NOT acquire/mutate."""
+        return self._dispatch_sem[side].locked()
 
     def consecutive_loss_count(self, symbol: str, side: PositionSide = PositionSide.LONG) -> int:
         """mod:Selection_Controller read helper - THIS SIDE's consecutive-loss count for the

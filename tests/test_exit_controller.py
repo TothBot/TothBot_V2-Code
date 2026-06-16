@@ -48,8 +48,9 @@ class _FakeWM:
     def update_selection_state_on_close(self, symbol, is_win, side=None):
         self.sc_updates.append((symbol, is_win, side))
 
-    def release_exit_semaphore(self):
+    def release_exit_semaphore(self, side=None):
         self.sem_released += 1
+        self.sem_released_side = side
 
 
 _CLOCK = lambda: datetime(2026, 6, 15, 0, 45, 0, tzinfo=timezone.utc)

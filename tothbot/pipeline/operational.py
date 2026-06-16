@@ -346,6 +346,9 @@ async def assemble_operational(
         ws_state=make_ws_state_provider(silent_pairs.get),
         now_utc=now_utc,
         cycle_parameters=make_cycle_parameters_provider(conductors),
+        # gate:G7 CHECK 4 (ar:AR-043, D2): the per-module dispatch-semaphore probe lives on the wm
+        # (the dispatch owner acquires/releases it); the gate reads it as a non-blocking lock state.
+        semaphore_locked=getattr(wm, "dispatch_semaphore_locked", None),
     )
 
     # 4b. THE PERIODIC-REPORT CADENCE (contract:Operator_Reporting_Hierarchy C2-C6 PULL track). When a

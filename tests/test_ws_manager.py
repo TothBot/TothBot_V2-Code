@@ -465,13 +465,24 @@ def test_open_switches_ticker_trigger_to_bbo():
     assert m.ticker_event_trigger("BTC/USD") == "bbo"      # WS-TKR-003 on open
 
 
+def test_open_acquires_only_this_modules_dispatch_semaphore():
+    # ar:AR-043 (D2) per-module independence (sec 7): opening a LONG commitment acquires the LONG
+    # dispatch semaphore but leaves the SHORT module's semaphore FREE (one side never blocks the other).
+    m = WSManager(Mode.PAPER)
+    assert m.dispatch_semaphore_locked(PositionSide.LONG) is False
+    assert m.dispatch_semaphore_locked(PositionSide.SHORT) is False
+    _open_paper_long(m)
+    assert m.dispatch_semaphore_locked(PositionSide.LONG) is True    # LONG commitment held
+    assert m.dispatch_semaphore_locked(PositionSide.SHORT) is False  # SHORT unaffected
+
+
 def test_paper_exit_lifecycle_l2_mae_full_close():
     events: list = []
-    sem = _FakeSemaphore()
-    m = WSManager(Mode.PAPER, on_event=events.append,
-                  now_monotonic=lambda: 1234.5, exit_semaphore=sem)
+    m = WSManager(Mode.PAPER, on_event=events.append, now_monotonic=lambda: 1234.5)
     _open_paper_long(m)
     assert m.spot_usd_balance == Decimal("1992.2")        # after entry debit
+    # ar:AR-043 (D2 position-lifetime): the fill ACQUIRED the LONG dispatch semaphore.
+    assert m.dispatch_semaphore_locked(PositionSide.LONG) is True
 
     # adverse bbo: bid 57000 -> mae 3000 >= atr 2000 * 1.5 -> L2 breach at the bid.
     m.handle_ticker(_ticker("BTC/USD", "57000", "57100"))
@@ -494,7 +505,8 @@ def test_paper_exit_lifecycle_l2_mae_full_close():
     assert m.consecutive_loss_count("BTC/USD") == 1
     assert m.exit_cooldown_at("BTC/USD") == 1234.5
     assert m.ticker_event_trigger("BTC/USD") == "trades"   # step 10
-    assert sem.released == 1                                # step 9
+    # step 9: the LONG dispatch semaphore was RELEASED at close (ar:AR-043 D2; free for the next).
+    assert m.dispatch_semaphore_locked(PositionSide.LONG) is False
     assert any(isinstance(e, SelectionStateUpdated) and not e.is_win for e in events)
 
 
@@ -632,11 +644,10 @@ def _trending_neg():
 
 def test_l1a_daily_downgrade_full_close():
     events: list = []
-    sem = _FakeSemaphore()
-    m = WSManager(Mode.PAPER, on_event=events.append,
-                  now_monotonic=lambda: 999.0, exit_semaphore=sem)
+    m = WSManager(Mode.PAPER, on_event=events.append, now_monotonic=lambda: 999.0)
     _open_paper_long(m)
     assert m.spot_usd_balance == Decimal("1992.2")
+    assert m.dispatch_semaphore_locked(PositionSide.LONG) is True   # acquired on the fill (D2)
 
     # 00:00 UTC regime refresh downgrades the pair; run-to-reversal close at the bid 61000.
     m.on_regime_classified("BTC/USD", _trending_neg(), bid="61000", ask="61100")
@@ -657,7 +668,7 @@ def test_l1a_daily_downgrade_full_close():
     assert len(det) == 1 and det[0].trigger == "EC-L1A-002"
     assert m.consecutive_loss_count("BTC/USD") == 0     # win path
     assert m.ticker_event_trigger("BTC/USD") == "trades"
-    assert sem.released == 1
+    assert m.dispatch_semaphore_locked(PositionSide.LONG) is False  # released at close (D2 step 9)
     assert any(isinstance(e, SelectionStateUpdated) and e.is_win for e in events)
 
 

@@ -285,8 +285,9 @@ class ExitController:
         wm.close_position(symbol)
         # 8. update Selection Controller state via the WSManager AR-073 path (HR-EC-014).
         wm.update_selection_state_on_close(symbol, is_win, position.side)
-        # 9. release the G7 capital-commitment semaphore.
-        wm.release_exit_semaphore()
+        # 9. release the G7 capital-commitment semaphore for THIS module (ar:AR-043, D2 position-
+        #    lifetime - the commitment held since entry is freed at close, per side).
+        wm.release_exit_semaphore(position.side)
         return record
 
 
