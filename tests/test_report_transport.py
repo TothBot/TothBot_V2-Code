@@ -21,6 +21,7 @@ from tothbot.recorder.report_transport import (
     PullCadenceScheduler,
     SmtpReportTransport,
     fan_out,
+    smtplib_send,
 )
 from tothbot.recorder.reporting import ReportCategory, report_window
 
@@ -193,6 +194,91 @@ def test_scheduler_is_deterministic_over_the_same_tick_sequence():
             sched.tick(t)
         runs.append(list(svc.calls))
     assert runs[0] == runs[1] and len(runs[0]) >= 2     # at least 2 day-boundaries crossed
+
+
+# --------------------------------------------------------------------- the real smtplib socket edge
+class _FakeSmtp:
+    """A smtplib.SMTP stand-in: records the connection target + the calls, so smtplib_send is tested
+    without opening a socket."""
+
+    def __init__(self, host, port):
+        self.host, self.port = host, port
+        self.tls = False
+        self.login_args = None
+        self.sent: list = []
+        self.quit_called = False
+
+    def starttls(self):
+        self.tls = True
+
+    def login(self, user, password):
+        self.login_args = (user, password)
+
+    def sendmail(self, from_addr, to_addrs, message):
+        self.sent.append((from_addr, to_addrs, message))
+
+    def quit(self):
+        self.quit_called = True
+
+
+def test_smtplib_send_opens_sends_and_quits_via_the_injected_factory():
+    made: list = []
+
+    def factory(host, port):
+        client = _FakeSmtp(host, port)
+        made.append(client)
+        return client
+
+    send = smtplib_send("mail.example.com", 587, smtp_factory=factory,
+                        starttls=True, username="u", password="p")
+    send("from@x", ["a@y", "b@z"], "MESSAGE-BODY")
+
+    assert len(made) == 1
+    c = made[0]
+    assert (c.host, c.port) == ("mail.example.com", 587)
+    assert c.tls is True and c.login_args == ("u", "p")
+    assert c.sent == [("from@x", ["a@y", "b@z"], "MESSAGE-BODY")]
+    assert c.quit_called is True
+
+
+def test_smtplib_send_skips_tls_and_login_when_unconfigured():
+    made: list = []
+    send = smtplib_send("h", smtp_factory=lambda h, p: (made.append(_FakeSmtp(h, p)), made[-1])[1])
+    send("f", ["t"], "m")
+    assert made[0].tls is False and made[0].login_args is None and made[0].quit_called is True
+
+
+def test_smtplib_send_quits_even_when_sendmail_raises():
+    class _BoomSmtp(_FakeSmtp):
+        def sendmail(self, *a):
+            raise RuntimeError("smtp down")
+
+    made: list = []
+
+    def factory(host, port):
+        c = _BoomSmtp(host, port)
+        made.append(c)
+        return c
+
+    send = smtplib_send("h", smtp_factory=factory)
+    try:
+        send("f", ["t"], "m")
+    except RuntimeError:
+        pass
+    assert made[0].quit_called is True            # the finally-quit ran despite the send error
+
+
+def test_smtp_transport_over_the_real_smtplib_edge_delivers_the_built_message():
+    # SmtpReportTransport (message construction) composed with smtplib_send (the socket edge): the
+    # built RFC-822 message reaches the SMTP sendmail, end to end, with the socket injected.
+    made: list = []
+    transport = SmtpReportTransport(
+        send=smtplib_send("h", smtp_factory=lambda host, port: (made.append(_FakeSmtp(host, port)), made[-1])[1]),
+        sender="t@b", recipients=["w@g"])
+    transport(_rendered())
+    frm, to, msg = made[0].sent[0]
+    assert frm == "t@b" and to == ["w@g"]
+    assert "X-TothBot-Track: periodic-pull" in msg and "net P/L: -200 USD" in msg
 
 
 def _close(net, when):

@@ -75,6 +75,9 @@ from ..exchange.sharding import ShardPlan
 from ..exchange.silent_pair import SilentPairMachine
 from ..exchange.transport import Transport
 from ..exchange.warmup import WarmupOrchestrator
+from ..recorder.report_render import PullReportService, ReportSink
+from ..recorder.report_transport import PullCadenceScheduler
+from ..recorder.reporting import ReportCategory
 from ..regime.scheduler import DailyRegimeCompute, RegimeCache
 from .live_driver import (
     LiveSweepDriver,
@@ -213,6 +216,7 @@ class OperationalSystem:
     ciats_sinks: dict[PositionSide, Callable[[object], None]]
     approval_inboxes: dict[PositionSide, ApprovalInbox]
     private_connection: PrivateConnection | None = None
+    pull_scheduler: PullCadenceScheduler | None = None
 
     async def run(self) -> None:
         """Drive the public data layer (and the live private connection, if present) concurrently."""
@@ -252,6 +256,8 @@ async def assemble_operational(
     acquire_token: "Callable | None" = None,
     fetch_snap_orders: "Callable | None" = None,
     balances_handler: Handler | None = None,
+    report_emit: "ReportSink | None" = None,
+    report_categories: "Sequence[ReportCategory] | None" = None,
 ) -> OperationalSystem:
     """Run the ar:AR-049 cold-start sequence and return the runnable public organism (see module
     docstring). `on_event` (defaulting to logger.record) sinks the warm-up / regime / liquidity /
@@ -324,6 +330,26 @@ async def assemble_operational(
         cycle_parameters=make_cycle_parameters_provider(conductors),
     )
 
+    # 4b. THE PERIODIC-REPORT CADENCE (contract:Operator_Reporting_Hierarchy C2-C6 PULL track). When a
+    #     report delivery edge is wired (`report_emit` = e.g. an SmtpReportTransport / a dashboard
+    #     write, the low-level send injected at this cold-start), build the per-organism PullReport
+    #     Service over mod:Logger + the per-module Parameter Stores and a PullCadenceScheduler over the
+    #     C2-C6 categories. The scheduler's tick is driven by the OHLC_5m system clock (step 5) - so a
+    #     calendar boundary FIRES the periodic pull through the wired transport, DISTINCT from the C1
+    #     IMMEDIATE push (the pull never raises a C1 alert). No report_emit -> no cadence wiring (the
+    #     pull stays operator-invoked only); the driver's clock tick is left None.
+    pull_scheduler: PullCadenceScheduler | None = None
+    on_clock_tick: "Callable[[datetime], None] | None" = None
+    if report_emit is not None:
+        stores = {
+            side.value: conductors[side].parameter_store
+            for side in (PositionSide.LONG, PositionSide.SHORT)
+        }
+        pull_service = PullReportService(logger, stores, emit=report_emit)
+        categories = list(report_categories) if report_categories is not None else list(ReportCategory)
+        pull_scheduler = PullCadenceScheduler(pull_service, categories)
+        on_clock_tick = pull_scheduler.tick
+
     # 5. The LiveSweepDriver over the warmed pairs (the HR-WM-012 guard reads the shared coordinator).
     driver = LiveSweepDriver(
         warmups=warmups,
@@ -334,6 +360,7 @@ async def assemble_operational(
         is_reconnecting=coordinator.any_reconnecting,
         now_monotonic=mono_clock,
         bbo_provider=bbo_pair,
+        on_clock_tick=on_clock_tick,
     )
 
     # 6. Build + run the public data layer (handlers bound, the SHARED machines/coordinator injected).
@@ -392,4 +419,5 @@ async def assemble_operational(
         ciats_sinks=ciats_sinks,
         approval_inboxes=approval_inboxes,
         private_connection=private_connection,
+        pull_scheduler=pull_scheduler,
     )

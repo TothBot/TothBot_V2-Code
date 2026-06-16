@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from ..exchange.candle_close import (
@@ -151,6 +152,7 @@ class LiveSweepDriver:
         htf_ema_short: int = HTF_EMA_SHORT,
         htf_ema_long: int = HTF_EMA_LONG,
         bbo_provider: Callable[[str], "tuple[object, object]"] | None = None,
+        on_clock_tick: Callable[[datetime], None] | None = None,
     ) -> None:
         self._warmups = warmups
         self._regime_cache = regime_cache
@@ -159,6 +161,11 @@ class LiveSweepDriver:
         self._logger = logger
         self._is_reconnecting = is_reconnecting or (lambda: False)
         self._now = now_monotonic
+        # The UTC-wall-clock tick for the periodic-report cadence (contract:Operator_Reporting_
+        # Hierarchy). The OHLC_5m close is the SOLE pipeline clock, so each closed 5m candle's UTC
+        # instant advances the PullCadenceScheduler (a calendar boundary fires the periodic pull).
+        # Injected + optional - paper/unit assemblies that wire no reporting leave it None.
+        self._on_clock_tick = on_clock_tick
         self._alpha_short = Decimal(2) / (int(htf_ema_short) + 1)   # 1H EMA(20) step alpha 2/21
         self._alpha_long = Decimal(2) / (int(htf_ema_long) + 1)     # 1H EMA(50) step alpha 2/51
         self._bbo = bbo_provider or providers.bbo
@@ -207,6 +214,11 @@ class LiveSweepDriver:
                     OhlcCandle(high=closed.high, low=closed.low, close=closed.close, volume=closed.volume)
                 )
                 self._stepped5[candle.symbol] = closed.interval_begin
+            # The OHLC_5m close is the system clock: advance the periodic-report cadence with this
+            # candle's UTC instant (the interval_begin Unix-second key -> a UTC datetime). A calendar
+            # boundary crossed since the last close fires the C2-C6 periodic pull (no manual tick).
+            if self._on_clock_tick is not None:
+                self._on_clock_tick(datetime.fromtimestamp(closed.interval_begin, tz=timezone.utc))
             results.extend(await sweep_pair(
                 self._wm, self._logger, candle=closed, warmup=warmup,
                 regime_cache=self._regime_cache, providers=self._providers, now_monotonic=self._now,

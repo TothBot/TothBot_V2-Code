@@ -76,6 +76,43 @@ class SmtpReportTransport:
         self._send(self._sender, self._recipients, self.build_message(rendered))
 
 
+# =================================================================== the real smtplib socket binding
+def smtplib_send(
+    host: str,
+    port: int = 0,
+    *,
+    smtp_factory: Callable[[str, int], object] | None = None,
+    starttls: bool = False,
+    username: str | None = None,
+    password: str | None = None,
+) -> SmtpSend:
+    """Build the LOW-LEVEL SmtpSend bound to a real smtplib.SMTP server - the actual operator delivery
+    edge for the periodic-pull track (mirroring the C1 alert SMTP seam, on the DISTINCT pull track).
+    Each send opens a connection, optionally STARTTLS + logs in, sendmails the RFC-822 message, and
+    quits. `smtp_factory` defaults to smtplib.SMTP (lazy-imported at the edge, never at module load -
+    the same pattern transport.py uses for websockets); a unit test injects a fake factory so NO
+    socket opens. This is the process edge bound at cold-start assembly; the message construction +
+    the cadence stay I/O-free in SmtpReportTransport / PullCadenceScheduler."""
+
+    def send(from_addr: str, to_addrs: Sequence[str], message: str) -> None:
+        factory = smtp_factory
+        if factory is None:
+            import smtplib  # lazy: the socket library is the edge, not a module-load dependency
+
+            factory = smtplib.SMTP
+        client = factory(host, port)
+        try:
+            if starttls:
+                client.starttls()
+            if username is not None:
+                client.login(username, password)
+            client.sendmail(from_addr, list(to_addrs), message)
+        finally:
+            client.quit()
+
+    return send
+
+
 # ======================================================================= the dashboard/file transport
 class DashboardReportTransport:
     """The REAL emit transport for the C2 operational dashboard / a file surface: a RenderedReport ->
