@@ -70,9 +70,15 @@ QueryOrders = Callable[[Sequence[str]], Awaitable[Mapping[str, Mapping[str, obje
 # The REST-BAL-004 startup drawdown-baseline source (ar:AR-052): the GetAccountBalance spot/main USD
 # assigned DIRECTLY as portfolio_baseline_USD, captured ONCE at startup (after the snap_orders Step 6),
 # never on reconnect (HR-WM-011 / AR-056). Returns the LONG (spot) portfolio USD; None -> no baseline
-# captured (the sweep skips the long until it lands). The SHORT margin-account-equity baseline source
-# (the REST endpoint for the margin equity) is a follow-on - the diagram leaves it undecided.
+# captured (the sweep skips the long until it lands).
 FetchAccountBalance = Callable[[], Awaitable[object]]
+# The REST-BAL-008 SHORT startup drawdown-baseline source (ar:AR-052 / ar:AR-009, the resolved TB00766
+# ruling): the Kraken MARGIN-account EQUITY (TradeBalance `e` = trade balance + unrealized net P&L,
+# borrow-adjusted) captured ONCE as the SHORT portfolio_baseline_USD - NOT the margin cash (cash is blind
+# to open-short MTM, a structural FALSE NEGATIVE for the breaker). Same once-only / never-on-reconnect
+# contract as the long (HR-WM-011 / AR-056). Returns the SHORT margin equity; None -> no short baseline
+# captured (the sweep keeps the short safely gated off until it lands).
+FetchTradeBalance = Callable[[], Awaitable[object]]
 BalancesHandler = Handler                                # balances frame consumer (ledger = Path B)
 Clock = Callable[[], float]
 Sleep = Callable[[float], Awaitable[None]]
@@ -323,6 +329,7 @@ class PrivateConnectionAssembler:
         fetch_snap_orders: FetchSnapOrders | None = None,
         query_orders: QueryOrders | None = None,
         fetch_account_balance: FetchAccountBalance | None = None,
+        fetch_trade_balance: FetchTradeBalance | None = None,
         balances_handler: BalancesHandler | None = None,
         coordinator: ShardReconnectCoordinator | None = None,
         on_event: EventSink | None = None,
@@ -344,6 +351,7 @@ class PrivateConnectionAssembler:
         self._fetch_snap_orders = fetch_snap_orders
         self._query_orders = query_orders
         self._fetch_account_balance = fetch_account_balance
+        self._fetch_trade_balance = fetch_trade_balance
         self._balances_handler = balances_handler or _balances_handler_for(ws_manager)
         self._coordinator = coordinator or ShardReconnectCoordinator()
         self._external_on_event = on_event
@@ -480,21 +488,27 @@ class PrivateConnectionAssembler:
         )
 
     async def _capture_startup_baseline(self) -> None:
-        """REST-BAL-004 / ar:AR-052: capture the LONG drawdown baseline ONCE at startup - the
-        GetAccountBalance spot/main USD assigned directly as portfolio_baseline_USD (rule:HR-WM-011:
-        never updated, never reset on reconnect; WSManager.set_live_portfolio_baseline enforces the
-        once-only capture). Runs ONLY in build() (the initial startup), never in a reconnect restore
-        step (AR-056). A no-op when no REST edge is wired (a test stand-in) or the wm lacks the baseline
-        surface (back-compat). The SHORT margin-account-equity baseline source is a follow-on - the
-        diagram pins the long (spot USD) but leaves the short margin-equity REST endpoint undecided."""
-        if self._fetch_account_balance is None:
-            return
+        """ar:AR-052 / rule:HR-WM-011: capture BOTH per-side drawdown baselines ONCE at startup - a
+        BASIS-CONSISTENT pair (the equity baseline must land WITH its current_portfolio basis, never a
+        mixed-basis bug). Runs ONLY in build() (the initial startup), never in a reconnect restore step
+        (AR-056); WSManager.set_live_portfolio_baseline enforces the once-only capture (a reconnect re-
+        running startup is ignored). A no-op for a side whose REST edge is unwired (a test stand-in) or
+        when the wm lacks the baseline surface (back-compat):
+          LONG  (REST-BAL-004 GetAccountBalance): the spot/main USD assigned directly as the baseline.
+          SHORT (REST-BAL-008 TradeBalance): the Kraken MARGIN-account EQUITY `e` (borrow-adjusted,
+                ar:AR-009; NOT the margin cash - cash is blind to open-short MTM, a structural FALSE
+                NEGATIVE) - the resolved TB00766 ruling. Until it lands the short stays safely gated off."""
         capture = getattr(self._wm, "set_live_portfolio_baseline", None)
         if not callable(capture):
             return
-        usd = await self._fetch_account_balance()
-        if usd is not None:
-            capture(PositionSide.LONG, usd)   # ar:AR-052 long; the short baseline is deferred
+        if self._fetch_account_balance is not None:
+            usd = await self._fetch_account_balance()
+            if usd is not None:
+                capture(PositionSide.LONG, usd)    # REST-BAL-004 long spot USD
+        if self._fetch_trade_balance is not None:
+            equity = await self._fetch_trade_balance()
+            if equity is not None:
+                capture(PositionSide.SHORT, equity)  # REST-BAL-008 short margin equity (TradeBalance e)
 
     def _bind_reconnect(self):
         async def initiate(reason: DisconnectReason) -> Transport:

@@ -698,6 +698,59 @@ def test_build_captures_the_long_startup_baseline_once_never_on_reconnect():
     assert len(calls) == 1
 
 
+def test_build_captures_the_short_equity_baseline_from_trade_balance():
+    # REST-BAL-008 / ar:AR-052 (the resolved TB00766 ruling): build() captures the SHORT drawdown
+    # baseline ONCE from the TradeBalance equity edge (`e`, borrow-adjusted margin equity - NOT margin
+    # cash), the BASIS-CONSISTENT pair to the long spot baseline. Once-only, never on reconnect.
+    m = WSManager(Mode.LIVE)
+    long_calls: list = []
+    short_calls: list = []
+
+    async def _balance():
+        long_calls.append(1)
+        return Decimal("5000.0")
+
+    async def _trade_balance():
+        short_calls.append(1)
+        return Decimal("5000.0")   # flat cold start: equity == margin cash (cross-validated)
+
+    async def _open():
+        return _IdleTransport()
+
+    asm = PrivateConnectionAssembler(
+        m, open_socket=_open, acquire_token=_tok,
+        fetch_account_balance=_balance, fetch_trade_balance=_trade_balance, sleep=_noop_sleep,
+    )
+    pc = asyncio.run(asm.build())
+    # BOTH baselines land together at startup (a basis-consistent pair, never the baseline alone).
+    assert m.portfolio_baseline(PositionSide.LONG) == Decimal("5000.0")
+    assert m.portfolio_baseline(PositionSide.SHORT) == Decimal("5000.0")
+    assert len(long_calls) == len(short_calls) == 1
+    # a reconnect re-runs the restore steps but NOT the startup capture (captured once, both sides).
+    asyncio.run(pc.driver.initiate(0, _random_reason()))
+    assert m.portfolio_baseline(PositionSide.SHORT) == Decimal("5000.0")
+    assert len(short_calls) == 1
+
+
+def test_build_short_equity_edge_independent_of_long_edge():
+    # the short TradeBalance edge stands alone: wired without the long GetAccountBalance edge, only the
+    # short baseline lands (the long stays None -> the sweep skips the long, sweeps the short).
+    m = WSManager(Mode.LIVE)
+
+    async def _trade_balance():
+        return Decimal("8000.0")
+
+    async def _open():
+        return _IdleTransport()
+
+    asm = PrivateConnectionAssembler(
+        m, open_socket=_open, acquire_token=_tok, fetch_trade_balance=_trade_balance, sleep=_noop_sleep,
+    )
+    asyncio.run(asm.build())
+    assert m.portfolio_baseline(PositionSide.LONG) is None
+    assert m.portfolio_baseline(PositionSide.SHORT) == Decimal("8000.0")
+
+
 def test_build_without_account_balance_edge_leaves_baseline_unset():
     # back-compat: no REST-BAL-004 edge wired -> no live baseline captured (the sweep skips the long
     # until one lands); build still succeeds (the edge is optional, like fetch_snap_orders).

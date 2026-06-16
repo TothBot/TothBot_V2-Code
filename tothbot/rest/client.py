@@ -34,6 +34,7 @@ PATH_OHLC = "/0/public/OHLC"                      # channel:kraken_rest_GetOHLCD
 PATH_TICKER = "/0/public/Ticker"                  # channel:kraken_rest_Ticker (liquidity probe)
 PATH_OPEN_ORDERS = "/0/private/OpenOrders"        # channel:kraken_rest_GetOpenOrders
 PATH_BALANCE = "/0/private/Balance"               # channel:kraken_rest_GetAccountBalance
+PATH_TRADE_BALANCE = "/0/private/TradeBalance"    # channel:kraken_rest_TradeBalance (REST-BAL-008, short equity)
 PATH_QUERY_ORDERS = "/0/private/QueryOrders"      # channel:kraken_rest_QueryOrdersInfo (REST-QOI-002)
 
 # REST-HTTP-002 MANDATORY aiohttp ClientSession config VALUES (the single shared session,
@@ -189,6 +190,18 @@ def parse_account_balance(payload: Mapping[str, object]) -> dict[str, Decimal]:
     """GetAccountBalance -> {asset: Decimal balance} (balance reconcile fallback)."""
     result = raise_for_error(payload)
     return {asset: _dec(amount) for asset, amount in result.items()}
+
+
+def parse_trade_balance(payload: Mapping[str, object]) -> dict[str, Decimal]:
+    """TradeBalance (REST-BAL-008) -> {field: Decimal} - the Kraken MARGIN-account summary, the SHORT
+    drawdown-baseline source (ar:AR-052 / ar:AR-009). Kraken returns result = {eb (equivalent balance),
+    tb (trade balance), m (margin used), n (UNREALIZED net P&L), c (cost basis), v (floating valuation),
+    e (EQUITY = tb + n, borrow-adjusted), mf (free margin), ml (margin level)}; every value is a string ->
+    Decimal(str) on parse (no float, ar:AR-047). The SHORT baseline + running-equity reconcile read `e`
+    (the borrow-adjusted margin equity); the full dict is returned so the caller may cross-validate (at a
+    flat cold start e == margin cash == the GetAccountBalance margin USD)."""
+    result = raise_for_error(payload)
+    return {key: _dec(value) for key, value in result.items()}
 
 
 # The order-info numeric fields converted to Decimal on parse (REST-OO-003 / REST-QOI-003:
@@ -377,6 +390,13 @@ class KrakenRestClient:
         """GetAccountBalance (private). The balance reconcile fallback."""
         payload = await self._private(PATH_BALANCE, {})
         return parse_account_balance(payload)
+
+    async def get_trade_balance(self, asset: str = "ZUSD") -> dict[str, Decimal]:
+        """TradeBalance (private, REST-BAL-008). The Kraken MARGIN-account summary - the SHORT drawdown-
+        baseline source (ar:AR-052 / ar:AR-009): read result['e'] (the borrow-adjusted margin EQUITY)
+        captured ONCE at startup as the short portfolio_baseline. asset = the valuation currency (ZUSD)."""
+        payload = await self._private(PATH_TRADE_BALANCE, {"asset": asset})
+        return parse_trade_balance(payload)
 
     async def query_orders(self, txids: Sequence[str]) -> dict[str, dict]:
         """QueryOrders / QueryOrdersInfo (private, REST-QOI-002). Targeted single-order

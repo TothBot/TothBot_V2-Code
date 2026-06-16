@@ -28,10 +28,12 @@ from tothbot.rest.client import (
     PATH_OHLC,
     PATH_OPEN_ORDERS,
     PATH_QUERY_ORDERS,
+    PATH_TRADE_BALANCE,
     PATH_WS_TOKEN,
     RestOhlcBar,
     gap_close_fill,
     parse_account_balance,
+    parse_trade_balance,
     parse_ohlc,
     parse_open_orders,
     parse_query_orders,
@@ -187,6 +189,19 @@ def test_parse_account_balance_decimal():
     assert bal == {"ZUSD": Decimal("1500.5000"), "XXBT": Decimal("0.25")}
 
 
+def test_parse_trade_balance_decimal_equity():
+    # REST-BAL-008: the SHORT margin-equity baseline source - every field Decimal, `e` = equity.
+    payload = {"error": [], "result": {
+        "eb": "5000.0000", "tb": "5000.0000", "m": "0.0000", "n": "0.0000",
+        "c": "0.0000", "v": "0.0000", "e": "5000.0000", "mf": "5000.0000",
+    }}
+    tb = parse_trade_balance(payload)
+    assert tb["e"] == Decimal("5000.0000")          # the borrow-adjusted margin EQUITY (the baseline)
+    assert all(isinstance(v, Decimal) for v in tb.values())
+    # flat cold start sanity: equity == equivalent balance == trade balance (no open positions yet).
+    assert tb["e"] == tb["eb"] == tb["tb"]
+
+
 # --- the client over a fake transport -----------------------------------------
 
 class _FakeRestTransport:
@@ -260,6 +275,18 @@ def test_client_get_account_balance():
     client = KrakenRestClient(_CREDS, transport=fake)
     bal = asyncio.run(client.get_account_balance())
     assert bal == {"ZUSD": Decimal("10.0")}
+
+
+def test_client_get_trade_balance_signs_and_carries_asset():
+    # REST-BAL-008 TradeBalance: signed private call, asset=ZUSD in the body, result['e'] the equity.
+    fake = _FakeRestTransport(post_result={"error": [], "result": {"e": "4980.50", "tb": "5000.0"}})
+    client = KrakenRestClient(_CREDS, transport=fake)
+    tb = asyncio.run(client.get_trade_balance())
+    assert tb["e"] == Decimal("4980.50")
+    url, data, headers = fake.post_calls[0]
+    assert url == REST_BASE_URL + PATH_TRADE_BALANCE
+    assert data["asset"] == "ZUSD" and "nonce" in data
+    assert headers["API-Sign"]  # private: signed
 
 
 def test_client_nonce_increases_across_private_calls():
