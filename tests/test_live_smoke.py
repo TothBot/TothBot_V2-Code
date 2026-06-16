@@ -494,3 +494,48 @@ def test_monthly_report_view_surfaces_the_reported_theory_no_new_capture():
     assert not _mae_alert(logger)
     # the short module is isolated (no closes flowed to it) - per-module, sec 7.
     assert report.per_module["short"].performance.trade_count == 0
+
+
+# ------------------------------------------------ TB00753: the C4 MONTHLY PULL report RENDERED + EMITTED
+# to the operator surface - the degrading run -> the PULL trigger builds + renders + emits a body
+# carrying the trade performance + the reported theory + the parameter evolution, no new capture, no C1
+
+def test_monthly_pull_trigger_renders_and_emits_the_operator_report():
+    # The TB00753 capstone: the same degrading run as the VIEW capstone -> the C4 MONTHLY PULL trigger
+    # (PullReportService) builds (the VIEW) + RENDERS (the operator-facing body) + EMITS (the injected
+    # sink), distinct from the C1 push. The rendered body carries the realized trade performance + the
+    # REPORTED disproven theory; NO new capture; NO C1 alert was raised by the pull.
+    from tothbot.recorder.report_render import PullReportService, RenderedReport
+    from tothbot.recorder.reporting import ReportCategory
+
+    system, _wm, logger = _assemble_real_wm()
+    sink = system.ciats_sinks[PositionSide.LONG]
+    for _ in range(120):
+        sink(_close_at("5", "2026-06-10T12:00:00+00:00", heat=5))   # winners, hot
+    for _ in range(80):
+        sink(_close_at("-10", "2026-06-12T12:00:00+00:00", heat=1))  # losers, cool -> 200 + CUSUM breach
+
+    stores = {s.value: system.conductors[s].parameter_store for s in (PositionSide.LONG, PositionSide.SHORT)}
+    captured_before = len(logger.operational)
+    emitted: list = []
+    service = PullReportService(logger, stores, emit=emitted.append)
+    rendered = service.pull(
+        ReportCategory.C4_MONTHLY, datetime(2026, 6, 15, 18, 0, tzinfo=timezone.utc))
+
+    # the operator received exactly the rendered report on the PULL path (not the C1 SMTP seam).
+    assert emitted == [rendered] and isinstance(rendered, RenderedReport)
+    assert rendered.code == "C4" and "C4 MONTHLY" in rendered.subject
+    # the rendered body carries the realized trade performance (the LONG module, 200 trades, net -200).
+    assert "module: LONG" in rendered.body
+    assert "trades: 200" in rendered.body
+    assert "net P/L: -200 USD" in rendered.body
+    assert "inference-valid" in rendered.body                 # the 200-trade floor is reached
+    # the disproven stop-width theory is REPORTED in the rendered body (CHECK failed), not pushed.
+    assert "REPORTED theories" in rendered.body
+    assert "CHECK failed" in rendered.body
+    # NO new capture: the pull read the same Stream-1, it did not append to it.
+    assert len(logger.operational) == captured_before
+    # NO C1 alert was raised by the pull (the periodic-pull track is distinct from the C1 push).
+    assert not _mae_alert(logger)
+    # the SHORT module section is isolated (no closes flowed to it).
+    assert "module: SHORT" in rendered.body
