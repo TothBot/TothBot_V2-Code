@@ -20,6 +20,7 @@ a schema-valid 23-field record routed through the per-module Logger Stream-2 sin
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -254,7 +255,7 @@ def test_trade_close_closes_the_ciats_learning_loop():
 # --------------------------------------------------------------------------- TB00748 (c): the
 # RUNNING wm emits each exit THROUGH the side's CIATS sink (no manual sink call)
 
-def _assemble_real_wm(*, report_emit=None, report_categories=None):
+def _assemble_real_wm(*, report_emit=None, report_categories=None, records_dir=None):
     """Assemble the paper organism over a REAL WSManager (not the decide-size stand-in), so the
     exit path is wired end-to-end: assemble_operational hands the per-side ciats_sinks to the wm's
     per-module Exit Controllers (TB00748 (b)). `report_emit` / `report_categories` wire the
@@ -271,7 +272,7 @@ def _assemble_real_wm(*, report_emit=None, report_categories=None):
         wm=wm, logger=logger, mpp_store=MppCapStore(), reward_store=ExpectedRewardStore(),
         mode=Mode.PAPER, now_utc=lambda: datetime(2026, 6, 15, 7, 30, tzinfo=timezone.utc),
         rest_sleep=no_sleep, pace_sleep=no_sleep,
-        report_emit=report_emit, report_categories=report_categories,
+        report_emit=report_emit, report_categories=report_categories, records_dir=records_dir,
     ))
     return system, wm, logger
 
@@ -697,3 +698,56 @@ def test_live_clock_fires_the_monthly_pull_over_the_smtp_transport():
     # NO new capture by the clock-driven pull, and NO C1 alert raised.
     assert len(logger.operational) == captured_before
     assert not _mae_alert(logger)
+
+
+# ------------------------------------------------ TB00756: the rule:HR-LG-013 DURABLE trade-record FILE
+# sink wired into the live organism - a run of closes is BOTH learned in-memory AND durably appended to
+# trades_<YYYY>.jsonl; a cold-start load reconstructs the corpus + the C5 ANNUAL report reads the file as
+# its authoritative source, no C1 write-failure
+
+def test_running_closes_persist_to_the_durable_file_and_c5_reads_it_back():
+    # The TB00756 capstone: assemble_operational wires the PermanentTradeRecordSink (rule:HR-LG-013) as
+    # the per-module learning-sink downstream over a REAL temp records dir. 200 closes flow through the
+    # LONG ciats_sink -> learned in-memory AND durably appended to trades_2026.jsonl (fsync-per-write).
+    # Then a FRESH load off disk reconstructs the 200-trade corpus (cold-start restore) and the C5
+    # ANNUAL report is built from the durable file alone - independent of the live in-memory state.
+    import tempfile
+
+    from tothbot.recorder.trade_record_file import (
+        build_c5_from_durable_file,
+        load_trade_records_dir,
+    )
+
+    with tempfile.TemporaryDirectory() as records_dir:
+        system, _wm, logger = _assemble_real_wm(records_dir=records_dir)
+        assert system.trade_record_sink is not None        # the durable sink was wired by the assembly
+
+        sink = system.ciats_sinks[PositionSide.LONG]
+        for _ in range(150):
+            sink(_close_at("5", "2026-06-10T12:00:00+00:00"))    # winners
+        for _ in range(50):
+            sink(_close_at("-10", "2026-06-12T12:00:00+00:00"))  # losers -> 200 total, net 750-500=250
+
+        # the durable file exists with one NDJSON line per closed trade (200), each parseable.
+        path = os.path.join(records_dir, "trades_2026.jsonl")
+        assert os.path.exists(path)
+        with open(path, encoding="utf-8") as fh:
+            lines = [ln for ln in fh.read().splitlines() if ln.strip()]
+        assert len(lines) == 200
+
+        # a FRESH cold-start load off disk reconstructs the full 200-trade corpus.
+        restored = load_trade_records_dir(records_dir, [2026])
+        assert len(restored) == 200
+        assert sum(r.net_pl_usd for r in restored) == Decimal("250")   # 150*5 + 50*-10
+
+        # the C5 ANNUAL report is built from the durable file ALONE (the authoritative source).
+        report = build_c5_from_durable_file(records_dir, 2026)
+        assert report.category.code == "C5"
+        assert report.combined.trade_count == 200                      # all 200 in the calendar year
+        assert report.combined.net_pl_usd == Decimal("250")
+        assert report.combined.inference_valid is True                 # the 200-trade floor, restored
+        # the C5 Form 8949 tax lots are present over the durable (combined, sideless) corpus.
+        assert len(report.per_module["all"].tax_lots) == 200
+
+        # NO durable-write failure was raised (no C1 TRADE_RECORD_WRITE_FAILED alert).
+        assert not any(getattr(a, "code", None) == "TRADE_RECORD_WRITE_FAILED" for a in logger.alerts)

@@ -253,3 +253,36 @@ def load_trade_records_dir(records_dir: str, years: Sequence[int]) -> list[Trade
     for year in years:
         out.extend(load_trade_records_file(os.path.join(records_dir, f"trades_{year}.jsonl")))
     return out
+
+
+# C5 reads from the durable file as its authoritative source (the module label for the combined,
+# sideless C5 view - see build_c5_from_durable_file).
+C5_DURABLE_MODULE = "all"
+
+
+def build_c5_from_durable_file(
+    records_dir: str,
+    year: int,
+    *,
+    parameter_stores: "dict | None" = None,
+    as_of: datetime | None = None,
+):
+    """Build the C5 ANNUAL OperatorReport from the durable trades_<year>.jsonl - the authoritative
+    source per rule:HR-LG-013 (the contract: "C5 reads from the permanent trade-record file"). Loads
+    the calendar-year records off disk + views them through the report builder as ONE combined corpus:
+    the durable schema carries NO side field (the per-module partition IS the emitting side, sec 7), so
+    Long/Short is not recoverable from the file - and C5 IS the combined calendar-year compliance + IRS
+    Form 8949 view (all trades), which the combined roll-up + the single 'all' module's tax lots give
+    exactly. Independent of the live in-memory corpus (a cold-start / audit can build C5 from disk
+    alone)."""
+    from .reporting import ReportCategory, build_operator_report  # local: avoid an import cycle
+
+    from types import SimpleNamespace
+
+    records = load_trade_records_dir(records_dir, [year])
+    when = as_of or datetime(year, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
+    logger_view = SimpleNamespace(corpus={C5_DURABLE_MODULE: records}, operational=list(records))
+    return build_operator_report(
+        logger_view, parameter_stores or {}, category=ReportCategory.C5_ANNUAL,
+        as_of=when, modules=(C5_DURABLE_MODULE,),
+    )

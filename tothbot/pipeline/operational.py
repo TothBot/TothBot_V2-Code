@@ -78,6 +78,7 @@ from ..exchange.warmup import WarmupOrchestrator
 from ..recorder.report_render import PullReportService, ReportSink
 from ..recorder.report_transport import PullCadenceScheduler
 from ..recorder.reporting import ReportCategory
+from ..recorder.trade_record_file import PermanentTradeRecordSink
 from ..regime.scheduler import DailyRegimeCompute, RegimeCache
 from .live_driver import (
     LiveSweepDriver,
@@ -142,6 +143,7 @@ def assemble_ciats_modules(
     on_event: EventSink | None = None,
     on_approval: "Callable | None" = None,
     wallet_balance: "Callable[[PositionSide], object] | None" = None,
+    trade_record_sink: "Callable[[object], None] | None" = None,
 ) -> "tuple[dict[PositionSide, CiatsConductor], dict[PositionSide, Callable[[object], None]], dict[PositionSide, ApprovalInbox]]":
     """Construct the per-MODULE CIATS brain (one CiatsConductor + one TRADE_CLOSE learning sink + one
     operator ApprovalInbox per wallet, Long + Short - NO cross-module pooling, sec 7). Each conductor
@@ -184,8 +186,12 @@ def assemble_ciats_modules(
         side_balance = (
             (lambda s=side: wallet_balance(s)) if wallet_balance is not None else None
         )
+        # rule:HR-LG-013: chain the durable trade-record FILE sink as the learning-sink downstream, so
+        # a closed trade is BOTH learned in-memory AND durably appended to trades_<YYYY>.jsonl (the sink
+        # filters TRADE_CLOSE; both sides write the one combined permanent file).
         sinks[side] = make_ciats_learning_sink(
-            logger, side.value, conductor, inbox=inbox, wallet_balance=side_balance
+            logger, side.value, conductor, inbox=inbox, wallet_balance=side_balance,
+            downstream=trade_record_sink,
         )
     return conductors, sinks, inboxes
 
@@ -217,6 +223,7 @@ class OperationalSystem:
     approval_inboxes: dict[PositionSide, ApprovalInbox]
     private_connection: PrivateConnection | None = None
     pull_scheduler: PullCadenceScheduler | None = None
+    trade_record_sink: PermanentTradeRecordSink | None = None
 
     async def run(self) -> None:
         """Drive the public data layer (and the live private connection, if present) concurrently."""
@@ -258,6 +265,7 @@ async def assemble_operational(
     balances_handler: Handler | None = None,
     report_emit: "ReportSink | None" = None,
     report_categories: "Sequence[ReportCategory] | None" = None,
+    records_dir: "str | None" = None,
 ) -> OperationalSystem:
     """Run the ar:AR-049 cold-start sequence and return the runnable public organism (see module
     docstring). `on_event` (defaulting to logger.record) sinks the warm-up / regime / liquidity /
@@ -306,8 +314,18 @@ async def assemble_operational(
     #    The cycle_parameters provider is BACKED by the per-module Parameter Stores + the conductors'
     #    disallowed_regimes (CI-IF-003): a CIATS-tuned value + the protective block list now FLOW
     #    into the gates per cycle (no longer seed-only). The conductors' CIATS events sink to Stream-1.
+    # rule:HR-LG-013: the DURABLE permanent trade-record FILE sink (the authoritative C5 + multi-year
+    # corpus). Built only when a records_dir is given; the failure event sinks to mod:Logger (a CRITICAL
+    # TRADE_RECORD_WRITE_FAILED -> the C1 alert seam). now_utc (the providers' UTC clock) drives the
+    # annual <YYYY> segmentation; None -> the sink uses datetime.now(timezone.utc).
+    trade_record_sink: PermanentTradeRecordSink | None = None
+    if records_dir is not None:
+        trade_record_sink = PermanentTradeRecordSink(
+            records_dir, now_utc=now_utc, on_event=event_sink
+        )
     conductors, ciats_sinks, approval_inboxes = assemble_ciats_modules(
-        logger, on_event=event_sink, wallet_balance=getattr(wm, "wallet_balance", None)
+        logger, on_event=event_sink, wallet_balance=getattr(wm, "wallet_balance", None),
+        trade_record_sink=trade_record_sink,
     )
     # THE ASSEMBLY TIE-IN (TB00748 (b)): wire each side's CIATS learning sink into the injected wm's
     # per-module Exit_Controller, so a paper close emits its evt:TRADE_CLOSE THROUGH the emitting
@@ -420,4 +438,5 @@ async def assemble_operational(
         approval_inboxes=approval_inboxes,
         private_connection=private_connection,
         pull_scheduler=pull_scheduler,
+        trade_record_sink=trade_record_sink,
     )
