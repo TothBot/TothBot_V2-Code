@@ -69,6 +69,7 @@ from ..exchange.instrument_cache import InstrumentCache
 from ..exchange.liquidity_cache import LiquidityCache, LiquidityProbe
 from ..exchange.pacing import SubscribeTokenBucket
 from ..exchange.position_mirror import PositionSide
+from ..exchange.regime_exit import pair_status_from_wire
 from ..exchange.private_ws import PrivateConnection, PrivateConnectionAssembler
 from ..exchange.reconnect import ShardReconnectCoordinator
 from ..exchange.sharding import ShardPlan
@@ -107,21 +108,59 @@ def _noop_handler(_frame: dict) -> None:
     (WS-STAT-002 maintenance arming is the receive loop's Scenario-B concern, not a channel sink)."""
 
 
+def make_instrument_handler(
+    instrument_cache: InstrumentCache,
+    *,
+    wm=None,
+    bbo_provider: "Callable[[str], tuple[object | None, object | None]] | None" = None,
+) -> Handler:
+    """The public instrument-channel handler: ingest the A-17 snapshot/update into the cache AND
+    (ar:AR-040) drive mod:Exit_Controller's instrument-status path for any OPEN-position pair whose
+    status changed (WS-INST-008). A transition to limit_only fires the active single-IOC-limit exit;
+    on_instrument_status is a no-op for any other status and in paper. Wrapping is added only when the
+    wm exposes on_instrument_status (a lightweight test stand-in is left with the bare cache ingest)."""
+    base = instrument_cache.ingest
+    if wm is None or not callable(getattr(wm, "on_instrument_status", None)):
+        return base
+    has_position = getattr(wm, "has_position", None)
+    quote = bbo_provider or (lambda _s: (None, None))
+
+    def handler(frame: dict) -> list[str]:
+        updated = base(frame)
+        for symbol in updated:
+            if has_position is not None and not has_position(symbol):
+                continue
+            info = instrument_cache.get(symbol)
+            if info is None:
+                continue
+            bid, ask = quote(symbol)
+            wm.on_instrument_status(symbol, pair_status_from_wire(info.status), bid=bid, ask=ask)
+        return updated
+
+    return handler
+
+
 def make_public_handler_provider(
     *,
     instrument_cache: InstrumentCache,
     bbo_cache: BboCache,
     driver: LiveSweepDriver,
     status_handler: Handler | None = None,
+    wm=None,
+    bbo_provider: "Callable[[str], tuple[object | None, object | None]] | None" = None,
 ) -> Callable[[int, Channel], Handler]:
     """The DataLayerAssembler handler_provider binding each public channel to its sole consumer.
 
     instrument/ticker frames ingest into the shared caches; ohlc(5m)/ohlc(60m) drive the
     LiveSweepDriver. The same shared caches/driver serve every shard, so the binding is by channel
     (shard_index satisfies the HandlerProvider signature but does not vary the handler). A request
-    for a channel with no public consumer raises (a wiring bug, never silently dropped)."""
+    for a channel with no public consumer raises (a wiring bug, never silently dropped). When a wm is
+    supplied the instrument handler ALSO drives the ar:AR-040 instrument-status exit path
+    (make_instrument_handler); bbo_provider supplies the realizable (bid, ask) for the limit_only close."""
     handlers: dict[Channel, Handler] = {
-        PublicChannel.INSTRUMENT: instrument_cache.ingest,
+        PublicChannel.INSTRUMENT: make_instrument_handler(
+            instrument_cache, wm=wm, bbo_provider=bbo_provider
+        ),
         PublicChannel.TICKER: bbo_cache.ingest,
         PublicChannel.OHLC_5M: driver.ohlc_5m_handler(),
         PublicChannel.OHLC_60M: driver.ohlc_60m_handler(),
@@ -391,6 +430,11 @@ async def assemble_operational(
         bbo_cache=bbo_cache,
         driver=driver,
         status_handler=status_handler,
+        # ar:AR-040: the instrument handler ALSO drives the Exit Controller limit_only active-exit
+        # path for open-position pairs (a no-op in paper / for any non-limit_only status). bbo_pair
+        # supplies the realizable (bid, ask) for the single IOC limit close (WS-TKR-002 bbo).
+        wm=wm,
+        bbo_provider=bbo_pair,
     )
     assembler = DataLayerAssembler(
         ShardPlan(universe),

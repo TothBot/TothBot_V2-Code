@@ -82,6 +82,28 @@ class PairStatus(Enum):
 # The pair-disruption states that HOLD an L1a exit (rule:HR-EC-016(a)).
 _L1A_BLOCKING: frozenset[PairStatus] = frozenset({PairStatus.CANCEL_ONLY, PairStatus.MAINTENANCE})
 
+# WS-INST-008 wire trading-status -> the AR-040 PairStatus the Exit Controller acts on. The
+# instrument channel enumerates 8 states; only the three exit-relevant ones map to a distinct
+# PairStatus member (limit_only -> the AR-040 active single-IOC-limit exit; cancel_only /
+# maintenance -> the L1a/L2 HOLD precondition). Every other wire status (online, post_only,
+# reduce_only, work_in_progress, delisted) maps to ONLINE here - on_instrument_status only ACTS
+# on limit_only, and the HOLD set is checked at the L1a/L2 dispatch precondition, not here.
+_WIRE_PAIR_STATUS: dict[str, PairStatus] = {
+    PairStatus.LIMIT_ONLY.value: PairStatus.LIMIT_ONLY,
+    PairStatus.CANCEL_ONLY.value: PairStatus.CANCEL_ONLY,
+    PairStatus.MAINTENANCE.value: PairStatus.MAINTENANCE,
+    PairStatus.ONLINE.value: PairStatus.ONLINE,
+}
+
+
+def pair_status_from_wire(status: object) -> PairStatus:
+    """Map a WS-INST-008 instrument-channel trading-status string to the AR-040 PairStatus (PURE).
+    limit_only / cancel_only / maintenance map to their members; any other status (online, post_only,
+    reduce_only, work_in_progress, delisted, or an unrecognised value) maps to ONLINE - the
+    on_instrument_status handler only acts on LIMIT_ONLY and the HOLD set is enforced at the L1a/L2
+    dispatch precondition, so a non-limit_only status is correctly inert at the instrument handler."""
+    return _WIRE_PAIR_STATUS.get(str(status), PairStatus.ONLINE)
+
 
 def l1a_precondition_blocks(pair_status: PairStatus) -> bool:
     """rule:HR-EC-016(a) Step 1: True when the pair status forbids the L1a cancel/sell sequence

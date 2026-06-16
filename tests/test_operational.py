@@ -24,8 +24,10 @@ from tothbot.exchange.channels import PrivateChannel, PublicChannel
 from tothbot.exchange.instrument_cache import InstrumentCache
 from tothbot.exchange.pacing import SubscribeTokenBucket
 from tothbot.exchange.position_mirror import PositionSide
+from tothbot.exchange.regime_exit import PairStatus
 from tothbot.pipeline.operational import (
     assemble_operational,
+    make_instrument_handler,
     make_public_handler_provider,
 )
 from tothbot.pipeline.providers import WS_STATE_SUBSCRIBED
@@ -207,6 +209,54 @@ def test_handler_provider_unknown_channel_raises():
     )
     with pytest.raises(ValueError):
         provider(0, PrivateChannel.EXECUTIONS)  # never a public-shard channel
+
+
+# --- ar:AR-040 instrument-status exit wiring (make_instrument_handler) -----------------
+
+class _StatusRecordingWM:
+    """A wm stand-in recording on_instrument_status calls, with one open-position symbol."""
+
+    def __init__(self, open_symbols=()):  # noqa: B006
+        self._open = set(open_symbols)
+        self.status_calls: list = []
+
+    def has_position(self, symbol):
+        return symbol in self._open
+
+    def on_instrument_status(self, symbol, pair_status, *, bid=None, ask=None):
+        self.status_calls.append((symbol, pair_status, bid, ask))
+
+
+def _instrument_frame(symbol, status):
+    return {"data": {"pairs": [
+        {"symbol": symbol, "status": status, "marginable": True, "qty_min": "0.0001",
+         "cost_min": "0.5", "price_increment": "0.1", "qty_increment": "0.00000001"}]}}
+
+
+def test_instrument_handler_drives_on_instrument_status_for_open_position_pair():
+    instr = InstrumentCache()
+    wm = _StatusRecordingWM(open_symbols={"BTC/USD"})
+    handler = make_instrument_handler(
+        instr, wm=wm, bbo_provider=lambda s: (Decimal("60000"), Decimal("60010"))
+    )
+    handler(_instrument_frame("BTC/USD", "limit_only"))
+    assert instr.get("BTC/USD").status == "limit_only"        # still ingested into the cache
+    assert wm.status_calls == [("BTC/USD", PairStatus.LIMIT_ONLY, Decimal("60000"), Decimal("60010"))]
+
+
+def test_instrument_handler_skips_pairs_without_open_position():
+    instr = InstrumentCache()
+    wm = _StatusRecordingWM(open_symbols=set())   # no open position
+    handler = make_instrument_handler(instr, wm=wm)
+    handler(_instrument_frame("BTC/USD", "limit_only"))
+    assert wm.status_calls == []                  # cache updated, but no exit-controller drive
+
+
+def test_instrument_handler_is_bare_ingest_without_wm():
+    instr = InstrumentCache()
+    handler = make_instrument_handler(instr)       # no wm -> the bare cache ingest
+    out = handler(_instrument_frame("BTC/USD", "online"))
+    assert out == ["BTC/USD"] and instr.get("BTC/USD") is not None
 
 
 # --------------------------------------------------------------------------- assemble_operational

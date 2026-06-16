@@ -18,6 +18,7 @@ from tothbot.exchange.regime_exit import (
     detect_daily_regime_downgrade,
     detect_htf_regime_reversal,
     l1a_precondition_blocks,
+    pair_status_from_wire,
 )
 from tothbot.regime.engine import classify_from_indicators
 from tothbot.regime.taxonomy import Regime
@@ -149,3 +150,18 @@ def test_precondition_blocks_cancel_only_and_maintenance():
 
 def test_precondition_allows_online():
     assert l1a_precondition_blocks(PairStatus.ONLINE) is False
+
+
+# --- WS-INST-008 wire trading-status -> PairStatus mapping -----------------------------
+def test_pair_status_from_wire_maps_the_three_exit_relevant_states():
+    assert pair_status_from_wire("limit_only") is PairStatus.LIMIT_ONLY
+    assert pair_status_from_wire("cancel_only") is PairStatus.CANCEL_ONLY
+    assert pair_status_from_wire("maintenance") is PairStatus.MAINTENANCE
+    assert pair_status_from_wire("online") is PairStatus.ONLINE
+
+
+def test_pair_status_from_wire_other_states_map_to_online():
+    # post_only / reduce_only / work_in_progress / delisted / unknown -> ONLINE (inert at the
+    # instrument handler; on_instrument_status only acts on limit_only, HOLD set at dispatch).
+    for s in ("post_only", "reduce_only", "work_in_progress", "delisted", "nonsense"):
+        assert pair_status_from_wire(s) is PairStatus.ONLINE
