@@ -49,8 +49,11 @@ class CandidateResult:
     dispatched and filled."""
 
     outcome: PipelineOutcome
-    dispatched: bool   # True iff the pipeline ACCEPTED and execute_entry was called
-    filled: bool       # True iff the dispatched entry actually filled (a position opened)
+    dispatched: bool   # True iff an entry add_order was sent (PAPER: always on ACCEPT; LIVE: False if
+    #                    the RL-MON-003 gate suppressed it - see PA-004 div #4 below)
+    filled: bool       # PAPER: True iff the entry actually filled (the simulator opened the position).
+    #                    LIVE: always False - the fill is async (confirmed later on the executions
+    #                    channel via record_execution OPENED), never known synchronously here.
 
 
 async def process_candidate(
@@ -75,7 +78,7 @@ async def process_candidate(
     if not outcome.accepted:
         return CandidateResult(outcome=outcome, dispatched=False, filled=False)
 
-    filled = await execute_entry(
+    entry = await execute_entry(
         wm,
         side,
         symbol,
@@ -95,4 +98,10 @@ async def process_candidate(
         market_regime=exec_ctx.market_regime,
         entry_timestamp_utc=exec_ctx.entry_timestamp_utc,
     )
-    return CandidateResult(outcome=outcome, dispatched=True, filled=filled)
+    # PA-004 div #4 - the entry return diverges by mode. PAPER: `entry` is filled (the simulator
+    # opened the position synchronously). LIVE: `entry` is dispatched (an add_order went out, False if
+    # the RL-MON-003 gate suppressed it); the fill is async, so `filled` is False here - the open is
+    # confirmed later on the executions channel (record_execution OPENED).
+    if getattr(wm, "is_live", False):
+        return CandidateResult(outcome=outcome, dispatched=entry, filled=False)
+    return CandidateResult(outcome=outcome, dispatched=True, filled=entry)

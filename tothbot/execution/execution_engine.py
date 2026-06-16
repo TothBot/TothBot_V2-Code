@@ -45,8 +45,11 @@ async def execute_entry(
 ) -> bool:
     """Execute a G8-accepted entry: size the marketable-IOC order (MPP cap), derive the emergSL
     from the actual fill, and dispatch through mod:WS_Manager into THIS side's wallet. `sized` is
-    the G8Sized (carries expected_reward / net_loss / emergsl_dist / entry_fill_price). Returns
-    True if the entry filled. PURE composition over compute_entry_order + wm.dispatch_entry."""
+    the G8Sized (carries expected_reward / net_loss / emergsl_dist / entry_fill_price). Returns the
+    wm.dispatch_entry result, whose meaning diverges by mode (PA-004 div #4): PAPER -> filled (the
+    simulator opened the position); LIVE -> dispatched (the add_order transmitted; False if the
+    RL-MON-003 gate suppressed it - the fill is async). PURE composition over compute_entry_order +
+    wm.dispatch_entry."""
     sizing = compute_entry_order(
         side,
         sized_usd=sized_usd,

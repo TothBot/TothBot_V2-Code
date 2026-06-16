@@ -50,7 +50,10 @@ from tothbot.regime.engine import classify_from_indicators
 from tothbot.regime.taxonomy import Regime
 from tothbot.exchange.ws_manager import (
     CancelAckTimeout,
+    EmergSlPlaced,
+    EntrySuppressed,
     ExitDispatchOutcome,
+    PendingEmergSl,
     LiveExitDetected,
     LiveExitDispatched,
     GapCloseEstimated,
@@ -1539,3 +1542,46 @@ def test_dispatch_entry_short_opens_short_credits_short_wallet_emergsl_above():
     # the SHORT wallet was credited (sell-to-open proceeds); the LONG wallet is untouched.
     assert m.wallet_balance(PositionSide.SHORT) > Decimal("5000.0")
     assert m.wallet_balance(PositionSide.LONG) == Decimal("5000.0")
+
+
+# -- the LIVE ENTRY dispatch (slice a: PA-004 div #4 async entry; the fill arrives later) --------
+
+def test_dispatch_entry_live_long_transmits_marketable_ioc_returns_dispatched():
+    mgr, sent, events = _live_manager()
+    dispatched = asyncio.run(mgr.dispatch_entry(
+        PositionSide.LONG, "BTC/USD",
+        order_qty="0.05", entry_limit_price="60000", emergsl_price="57000",
+        atr_14_entry="1000", regime_at_entry="TRENDING_POS_NORMAL",
+        cl_ord_id="cl-L1", deadline="2026-06-16T07:30:00Z",
+        signal_params={"rsi_14": 42, "side": "long"},
+        market_regime="TRENDING_POS_ELEVATED", entry_timestamp_utc="2026-06-16T07:25:00+00:00",
+    ))
+    # LIVE returns dispatched=True (the add_order went out); the fill is async, so NO position yet.
+    assert dispatched is True
+    assert mgr.position("BTC/USD") is None
+    # exactly the marketable-IOC entry add_order traversed the seam - NOT the emergSL (that is placed
+    # on the async fill, slice b), so no batch_add here.
+    ops = [op for op, _ in sent]
+    assert ops == [OutboundOp.ADD_ORDER]
+    _, msg = sent[0]
+    p = msg["params"]
+    assert p["side"] == "buy" and p["order_type"] == "limit" and p["time_in_force"] == "ioc"
+    assert p["order_qty"] == "0.05" and p["limit_price"] == "60000" and p["cl_ord_id"] == "cl-L1"
+    assert "margin" not in p   # spot LONG buy-to-open
+    # the entry-time D6 snapshot is RETAINED in the Pending Order Registry for the async opening fill
+    # to attach (the paper path pops inline; live keeps it until record_execution OPENED).
+    assert mgr._pending_entries["BTC/USD"]["emergsl_price"] == "57000"
+    assert mgr._pending_entries["BTC/USD"]["entry_timestamp_utc"] == "2026-06-16T07:25:00+00:00"
+
+
+def test_dispatch_entry_live_short_is_margin_sell_to_open():
+    mgr, sent, _ = _live_manager()
+    dispatched = asyncio.run(mgr.dispatch_entry(
+        PositionSide.SHORT, "BTC/USD",
+        order_qty="0.05", entry_limit_price="60000", emergsl_price="63000",
+        cl_ord_id="cl-S1", deadline="2026-06-16T07:30:00Z",
+    ))
+    assert dispatched is True
+    _, msg = sent[0]
+    p = msg["params"]
+    assert p["side"] == "sell" and p["margin"] is True   # SHORT sell-to-open on Kraken margin (AR-009)

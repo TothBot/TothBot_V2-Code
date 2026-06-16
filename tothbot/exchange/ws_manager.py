@@ -95,6 +95,7 @@ from .seam import DispatchSeam, EventSink, LiveSender, PaperSimulator
 from ..config import registry
 from ..config.fees import FEE_TAKER_PCT
 from ..config.settings import Mode
+from ..execution.entry_dispatch import build_emergsl_order, build_entry_order
 from ..execution.exit_controller import ExitController, ExitReason
 from ..execution.exit_dispatch import (
     build_cancel_order,
@@ -309,6 +310,56 @@ class LiveExitDeferredNoQuote:
     code: str = field(default="LIVE_EXIT_DEFERRED_NO_QUOTE", init=False)
 
 
+# --- THE LIVE ENTRY PATH (sec 7 mod:WS_Manager add_order + on-fill batch_add / ar:AR-054 / PA-004) ---
+# The async counterpart of the paper synchronous entry flow. dispatch_entry transmits the marketable-
+# IOC entry over the seam and RETURNS; the fill arrives LATER on the executions channel (PA-004 div #4).
+# record_execution's OPENED branch then attaches the entry-time D6 snapshot AND enqueues the AR-054
+# on-fill emergSL the after_batch pump places via seam.batch_add - the SAME sync->async seam the live
+# exit uses, placed in the same private _step as the fill so the position is never left unprotected.
+
+
+@dataclass(frozen=True)
+class PendingEmergSl:
+    """A just-opened LIVE position's ar:AR-054 on-fill emergSL awaiting async placement (the
+    executions OPENED handler enqueues it; drive_pending_emergsls drains it via seam.batch_add).
+    Carries the ACTUAL filled qty (position.qty, AR-054 "any filled qty is a real position") + side
+    (the direction mirror: a LONG places a SELL stop BELOW entry, a SHORT a BUY-to-cover reduce_only
+    stop ABOVE, ar:AR-009), the D6 emergsl_price, the entry-derived '-sl' cl_ord_id, and a fresh
+    now+5s deadline (the off-book L3 crash brake placed the instant the entry fills)."""
+
+    symbol: str
+    side: PositionSide
+    qty: Decimal
+    emergsl_price: Decimal
+    cl_ord_id: str
+    deadline: str
+
+
+@dataclass(frozen=True)
+class EmergSlPlaced:
+    """EMERGSL_PLACED [INFO] (ar:AR-054) - the on-fill off-book emergSL batch_add for a just-opened
+    LIVE position was transmitted over the seam (the position is now protected at layer:L3). The
+    after_batch pump placed it in the SAME private _step as the opening fill (loss-prevention: a live
+    position is NEVER left with no resting emergSL)."""
+
+    symbol: str
+    cl_ord_id: str
+    code: str = field(default="EMERGSL_PLACED", init=False)
+
+
+@dataclass(frozen=True)
+class EntrySuppressed:
+    """ENTRY_SUPPRESSED [HIGH] (RL-MON-003 CRITICAL tier) - a LIVE entry add_order was SUPPRESSED
+    because the pair's rate_counter armed above param:rl_critical_threshold_pct of its operative
+    ceiling (ar:AR-030). The entry is skipped (NO order sent) to PRESERVE the exit rate budget under
+    rate pressure - exits/cancels are NEVER gated (a suppressed exit would leave a position
+    unmanaged). The pair's entry placement resumes once the counter decays back below the warning
+    fraction (the RateCounter hysteresis latch). Surfaced so the suppression is never a silent drop."""
+
+    symbol: str
+    code: str = field(default="ENTRY_SUPPRESSED", init=False)
+
+
 # Default paper wallet seed (decision:D-05): $5,000 each for the Long + Short module
 # wallets. Sourced from the registry (the two seeds are equal); the per-module assembler
 # passes the wallet's own seed explicitly when it constructs each module's WSManager.
@@ -362,6 +413,17 @@ class WSManager:
         # so record_execution can attach it to the position at the opening fill (the snapshot is
         # TothBot-internal context, not on the Kraken wire frame). Cleared once the entry resolves.
         self._pending_entries: dict[str, dict] = {}
+        # LIVE entry path (ar:AR-054). _pending_emergsl: the on-fill emergSL placement queue - the
+        # async opening fill (record_execution OPENED, live) enqueues an intent built from the
+        # just-opened Position; the after_batch pump (drive_pending_emergsls) drains it via seam.
+        # batch_add so the off-book L3 stop is placed in the same private _step as the fill (the
+        # sync->async seam mirror of the live exit - the executions handler cannot await the seam).
+        # _entry_suppression_check: the RL-MON-003 dispatch gate the private assembler binds to its
+        # RateCounter.is_entry_suppressed (set_entry_suppression_check); None = no suppression (paper /
+        # a test without a rate counter). Checked FIRST by the live entry dispatch (entry-only by
+        # construction - the exit/cancel path never consults it).
+        self._pending_emergsl: list[PendingEmergSl] = []
+        self._entry_suppression_check: "Callable[[str], bool] | None" = None
         # LIVE exit bookkeeping (sec 12.5 LIVE FLOW). _pending_exit_reason: the exit_reason stamped
         # by a TothBot-dispatched live exit (L1a/L2 market sell) at dispatch, read when the executions
         # close fill confirms (an un-stamped close IS the off-book emergSL backstop firing - mod:Exit_
@@ -1080,10 +1142,21 @@ class WSManager:
         (UT-EE-005: batch_add ONLY on exec_type=filled) the off-book emergSL is placed (LONG
         sell-stop below / SHORT buy-to-cover reduce_only above). Returns True if the entry
         filled (a position opened). Everything traverses the seam (rule:HR-EE-013); a module
-        NEVER calls ws_private directly. Paper-mode entry flow (live entry is a later slice)."""
+        NEVER calls ws_private directly.
+
+        RETURN CONTRACT diverges by mode (PA-004 div #4). PAPER -> filled:bool (the simulator opened
+        the position synchronously inside the seam.add_order call). LIVE -> dispatched:bool (the
+        marketable-IOC entry transmitted; the fill is ASYNC, arriving later on the executions channel
+        as record_execution OPENED, which attaches the D6 snapshot + enqueues the on-fill emergSL the
+        after_batch pump places). LIVE returns False when the RL-MON-003 gate suppressed the entry (no
+        order sent). LIVE NEVER checks has_position (the position is unknowable synchronously)."""
         if self.modules is None:
-            raise RuntimeError(
-                "dispatch_entry is paper-mode only for now (the live entry path is a later slice)"
+            return await self._dispatch_entry_live(
+                side, symbol,
+                order_qty=order_qty, entry_limit_price=entry_limit_price, emergsl_price=emergsl_price,
+                atr_14_entry=atr_14_entry, regime_at_entry=regime_at_entry,
+                cl_ord_id=cl_ord_id, deadline=deadline, signal_params=signal_params,
+                market_regime=market_regime, entry_timestamp_utc=entry_timestamp_utc,
             )
         module = self.modules[side]
         # Pending Order Registry (AR-053 / UT-EE-010): stash the entry-time D6 snapshot so the
@@ -1125,6 +1198,66 @@ class WSManager:
             return filled
         finally:
             self._pending_entries.pop(symbol, None)
+
+    async def _dispatch_entry_live(
+        self,
+        side: PositionSide,
+        symbol: str,
+        *,
+        order_qty: object,
+        entry_limit_price: object,
+        emergsl_price: object,
+        atr_14_entry: object | None = None,
+        regime_at_entry: str | None = None,
+        cl_ord_id: str,
+        deadline: str,
+        signal_params: dict | None = None,
+        market_regime: str | None = None,
+        entry_timestamp_utc: str | None = None,
+    ) -> bool:
+        """The LIVE entry dispatch (PA-004 div #4) - the async counterpart of the paper synchronous
+        flow. The RL-MON-003 gate is checked FIRST: a suppressed entry sends NO order and returns
+        False (the exit budget is preserved; exits/cancels are never gated). Otherwise the entry-time
+        D6 snapshot is stashed in the Pending Order Registry (AR-053) so the ASYNC opening fill
+        (record_execution OPENED) attaches it + enqueues the AR-054 on-fill emergSL the after_batch
+        pump places, and the marketable-IOC entry add_order transmits over the seam (LONG spot buy /
+        SHORT margin sell-to-open, ar:AR-009). Returns True (the entry was dispatched); the fill is
+        confirmed later on the executions channel - this NEVER checks has_position (it is async)."""
+        # RL-MON-003 (CRITICAL tier): suppress a new entry add_order while the pair is armed above the
+        # critical rate fraction - the resting-exit rate budget is preserved (loss-prevention).
+        if self._entry_suppression_check is not None and self._entry_suppression_check(symbol):
+            self._emit_event(EntrySuppressed(symbol))
+            return False
+        # Pending Order Registry (AR-053 / UT-EE-010): the entry-time D6 snapshot the async opening
+        # fill attaches (the emergsl_price for L3, atr_14_entry for L2, regime + the TRADE_CLOSE
+        # entry-side producer fields). Kept until the fill resolves (record_execution OPENED pops it);
+        # the paper path pops inline in its finally, but the live fill is a later executions frame.
+        self._pending_entries[symbol] = {
+            "emergsl_price": emergsl_price,
+            "atr_14_entry": atr_14_entry,
+            "regime_at_entry": regime_at_entry,
+            "signal_params": signal_params,
+            "market_regime": market_regime,
+            "entry_timestamp_utc": entry_timestamp_utc,
+        }
+        # The marketable-IOC entry add_order (the emergSL is placed on the fill, not here - AR-054).
+        await self.seam.add_order(
+            build_entry_order(
+                symbol, side,
+                order_qty=order_qty, entry_limit_price=entry_limit_price,
+                cl_ord_id=cl_ord_id, deadline=deadline,
+            )
+        )
+        return True
+
+    def set_entry_suppression_check(self, check: "Callable[[str], bool] | None") -> None:
+        """Wire the RL-MON-003 entry-suppression predicate (the PrivateConnectionAssembler binds its
+        private-connection RateCounter.is_entry_suppressed here - the predicate lives on the rate
+        counter, the dispatch GATE is owned by WSManager per the sec-7 add_order OWNERSHIP note). The
+        LIVE entry dispatch calls it FIRST and SKIPs the entry add_order when it returns True. The gate
+        is ENTRY-only by construction (only the entry path consults it; the exit/cancel dispatch never
+        does). None unwires it (the default - no suppression, e.g. paper / a rate-counter-less test)."""
+        self._entry_suppression_check = check
 
     # --- sec 12.5 close surfaces (the Exit Controller calls these through `wm`) -------
     def close_position(self, symbol: str) -> Position | None:
