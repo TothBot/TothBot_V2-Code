@@ -33,14 +33,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field, fields
 from typing import Callable
 
-# The 23 canonical evt:TRADE_CLOSE field names (0500000 sec 7 Image6 schema). A Stream-2 record
-# MUST carry EXACTLY these (the schema fingerprint). Mirrors execution.exit_controller.TradeClose.
+# The 24 canonical evt:TRADE_CLOSE field names (0500000 dv1_252 sec 7 Image6 schema; D1 ruling
+# expanded 23 -> 24 with field (24) qty). A Stream-2 record MUST carry EXACTLY these (the schema
+# fingerprint). Mirrors execution.exit_controller.TradeClose.
 TRADE_CLOSE_SCHEMA: frozenset[str] = frozenset({
     "ts", "event", "level", "component", "symbol",
     "entry_fill_price", "exit_price", "entry_timestamp_utc", "exit_timestamp_utc",
     "hold_candle_count", "mae_pct_reached", "fees_entry_usd", "fees_exit_usd", "fees_total_usd",
     "exit_reason", "asset_regime", "vol_regime", "market_regime", "signal_params", "actual_rr",
-    "net_pl_usd", "net_gain_usd", "net_loss_usd",
+    "net_pl_usd", "net_gain_usd", "net_loss_usd", "qty",
 })
 
 # The default per-module corpus partitions (the two trading modules). A record's module tag keys

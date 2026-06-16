@@ -226,6 +226,13 @@ def test_same_candle_exit_floors_hold_to_zero():
 # ------------------------------------------------ TB00757: the max-over-life MAE (MTM) lift - the
 # TRADE_CLOSE mae_pct_reached is the WORST over the hold (wm.mae_pct_high_for), not the at-exit reading
 
+def test_trade_close_carries_qty_field_24():
+    # D1 (dv1_252): the close emits field (24) qty = the filled position quantity (Form 8949 source).
+    wm = _FakeWM(_pos(qty="0.05"), fees_entry=Decimal("7.8"))
+    rec = _ec([]).on_paper_close("BTC/USD", "66000", ExitReason.MAE_THRESHOLD_BREACH, "8.58", wm)
+    assert rec.qty == Decimal("0.05")
+
+
 def test_mae_pct_reached_is_lifted_to_the_max_over_life_high():
     # a benign (favorable) exit reaches 0 adverse AT EXIT, but the trade ran deep against the position
     # over its life (the tracked high) -> mae_pct_reached carries the DEEP max-over-life heat.

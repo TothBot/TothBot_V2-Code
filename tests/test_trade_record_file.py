@@ -38,7 +38,7 @@ def _tc(net="120", *, when="2026-06-10T12:00:00+00:00", regime="TRENDING_POS_NOR
         net_pl_usd=n, net_gain_usd=(n if win else Decimal("0")),
         net_loss_usd=(Decimal("0") if win else -n), asset_regime=regime, vol_regime="NORMAL_VOL",
         market_regime="TRENDING_POS_NORMAL", exit_timestamp_utc=when, hold_candle_count=12,
-        actual_rr=Decimal("1.6"), mae_pct_reached=Decimal("0.4"),
+        actual_rr=Decimal("1.6"), mae_pct_reached=Decimal("0.4"), qty=Decimal("0.05"),
         signal_params={"rsi_14": Decimal("41.5"), "ema_9": Decimal("100.2")},
     )
 
@@ -227,6 +227,28 @@ def test_load_records_dir_concatenates_years_in_order_missing_is_empty():
     for year in (2025, 2026, 2027):
         recs += trf.load_trade_records_file(f"/r/trades_{year}.jsonl", open_text=opener)
     assert [r.net_pl_usd for r in recs] == [Decimal("1"), Decimal("2")]   # 2027 missing -> nothing
+
+
+def test_serialize_carries_field_24_qty_and_round_trips():
+    import json
+    doc = json.loads(serialize_trade_close(_tc("120")))
+    assert doc["qty"] == "0.05" and isinstance(doc["qty"], str)   # field 24, Decimal-as-string
+    assert list(doc)[-1] == "qty"                                 # last in the canonical order
+    assert parse_trade_close(doc).qty == Decimal("0.05")          # parses back to Decimal
+
+
+def test_c5_from_durable_file_computes_proceeds_and_cost_basis(tmp_path):
+    # the D1 payoff: C5 Form 8949 proceeds (exit_price*qty) + cost_basis (entry_fill_price*qty) now
+    # compute from the durable record's field-24 qty.
+    from tothbot.recorder.trade_record_file import build_c5_from_durable_file
+
+    sink = PermanentTradeRecordSink(str(tmp_path), now_utc=lambda: datetime(2026, 6, 1, tzinfo=UTC))
+    sink(_tc("120"))
+    report = build_c5_from_durable_file(str(tmp_path), 2026)
+    lot = report.per_module["all"].tax_lots[0]
+    assert lot.qty == Decimal("0.05")
+    assert lot.proceeds_usd == Decimal("66000.5") * Decimal("0.05")     # exit_price * qty
+    assert lot.cost_basis_usd == Decimal("60000") * Decimal("0.05")     # entry_fill_price * qty
 
 
 def test_load_trade_records_dir_real_roundtrip(tmp_path):

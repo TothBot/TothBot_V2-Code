@@ -30,10 +30,11 @@ def _trade_close(symbol="BTC/USD", net="100"):
     )
 
 
-# -- the 23-field schema -------------------------------------------------
+# -- the 24-field schema (dv1_252: field 24 qty added per the D1 ruling) ---
 
-def test_schema_has_23_fields():
-    assert len(TRADE_CLOSE_SCHEMA) == 23
+def test_schema_has_24_fields():
+    assert len(TRADE_CLOSE_SCHEMA) == 24
+    assert "qty" in TRADE_CLOSE_SCHEMA
 
 
 def test_real_trade_close_passes_schema():

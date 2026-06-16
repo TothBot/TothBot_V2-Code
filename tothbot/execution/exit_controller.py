@@ -104,6 +104,8 @@ class TradeClose:
     market_regime: str | None = None              # (18) BTC/USD anchor regime
     signal_params: dict | None = None             # (19)
     actual_rr: Decimal | None = None              # (20) net_PL / risk_exposed
+    qty: Decimal | None = None                    # (24) filled position quantity (Form 8949 proceeds/
+                                                  #      cost-basis source; 0500000 dv1_252 D1 ruling)
     event: str = field(default="TRADE_CLOSE", init=False)   # (2)
     level: str = field(default="INFO", init=False)          # (3)
     component: str = field(default="EXIT_CTRL", init=False)  # (4)
@@ -275,6 +277,7 @@ class ExitController:
             market_regime=getattr(position, "market_regime", None),
             signal_params=getattr(position, "signal_params", None),
             actual_rr=actual_rr,
+            qty=qty,                              # (24) the filled position quantity (Form 8949)
         )
         # 6. emit TRADE_CLOSE (the canonical Stream-2 record).
         self._emit(record)

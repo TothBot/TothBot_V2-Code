@@ -57,12 +57,12 @@ _CANONICAL_ORDER: tuple[str, ...] = (
     "entry_fill_price", "exit_price", "entry_timestamp_utc", "exit_timestamp_utc",
     "hold_candle_count", "mae_pct_reached", "fees_entry_usd", "fees_exit_usd", "fees_total_usd",
     "exit_reason", "asset_regime", "vol_regime", "market_regime", "signal_params", "actual_rr",
-    "net_pl_usd", "net_gain_usd", "net_loss_usd",
+    "net_pl_usd", "net_gain_usd", "net_loss_usd", "qty",
 )
-# The price/fee/P-L/ratio fields parsed BACK to Decimal on read (the JSON-string numerics).
+# The price/fee/P-L/ratio/qty fields parsed BACK to Decimal on read (the JSON-string numerics).
 _DECIMAL_FIELDS: frozenset[str] = frozenset({
     "entry_fill_price", "exit_price", "mae_pct_reached", "fees_entry_usd", "fees_exit_usd",
-    "fees_total_usd", "actual_rr", "net_pl_usd", "net_gain_usd", "net_loss_usd",
+    "fees_total_usd", "actual_rr", "net_pl_usd", "net_gain_usd", "net_loss_usd", "qty",
 })
 
 DurableRecordsDir = str
@@ -121,6 +121,7 @@ def parse_trade_close(doc: dict) -> TradeClose:
         market_regime=doc.get("market_regime"),
         signal_params=({k: Decimal(str(v)) for k, v in sp.items()} if sp else None),
         actual_rr=dec("actual_rr"),
+        qty=dec("qty"),
     )
 
 

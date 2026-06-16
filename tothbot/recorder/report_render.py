@@ -155,7 +155,8 @@ def _render_module(m: ModuleReport) -> list[str]:
         for lot in m.tax_lots:
             lines.append(
                 f"  - {lot.symbol}: acquired {_s(lot.acquired_utc)} disposed {_s(lot.disposed_utc)}; "
-                f"entry {_s(lot.entry_fill_price)} exit {_s(lot.exit_price)}; gain/loss "
+                f"qty {_s(lot.qty)}; entry {_s(lot.entry_fill_price)} exit {_s(lot.exit_price)}; "
+                f"proceeds {_s(lot.proceeds_usd)} cost-basis {_s(lot.cost_basis_usd)} USD; gain/loss "
                 f"{_s(lot.gain_loss_usd)} USD; fees {_s(lot.fees_total_usd)} USD"
             )
     return lines

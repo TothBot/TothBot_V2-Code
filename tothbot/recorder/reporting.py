@@ -332,10 +332,11 @@ class ParameterEvolutionEntry:
 
 @dataclass(frozen=True)
 class TaxLot:
-    """A C5 Form 8949 / 26 CFR 1.6001-1 lot projection (the available 23-field fields): the acquired
-    + disposed instants, the entry/exit prices, the realized gain/loss (net_pl_usd), and the fees.
-    NOTE: proceeds / cost-basis in dollars need the position QTY, which the 23-field TRADE_CLOSE
-    schema does not carry - surfaced as a known gap (see module/SL carry-forward), not fabricated."""
+    """A C5 Form 8949 / 26 CFR 1.6001-1 lot (the 24-field schema, dv1_252): the acquired + disposed
+    instants, the entry/exit prices, the filled qty, the dollar PROCEEDS (exit_price * qty) + COST
+    BASIS (entry_fill_price * qty), the realized gain/loss (net_pl_usd), and the fees. proceeds /
+    cost_basis are now computed from field (24) qty (the D1 ruling closed the prior gap); they are
+    None only when a legacy record carries no qty (never fabricated)."""
 
     symbol: str
     acquired_utc: str | None
@@ -344,6 +345,9 @@ class TaxLot:
     exit_price: Decimal
     gain_loss_usd: Decimal
     fees_total_usd: Decimal
+    qty: Decimal | None = None
+    proceeds_usd: Decimal | None = None
+    cost_basis_usd: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -424,6 +428,27 @@ def _progress(count: int, floor: int) -> str:
     return f"{min(count, floor)}/{floor}" + (" (reached)" if count >= floor else "")
 
 
+def _tax_lot(r: object) -> TaxLot:
+    """One C5 Form 8949 lot from a TRADE_CLOSE record. proceeds = exit_price * qty, cost_basis =
+    entry_fill_price * qty (field 24 qty, dv1_252); both None when the record carries no qty (a legacy
+    23-field record) - never fabricated."""
+    raw_qty = getattr(r, "qty", None)
+    qty = _dec(raw_qty) if raw_qty is not None else None
+    entry = _dec(r.entry_fill_price)
+    exit_px = _dec(r.exit_price)
+    return TaxLot(
+        symbol=str(getattr(r, "symbol", "")),
+        acquired_utc=getattr(r, "entry_timestamp_utc", None),
+        disposed_utc=getattr(r, "exit_timestamp_utc", None),
+        entry_fill_price=entry, exit_price=exit_px,
+        gain_loss_usd=_dec(r.net_pl_usd),
+        fees_total_usd=_dec(getattr(r, "fees_total_usd", 0) or 0),
+        qty=qty,
+        proceeds_usd=(exit_px * qty) if qty is not None else None,
+        cost_basis_usd=(entry * qty) if qty is not None else None,
+    )
+
+
 def build_module_report(
     module: str,
     *,
@@ -449,17 +474,7 @@ def build_module_report(
 
     tax_lots: tuple[TaxLot, ...] = ()
     if category is ReportCategory.C5_ANNUAL:
-        tax_lots = tuple(
-            TaxLot(
-                symbol=str(getattr(r, "symbol", "")),
-                acquired_utc=getattr(r, "entry_timestamp_utc", None),
-                disposed_utc=getattr(r, "exit_timestamp_utc", None),
-                entry_fill_price=_dec(r.entry_fill_price), exit_price=_dec(r.exit_price),
-                gain_loss_usd=_dec(r.net_pl_usd),
-                fees_total_usd=_dec(getattr(r, "fees_total_usd", 0) or 0),
-            )
-            for r in in_window
-        )
+        tax_lots = tuple(_tax_lot(r) for r in in_window)
 
     cumulative = len([r for r in corpus if _is_trade_close(r)])
     return ModuleReport(
