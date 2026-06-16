@@ -176,6 +176,10 @@ class _FakeWM:
     def wallet_balance(self, side):
         return Decimal("5000") if side is PositionSide.LONG else None
 
+    def portfolio_baseline(self, side):
+        mod = self.modules.get(side)
+        return mod.portfolio_baseline if mod is not None else None
+
     async def dispatch_entry(self, *a, **k):
         return True
 

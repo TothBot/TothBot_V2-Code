@@ -17,8 +17,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from tothbot.config.settings import Mode
 from tothbot.exchange.position_mirror import PositionSide
+from tothbot.exchange.seam import OutboundOp
 from tothbot.exchange.warmup import HtfCache
+from tothbot.exchange.ws_manager import WSManager
 from tothbot.pipeline.sweep import (
     LiveProviders,
     assemble_candidate,
@@ -62,12 +65,15 @@ class _Pos:
 
 
 class _FakeWM:
-    def __init__(self, *, positions=None, wallets=None) -> None:
+    def __init__(self, *, positions=None, wallets=None, baselines=None) -> None:
         self._positions = positions or {}
         self._wallets = wallets or {PositionSide.LONG: Decimal("5000"), PositionSide.SHORT: Decimal("5000")}
-        self.modules = {
-            side: SimpleNamespace(portfolio_baseline=Decimal("5000")) for side in self._wallets
-        }
+        # The per-side drawdown baseline read through wm.portfolio_baseline(side) (mode-aware accessor);
+        # defaults to each wired side's $5,000 starting wallet. None -> the default; {} -> no baseline
+        # captured yet (the live pre-REST-BAL-004 startup case), distinct from the default.
+        self._baselines = (
+            {side: Decimal("5000") for side in self._wallets} if baselines is None else baselines
+        )
         self.dispatched: list[dict] = []
 
     def open_positions(self):
@@ -84,6 +90,9 @@ class _FakeWM:
 
     def wallet_balance(self, side):
         return self._wallets.get(side)
+
+    def portfolio_baseline(self, side):
+        return self._baselines.get(side)
 
     async def dispatch_entry(self, side, symbol, **kw):
         self.dispatched.append({"side": side, "symbol": symbol, **kw})
@@ -263,3 +272,68 @@ def test_sweep_no_regime_is_skipped():
         providers=_providers(),
     ))
     assert results == []
+
+
+def test_sweep_skips_side_until_live_baseline_captured():
+    # LIVE-readiness (slice d): the wallet is fed but the REST-BAL-004 startup baseline is NOT yet
+    # captured -> portfolio_baseline(side) is None -> the side is skipped this tick (G7 CHECK 1 would
+    # reject a None/<=0 baseline), exactly like a not-yet-ready wallet. The wallet alone is not enough.
+    wm = _FakeWM(baselines={})  # both wallets present, no baseline captured yet
+    logger = _FakeLogger()
+    results = asyncio.run(sweep_pair(
+        wm, logger, candle=_candle(), warmup=_warmup(_FakeIndicators(passing=True)),
+        regime_cache=_cache(regime=Regime.NON_DIR_NORMAL), providers=_providers(),
+    ))
+    assert results == []
+
+
+# --------------------------------------------------------------------------- LIVE sizing capstone
+def test_live_sweep_sizes_and_dispatches_a_live_entry_add_order():
+    # The capstone of live sizing (the entry mirror of the TB00764 exit capstone): a REAL live
+    # WSManager with a FED BalancesCache (the live G8 wallet) + a captured REST-BAL-004 baseline runs
+    # the full sweep over fakes and dispatches a LIVE entry add_order on the bound socket. NOTHING
+    # connects to Kraken for real - the live_sender captures every transmitted message.
+    sent: list = []
+
+    async def _live(op, message):
+        sent.append((op, message))
+
+    wm = WSManager(Mode.LIVE, live_sender=_live)
+    # the live G8 reads come ready: the balances snapshot feeds the wallet (WS-BAL-002) + the
+    # REST-BAL-004 startup capture sets the baseline (LONG spot, the TRENDING_POS_NORMAL side).
+    wm.ingest_balances({"type": "snapshot", "data": [
+        {"asset": "USD", "wallets": [{"type": "spot", "id": "main", "balance": "5000.0"}]}]})
+    wm.set_live_portfolio_baseline(PositionSide.LONG, "5000.0")
+    assert wm.wallet_balance(PositionSide.LONG) == Decimal("5000.0")
+    assert wm.portfolio_baseline(PositionSide.LONG) == Decimal("5000.0")
+
+    logger = _FakeLogger()
+    results = asyncio.run(sweep_pair(
+        wm, logger, candle=_candle(), warmup=_warmup(_FakeIndicators(passing=True)),
+        regime_cache=_cache(), providers=_providers(),   # TRENDING_POS_NORMAL -> LONG only
+    ))
+    assert len(results) == 1
+    assert results[0].outcome.accepted is True
+    # LIVE return contract (PA-004 div #4): dispatched True, filled False (the IOC fill is async).
+    assert results[0].dispatched is True and results[0].filled is False
+    # the marketable-IOC entry add_order transmitted over the bound socket (the live dispatch_entry).
+    assert [op for op, _msg in sent] == [OutboundOp.ADD_ORDER]
+
+
+def test_live_sweep_skips_when_wallet_cache_not_yet_fed():
+    # the mirror case: a live WSManager whose balances snapshot has NOT arrived -> wallet_balance is
+    # None -> the sweep skips the side (no dispatch), never a crash on wm.modules being None in live.
+    sent: list = []
+
+    async def _live(op, message):
+        sent.append((op, message))
+
+    wm = WSManager(Mode.LIVE, live_sender=_live)
+    wm.set_live_portfolio_baseline(PositionSide.LONG, "5000.0")  # baseline set, but no wallet yet
+    logger = _FakeLogger()
+    results = asyncio.run(sweep_pair(
+        wm, logger, candle=_candle(), warmup=_warmup(_FakeIndicators(passing=True)),
+        regime_cache=_cache(), providers=_providers(),
+    ))
+    assert results == []
+    assert sent == []

@@ -212,7 +212,7 @@ def assemble_candidate(
         has_active_same_side_position=has_same_side,
         base_per_trade_size_usd=base,
         wallet_balance=wm.wallet_balance(side),
-        portfolio_baseline=wm.modules[side].portfolio_baseline,
+        portfolio_baseline=wm.portfolio_baseline(side),  # mode-aware (paper ledger / live REST-BAL-004)
         candidate_committed_usd=candidate_committed_usd(side, sized_usd),
         total_committed_usd=total_committed_usd(wm, side),
         semaphore_locked=providers.semaphore_locked(side),
@@ -260,7 +260,14 @@ async def sweep_pair(
     evaluator = live_sss_evaluator(warmup.indicators)
     results = []
     for side in permitted_sides(classification.regime):
-        if wm.wallet_balance(side) is None:  # no module wired for this side
+        # The side's live G8-sizer reads must BOTH be ready (mode-aware, sec 12.4): wallet_balance(side)
+        # (ar:AR-051 realized cash) AND portfolio_baseline(side) (ar:AR-052 startup baseline). PAPER:
+        # both come off the wired module ledger - a side with no module is None -> skipped. LIVE: the
+        # balances snapshot feeds the wallet + REST-BAL-004 captures the baseline at startup - either
+        # absent (pre-snapshot / pre-capture) is a not-yet-ready wallet -> skip this tick (like a
+        # WARM_UP pair, never a crash; G7 would reject a None/<=0 baseline). Once both land the (pair,
+        # side) candidate is sized through G6/G7/G8 and dispatched via the live dispatch_entry.
+        if wm.wallet_balance(side) is None or wm.portfolio_baseline(side) is None:
             continue
         try:
             inputs, ctx = assemble_candidate(

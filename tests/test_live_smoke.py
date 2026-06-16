@@ -138,6 +138,10 @@ class _TradeWM:
     def wallet_balance(self, side):
         return self._w.get(side)
 
+    def portfolio_baseline(self, side):
+        mod = self.modules.get(side)
+        return mod.portfolio_baseline if mod is not None else None
+
     async def dispatch_entry(self, side, symbol, **kw):
         self.dispatched.append((side, symbol))
         return True
