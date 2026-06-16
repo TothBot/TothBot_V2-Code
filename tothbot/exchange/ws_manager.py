@@ -61,6 +61,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 
+from .balances_cache import BalancesCache
 from .connection import ConnectionRole, WSConnection
 from .dispatch import Channel, DispatchTable, Handler
 from .ledger import LedgerUpdate, SyntheticCapitalLedger
@@ -424,6 +425,12 @@ class WSManager:
         # construction - the exit/cancel path never consults it).
         self._pending_emergsl: list[PendingEmergSl] = []
         self._entry_suppression_check: "Callable[[str], bool] | None" = None
+        # The LIVE wallet cache (sec 12.4 / WS-BAL-002/003): real Kraken balances are authoritative in
+        # live (the synthetic ledger is paper-only), so the balances channel feeds this cache (ingest_
+        # balances) and the live G8 sizer reads it (live_spot_wallet_usd / live_margin_wallet_usd). The
+        # paper path never feeds it (HR-WM-022: no private channel in paper); constructed in both modes
+        # but inert in paper. WSManager is its sole writer (the sec-12.4 single-owner property).
+        self._balances_cache = BalancesCache()
         # LIVE exit bookkeeping (sec 12.5 LIVE FLOW). _pending_exit_reason: the exit_reason stamped
         # by a TothBot-dispatched live exit (L1a/L2 market sell) at dispatch, read when the executions
         # close fill confirms (an un-stamped close IS the off-book emergSL backstop firing - mod:Exit_
@@ -1607,8 +1614,41 @@ class WSManager:
 
     def wallet_balance(self, side: PositionSide) -> Decimal | None:
         """THIS SIDE's synthetic wallet balance (paper): the Long wallet is spot USD, the Short
-        wallet is Kraken margin equity (sec 7 per-module). None in live mode."""
+        wallet is Kraken margin equity (sec 7 per-module). None in live mode (the live G8 sizer reads
+        the balances cache via live_spot_wallet_usd / live_margin_wallet_usd - a later wiring slice)."""
         return None if self.modules is None else self.modules[side].wallet_balance
+
+    # --- the LIVE wallet cache (sec 12.4 / WS-BAL-002/003 - real Kraken balances authoritative) -----
+    def ingest_balances(self, frame: Mapping[str, object]) -> object:
+        """Apply one balances-channel frame to the live wallet cache (WS-BAL-003 dispatch): a
+        type=snapshot REPLACES the cache (the full wallet state at subscription), any other (update)
+        MERGES the delta. WSManager is the sole writer of the cache (the sec-12.4 single-owner
+        property, like the mirror + ledger). Emits + returns the telemetry event. Live only - paper
+        has no balances channel (HR-WM-022); the cache simply stays empty if ever called in paper."""
+        data = frame.get("data")
+        if frame.get("type") == "snapshot":
+            event = self._balances_cache.apply_snapshot(data)
+        else:
+            event = self._balances_cache.apply_update(data)
+        self._emit_event(event)
+        return event
+
+    def reset_balances_cache(self) -> None:
+        """WS-REC-004: drop the live wallet cache on reconnect so a stale pre-disconnect balance is
+        never read; the fresh balances SNAPSHOT after re-subscribe re-seeds it."""
+        self._balances_cache.reset()
+
+    def live_spot_wallet_usd(self) -> Decimal | None:
+        """The LONG (spot) module's live portfolio USD from the balances cache (WS-BAL-002:
+        wallets[type=spot][id=main] ONLY), or None before the first balances frame. The live
+        counterpart of paper wallet_balance(LONG); the G8 live-sizer read is wired in a later slice."""
+        return self._balances_cache.spot_main_usd()
+
+    def live_margin_wallet_usd(self) -> Decimal | None:
+        """The SHORT (margin) module's live margin-account USD balance from the balances cache (WS-BAL-
+        002 / ar:AR-050 cash component), or None. The open-margin-position equity AR-050 adds to the
+        full short wallet is layered on by the REST OpenPositions reconcile in a later slice."""
+        return self._balances_cache.margin_usd()
 
     # --- Position Mirror read helpers (the rule:HR-PM-009 read contract) ------
     def position(self, symbol: str) -> Position | None:

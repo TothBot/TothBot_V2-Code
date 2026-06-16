@@ -647,6 +647,29 @@ def test_build_binds_entry_suppression_gate_to_the_rate_counter():
     assert m._entry_suppression_check("ETH/USD") is False
 
 
+def test_build_balances_handler_feeds_the_live_wallet_cache():
+    # the wired balances channel (no longer a no-op) routes each frame into the WSManager live wallet
+    # cache (WS-BAL-002/003), so the live G8 sizer's wallet source reflects the real Kraken balances.
+    m = WSManager(Mode.LIVE)
+
+    async def _open():
+        return _IdleTransport()
+
+    asm = PrivateConnectionAssembler(
+        m, open_socket=_open, acquire_token=_tok, sleep=_noop_sleep,
+    )
+    pc = asyncio.run(asm.build())
+    pc.loop.handle_message({"channel": "balances", "type": "snapshot", "data": [
+        {"asset": "USD", "wallets": [
+            {"type": "spot", "id": "main", "balance": "5000.0"},
+            {"type": "margin", "id": "m1", "balance": "3000.0"}]}]}, now=0.0)
+    assert m.live_spot_wallet_usd() == Decimal("5000.0")
+    assert m.live_margin_wallet_usd() == Decimal("3000.0")
+    # a reconnect drops the stale cache (WS-REC-004); the fresh snapshot re-seeds it.
+    asyncio.run(pc.driver.initiate(0, _random_reason()))
+    assert m.live_spot_wallet_usd() is None
+
+
 # -- the private connection satisfies the Transport protocol at its edge --
 
 def test_fake_transport_is_transport():

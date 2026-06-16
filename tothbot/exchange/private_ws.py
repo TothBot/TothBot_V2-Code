@@ -257,8 +257,22 @@ class OrderAckHandler:
 
 
 def _noop_balances_handler(_frame: dict) -> None:
-    """Default balances consumer: the seq-gap tracking happens in the receive loop;
-    the wallet/ledger ingest (PA-004 div #3) is a LATER slice, so this is a no-op."""
+    """Fallback balances consumer when the wm has no balances ingest (a lightweight stand-in): the
+    seq-gap tracking still happens in the receive loop; this just drops the frame."""
+
+
+def _balances_handler_for(wm):
+    """The default balances consumer: route each balances frame to the WSManager live wallet cache
+    (WS-BAL-002/003 ingest_balances - snapshot replaces, update merges). Guarded so a wm stand-in
+    built before the live wallet cache (no ingest_balances) falls back to the no-op."""
+    ingest = getattr(wm, "ingest_balances", None)
+    if not callable(ingest):
+        return _noop_balances_handler
+
+    def _handler(frame: dict) -> None:
+        ingest(frame)
+
+    return _handler
 
 
 # --- the assembled private connection ----------------------------------------
@@ -321,7 +335,7 @@ class PrivateConnectionAssembler:
         self._acquire_token = acquire_token
         self._fetch_snap_orders = fetch_snap_orders
         self._query_orders = query_orders
-        self._balances_handler = balances_handler or _noop_balances_handler
+        self._balances_handler = balances_handler or _balances_handler_for(ws_manager)
         self._coordinator = coordinator or ShardReconnectCoordinator()
         self._external_on_event = on_event
         self._clock = clock
@@ -491,8 +505,13 @@ class PrivateConnectionAssembler:
             # disconnect, so drop the stale per-pair values + suppression latches now. The
             # operative ceiling is re-set from the FRESH executions ACK that the RESUBSCRIBE_
             # PRIVATE step just issued - it flows back through the loop's ceiling sink and
-            # re-emits MAXRATECOUNT_SET (never the hardcoded 125).
+            # re-emits MAXRATECOUNT_SET (never the hardcoded 125). The live wallet cache (WS-BAL-
+            # 002/003) is dropped here too - the same stale-per-connection-state drop - and re-seeded
+            # by the fresh balances SNAPSHOT the resubscribe issues (WS-REC-004).
             self._rate_counter.reset()
+            reset_balances = getattr(self._wm, "reset_balances_cache", None)
+            if callable(reset_balances):
+                reset_balances()
         elif step is RestoreStep.RESUME_KEEPALIVE:
             self._keepalive.reset()  # 30s ping + zombie timers (HR-WM-003/004)
         elif step is RestoreStep.RESTORE_POSITION_MIRROR:

@@ -48,6 +48,7 @@ from tothbot.exchange.regime_exit import (
 )
 from tothbot.regime.engine import classify_from_indicators
 from tothbot.regime.taxonomy import Regime
+from tothbot.exchange.balances_cache import BalancesSnapshotApplied, BalancesUpdated
 from tothbot.exchange.ws_manager import (
     CancelAckTimeout,
     EmergSlPlaced,
@@ -1711,3 +1712,40 @@ def test_entry_suppression_never_gates_the_exit_path():
     assert outcomes == [ExitDispatchOutcome.DISPATCHED]
     ops = [op for op, _ in sent]
     assert OutboundOp.CANCEL_ORDER in ops and OutboundOp.DISPATCH_MARKET_SELL in ops
+
+
+# -- the LIVE wallet cache ingest (WS-BAL-002/003 - the live G8 sizer's wallet source) ------------
+
+def test_ingest_balances_snapshot_then_update_feeds_live_wallet_reads():
+    m, _, events = _live_manager()
+    m.ingest_balances({"channel": "balances", "type": "snapshot", "data": [
+        {"asset": "USD", "wallets": [
+            {"type": "spot", "id": "main", "balance": "5000.0"},
+            {"type": "margin", "id": "m1", "balance": "3000.0"}]}]})
+    # Long reads spot/main, Short reads margin (WS-BAL-002, symmetric).
+    assert m.live_spot_wallet_usd() == Decimal("5000.0")
+    assert m.live_margin_wallet_usd() == Decimal("3000.0")
+    # an update merges only the changed spot wallet; margin is retained (WS-BAL-003).
+    m.ingest_balances({"channel": "balances", "type": "update", "data": [
+        {"asset": "USD", "wallets": [{"type": "spot", "id": "main", "balance": "4200.0"}]}]})
+    assert m.live_spot_wallet_usd() == Decimal("4200.0")
+    assert m.live_margin_wallet_usd() == Decimal("3000.0")
+    assert any(isinstance(e, BalancesSnapshotApplied) for e in events)
+    assert any(isinstance(e, BalancesUpdated) for e in events)
+
+
+def test_reset_balances_cache_drops_stale_for_reconnect_reseed():
+    m, _, _ = _live_manager()
+    m.ingest_balances({"type": "snapshot", "data": [
+        {"asset": "USD", "wallets": [{"type": "spot", "id": "main", "balance": "5000.0"}]}]})
+    m.reset_balances_cache()
+    assert m.live_spot_wallet_usd() is None and m.live_margin_wallet_usd() is None
+
+
+def test_paper_wallet_balance_unchanged_live_uses_the_cache():
+    # paper still reads the synthetic per-module wallet; live wallet_balance stays None (the live
+    # sizer reads live_spot_wallet_usd / live_margin_wallet_usd - the cache, not wallet_balance).
+    p = WSManager(Mode.PAPER, paper_starting_balance="5000")
+    assert p.wallet_balance(PositionSide.LONG) == Decimal("5000")
+    m, _, _ = _live_manager()
+    assert m.wallet_balance(PositionSide.LONG) is None
