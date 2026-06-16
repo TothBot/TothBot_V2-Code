@@ -23,9 +23,10 @@ from tothbot.execution.exit_controller import (
 class _FakeWM:
     """A stand-in for the WSManager sole-writer surfaces the Exit Controller calls."""
 
-    def __init__(self, position, fees_entry):
+    def __init__(self, position, fees_entry, mae_high=None):
         self._position = position
         self._fees_entry = fees_entry
+        self._mae_high = mae_high
         self.closed = []
         self.sc_updates = []
         self.sem_released = 0
@@ -35,6 +36,9 @@ class _FakeWM:
 
     def fees_entry_for(self, symbol):
         return self._fees_entry
+
+    def mae_pct_high_for(self, symbol):
+        return self._mae_high
 
     def close_position(self, symbol):
         self.closed.append(symbol)
@@ -217,3 +221,30 @@ def test_same_candle_exit_floors_hold_to_zero():
     wm = _FakeWM(pos, fees_entry=Decimal("7.8"))
     rec = _ec([]).on_paper_close("BTC/USD", "66000", ExitReason.MAE_THRESHOLD_BREACH, "8.58", wm)
     assert rec.hold_candle_count == 0
+
+
+# ------------------------------------------------ TB00757: the max-over-life MAE (MTM) lift - the
+# TRADE_CLOSE mae_pct_reached is the WORST over the hold (wm.mae_pct_high_for), not the at-exit reading
+
+def test_mae_pct_reached_is_lifted_to_the_max_over_life_high():
+    # a benign (favorable) exit reaches 0 adverse AT EXIT, but the trade ran deep against the position
+    # over its life (the tracked high) -> mae_pct_reached carries the DEEP max-over-life heat.
+    wm = _FakeWM(_pos(), fees_entry=Decimal("7.8"), mae_high=Decimal("0.0417"))
+    rec = _ec([]).on_paper_close("BTC/USD", "66000", ExitReason.HTF_REGIME_REVERSAL, "8.58", wm)
+    assert rec.mae_pct_reached == Decimal("0.0417")           # the tracked high, not the at-exit 0
+
+
+def test_mae_pct_reached_keeps_the_deeper_at_exit_when_it_exceeds_the_high():
+    # an L2 breach exit: the at-exit adverse excursion is the breach (deeper than any earlier mark) ->
+    # max(at_exit, tracked_high) keeps the at-exit value.
+    wm = _FakeWM(_pos(), fees_entry=Decimal("7.8"), mae_high=Decimal("0.01"))
+    rec = _ec([]).on_paper_close("BTC/USD", "57000", ExitReason.MAE_THRESHOLD_BREACH, "8.58", wm)
+    # at-exit = (60000-57000)/60000 = 0.05 > tracked 0.01
+    assert rec.mae_pct_reached == Decimal("3000") / Decimal("60000")
+
+
+def test_mae_pct_reached_falls_back_to_at_exit_without_a_tracker():
+    # a wm stand-in without mae_pct_high_for (None high) -> the at-exit reading stands (back-compat).
+    wm = _FakeWM(_pos(), fees_entry=Decimal("7.8"))            # mae_high defaults None
+    rec = _ec([]).on_paper_close("BTC/USD", "57000", ExitReason.MAE_THRESHOLD_BREACH, "8.58", wm)
+    assert rec.mae_pct_reached == Decimal("3000") / Decimal("60000")

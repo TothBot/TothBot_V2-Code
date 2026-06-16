@@ -63,7 +63,12 @@ from .connection import ConnectionRole, WSConnection
 from .dispatch import Channel, DispatchTable, Handler
 from .ledger import LedgerUpdate, SyntheticCapitalLedger
 from .outbound import PaperDispatchSimulator, PrivateTransmitter
-from .paper_exit import PaperEmergSlTriggered, PaperMaeDetected, detect_paper_exit
+from .paper_exit import (
+    MaeHighWaterTracker,
+    PaperEmergSlTriggered,
+    PaperMaeDetected,
+    detect_paper_exit,
+)
 from .paper_fill import PaperFillSimulator
 from .regime_exit import (
     L1aExitHeld,
@@ -196,6 +201,10 @@ class WSManager:
         # only writer; the write source diverges by mode upstream (PA-004 div #4:
         # paper = local sim fills; live = executions) but is byte-identical here.
         self.positions = PositionMirror(on_event=on_event)
+        # The max-over-life MAE (MTM) tracker (rule:HR-LG-013-adjacent heat signal): per open position
+        # the running-max adverse excursion over the whole hold, fed onto the TRADE_CLOSE at close so
+        # the CIATS stop-width theory reads true heat (not the at-exit reading). Marked on each ticker.
+        self._mae_tracker = MaeHighWaterTracker()
 
         # PAPER capital path (PA-004 div #3 / #4, paper side). In paper mode WSManager
         # owns the synthetic spot_usd_balance (sec 12.4 single-owner) and binds a
@@ -528,7 +537,17 @@ class WSManager:
         if self.modules is not None:
             for module in self.modules.values():
                 module.ledger.clear_fees_entry(symbol, writer=WRITER_ID)
+        # Drop the symbol's max-over-life MAE tracking (a reopened symbol starts fresh). The Exit
+        # Controller has already read it for the TRADE_CLOSE before requesting this clear.
+        self._mae_tracker.clear(symbol)
         return cleared
+
+    def mae_pct_high_for(self, symbol: str) -> "Decimal | None":
+        """The max-over-life adverse excursion (pct of entry) tracked for the open symbol, or None if
+        never marked. mod:Exit_Controller reads it at close to set the TRADE_CLOSE mae_pct_reached to
+        the worst-over-the-hold heat (sharper than the at-exit reading) for the CIATS stop-width
+        theory."""
+        return self._mae_tracker.high(symbol)
 
     def update_selection_state_on_close(
         self, symbol: str, is_win: bool, side: PositionSide = PositionSide.LONG
@@ -589,6 +608,9 @@ class WSManager:
             position = self.positions.get(symbol)
             if position is None:
                 continue
+            # Mark the max-over-life MAE FIRST (this tick, incl. the breaching one), THEN detect the
+            # exit - so the running max captures the final tick that fires the close.
+            self._mae_tracker.mark(position, entry.get("bid"), entry.get("ask"))
             signal = detect_paper_exit(position, entry.get("bid"), entry.get("ask"))
             if signal is not None:
                 self._drive_paper_exit(position, signal)

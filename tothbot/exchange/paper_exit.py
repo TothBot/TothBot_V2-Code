@@ -139,3 +139,56 @@ def detect_paper_exit(
             )
 
     return None
+
+
+# ============================================================ the max-over-life MAE (MTM) tracker
+def current_mae_pct(position: Position, bid: object | None, ask: object | None) -> Decimal | None:
+    """The CURRENT adverse-excursion pct of one open position at one bbo mark (ar:AR-048: a long is
+    marked at the bid, a short at the ask). Returns the pct (clamped at 0 on a favorable-side mark) or
+    None when this side's quote is absent / entry is 0 (no fabricated heat). DISTINCT from detect_
+    paper_exit: this MARKS every tick to feed the max-over-life tracker, it does not decide an exit."""
+    entry = position.avg_entry_price
+    is_long = position.side is PositionSide.LONG
+    quote = bid if is_long else ask
+    if quote is None or entry == 0:
+        return None
+    px = _dec(quote)
+    adverse = (entry - px) if is_long else (px - entry)
+    return (adverse / entry) if adverse > 0 else Decimal("0")
+
+
+class MaeHighWaterTracker:
+    """The max-over-life MAE (mark-to-market) tracker - per open position, the running MAX adverse
+    excursion (pct of entry) over the WHOLE hold.
+
+    The CIATS stop-width FORM->TEST->ROUTE theory reads this "heat" (the contract:TRADE_CLOSE field 11
+    mae_pct_reached): the AT-EXIT reading understates a trade that ran DEEP against the position then
+    recovered to a benign exit (e.g. a run-to-reversal take-profit that survived a deep drawdown), so
+    the worst-over-the-hold excursion is the truer signal the Spearman heat-vs-outcome gate ranks.
+
+    mark() on each bbo tick while the position is open; high() reads the running max at close; clear()
+    drops it when the mirror clears (so a reopened symbol starts fresh). PURE state, no I/O. Lives
+    OUTSIDE the frozen Position (the D6 entry snapshot is captured once + never live-recomputed, sec 7);
+    the exit path owns one tracker. Paper-mode marking (the ticker bbo); live MTM marking is executions/
+    quote-feed driven (a later slice, like the rest of live exit detection)."""
+
+    def __init__(self) -> None:
+        self._high: dict[str, Decimal] = {}
+
+    def mark(self, position: Position, bid: object | None, ask: object | None) -> None:
+        """Update the symbol's running-max adverse excursion with this bbo mark (a no-op when this
+        side has no quote / entry is 0)."""
+        cur = current_mae_pct(position, bid, ask)
+        if cur is None:
+            return
+        prev = self._high.get(position.symbol)
+        if prev is None or cur > prev:
+            self._high[position.symbol] = cur
+
+    def high(self, symbol: str) -> Decimal | None:
+        """The max-over-life adverse excursion seen for the open symbol, or None if never marked."""
+        return self._high.get(symbol)
+
+    def clear(self, symbol: str) -> Decimal | None:
+        """Drop + return the symbol's tracked max (called when the mirror clears at close)."""
+        return self._high.pop(symbol, None)

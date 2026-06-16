@@ -220,12 +220,19 @@ class ExitController:
         net_loss = Decimal("0") if is_win else -net_pl
         fees_total = fees_entry + fees_exit
 
-        # MAE_pct_reached - the adverse excursion at the exit tick (ar:AR-048: long uses
-        # the bid, short the ask; exit_price IS that bbo price for an MAE/emergSL exit).
-        # Clamped at 0 (a favorable-side exit, e.g. a regime reversal in profit, reached
-        # no adverse excursion at exit). A max-over-life MAE wants the MTM tracker.
+        # MAE_pct_reached - the MAX-OVER-LIFE adverse excursion (the contract:TRADE_CLOSE field 11
+        # "heat" the CIATS stop-width theory reads). The at-exit reading (ar:AR-048: long uses the
+        # bid, short the ask; exit_price IS that bbo price for an MAE/emergSL exit; clamped at 0 on a
+        # favorable-side exit) is LIFTED to the worst the trade ran over the whole hold via the MTM
+        # tracker (wm.mae_pct_high_for): a deep-then-benign exit (a run-to-reversal that survived a
+        # deep drawdown) now reports the deep heat, not the shallow at-exit value. A wm without the
+        # tracker (a lightweight test stand-in) falls back to the at-exit reading.
         adverse = (entry - exit_price) if is_long else (exit_price - entry)
         mae_pct = (adverse / entry) if entry != 0 and adverse > 0 else Decimal("0")
+        high_reader = getattr(wm, "mae_pct_high_for", None)
+        tracked_high = high_reader(symbol) if callable(high_reader) else None
+        if tracked_high is not None:
+            mae_pct = max(mae_pct, _dec(tracked_high))
 
         # actual_RR = net_PL / risk_exposed, risk_exposed = the MAE dollar risk leg
         # (atr_14_entry * mae_mult * qty); None when no entry-time ATR snapshot is on the

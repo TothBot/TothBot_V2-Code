@@ -10,7 +10,11 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from tothbot.exchange.paper_exit import detect_paper_exit
+from tothbot.exchange.paper_exit import (
+    MaeHighWaterTracker,
+    current_mae_pct,
+    detect_paper_exit,
+)
 from tothbot.exchange.position_mirror import Position, PositionSide
 
 
@@ -91,3 +95,38 @@ def test_short_uses_ask_not_bid():
     assert detect_paper_exit(
         _pos(side=PositionSide.SHORT), bid="80000", ask="61000"
     ) is None  # ask 61000 -> mae 1000 < 3000
+
+
+# ------------------------------------------------ TB00757: the per-mark heat + the max-over-life tracker
+def test_current_mae_pct_long_uses_bid_clamped_at_zero():
+    # adverse: (entry - bid)/entry; a favorable bid clamps to 0 (no fabricated negative heat).
+    assert current_mae_pct(_pos(), bid="57000", ask="99") == Decimal("3000") / Decimal("60000")
+    assert current_mae_pct(_pos(), bid="60500", ask="99") == Decimal("0")     # favorable -> 0
+    assert current_mae_pct(_pos(), bid=None, ask="1") is None                 # no bid -> None
+
+
+def test_current_mae_pct_short_uses_ask():
+    p = _pos(side=PositionSide.SHORT)
+    assert current_mae_pct(p, bid="1", ask="63000") == Decimal("3000") / Decimal("60000")
+    assert current_mae_pct(p, bid="1", ask="59000") == Decimal("0")           # favorable -> 0
+
+
+def test_tracker_keeps_the_running_max_over_marks():
+    t = MaeHighWaterTracker()
+    p = _pos()
+    assert t.high("BTC/USD") is None                          # never marked
+    t.mark(p, bid="58500", ask="1")                           # adverse 1500 -> 0.025
+    t.mark(p, bid="57600", ask="1")                           # adverse 2400 -> 0.04 (deeper)
+    t.mark(p, bid="59700", ask="1")                           # adverse 300  -> 0.005 (shallower)
+    assert t.high("BTC/USD") == Decimal("2400") / Decimal("60000")   # the running MAX, not the last
+    # a favorable mark never lowers the high.
+    t.mark(p, bid="61000", ask="1")
+    assert t.high("BTC/USD") == Decimal("2400") / Decimal("60000")
+
+
+def test_tracker_clear_drops_the_symbol():
+    t = MaeHighWaterTracker()
+    t.mark(_pos(), bid="57600", ask="1")
+    assert t.clear("BTC/USD") == Decimal("2400") / Decimal("60000")
+    assert t.high("BTC/USD") is None                          # a reopened symbol starts fresh
+    assert t.clear("BTC/USD") is None                         # idempotent
