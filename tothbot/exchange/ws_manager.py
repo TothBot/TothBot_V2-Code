@@ -53,11 +53,13 @@ contract:Reconciliation_REST fallback.
 
 from __future__ import annotations
 
+import asyncio
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from enum import Enum
 
 from .connection import ConnectionRole, WSConnection
 from .dispatch import Channel, DispatchTable, Handler
@@ -93,6 +95,12 @@ from .seam import DispatchSeam, EventSink, LiveSender, PaperSimulator
 from ..config import registry
 from ..config.settings import Mode
 from ..execution.exit_controller import ExitController, ExitReason
+from ..execution.exit_dispatch import (
+    build_cancel_order,
+    build_market_sell_order,
+    build_mpp_retry_order,
+    mpp_retry_limit_price,
+)
 from ..risk.dispatch_semaphore import DispatchSemaphore
 from ..modules.trading_module import TradingModule
 from ..regime.engine import RegimeClassification
@@ -106,6 +114,12 @@ _TRIGGER_TRADES = "trades"
 
 MonotonicClock = Callable[[], float]
 UtcClock = Callable[[], datetime]
+# The injected async edges of the live cancel-then-sell driver (defaults wire the live behavior;
+# tests inject deterministic stubs). CancelAckWait awaits a cancel_order ACK for a cl_ord_id up to
+# the timeout window, returning True if ACKed (I-6). MarketRejectedProbe reports whether a sent
+# close order was rejected by Kraken Max-Price-Protection on a wide spread (C-1).
+CancelAckWait = Callable[[str, float], Awaitable[bool]]
+MarketRejectedProbe = Callable[[dict], Awaitable[bool]]
 
 
 @dataclass(frozen=True)
@@ -133,6 +147,122 @@ class TickerTriggerSwitched:
     event_trigger: str
     code: str = field(default="TICKER_TRIGGER_SWITCHED", init=False)
 
+
+# --- LIVE EXIT DETECTION -> MARKET-SELL DISPATCH (sec 3 Image3 / sec 4.1 / sec 12.5 LIVE FLOW) ---
+# The sync read-loop handler DETECTS the exit (ticker bbo L2 MAE / regime L1a) and enqueues an
+# INTENT; the async drive_live_exits driver owns the SEQUENCE-CRITICAL "(1) cancel emergSL THEN
+# (2) market sell" with the I-6 cancel-timeout fallback + the C-1 MPP-rejection retry. The
+# sync->async seam is an engineering choice (the read loop cannot await the order seam): a sync
+# detector + an intent queue + an async dispatch_live_exit, mirroring dispatch_entry.
+
+
+class ExitDispatchOutcome(Enum):
+    """The terminal state of one dispatch_live_exit run (for the driver + tests)."""
+
+    DISPATCHED = "dispatched"               # cancel confirmed -> market close out (reason stamped)
+    SKIPPED_IN_FLIGHT = "skipped_in_flight"  # the double-dispatch guard fired (exit already in flight)
+    NO_POSITION = "no_position"             # the intent's symbol had no open position (already closed)
+    HELD_PAIR_STATUS = "held_pair_status"   # AR-040 precondition: cancel_only / maintenance -> HOLD
+    HELD_AMBIGUOUS = "held_ambiguous"       # I-6 2nd cancel timeout, state unknown -> HOLD + alert
+    HELD_MPP_EXHAUSTED = "held_mpp_exhausted"  # C-1: all mpp_retry_count IOC retries rejected -> HOLD
+
+
+@dataclass(frozen=True)
+class LiveExitIntent:
+    """A detected live exit awaiting async dispatch (the sync detector enqueues it). Carries the
+    side (the close direction mirror), the reason/trigger (stamped onto the executions TRADE_CLOSE),
+    the realizable bbo bound for the C-1 MPP retry (ar:AR-048: bid for a long, ask for a short), and
+    the ar:AR-040 pair status for the L1a Step-1 precondition (ONLINE until the live instrument-
+    status channel lands - a later slice)."""
+
+    symbol: str
+    side: PositionSide
+    exit_reason: str
+    trigger: str
+    layer: str
+    best_quote: object | None = None
+    pair_status: PairStatus = PairStatus.ONLINE
+
+
+@dataclass(frozen=True)
+class LiveExitDetected:
+    """LIVE_EXIT_DETECTED [HIGH] - the sync detector enqueued a TothBot-dispatched live exit intent
+    (the sec-12.5 step-3 detection event for the live flow). The async driver runs the cancel-then-
+    sell next; the close itself emits evt:TRADE_CLOSE off the executions confirm fill."""
+
+    symbol: str
+    exit_reason: str
+    trigger: str
+    code: str = field(default="LIVE_EXIT_DETECTED", init=False)
+
+
+@dataclass(frozen=True)
+class LiveExitDispatched:
+    """LIVE_EXIT_DISPATCHED [INFO] - the SEQUENCE-CRITICAL cancel-then-sell completed: the emergSL
+    cancel confirmed and the market close (or its C-1 IOC retry) is out, with the reason stamped via
+    note_live_exit_dispatch so the executions close fill carries it onto the TRADE_CLOSE."""
+
+    symbol: str
+    exit_reason: str
+    code: str = field(default="LIVE_EXIT_DISPATCHED", init=False)
+
+
+@dataclass(frozen=True)
+class LiveExitDoubleDispatchSkipped:
+    """LIVE_EXIT_DOUBLE_DISPATCH_SKIPPED [WARNING] - a dispatch was requested for a symbol that
+    already has an exit in flight (a reason stamped) or HELD; skipped to avoid a double cancel/sell.
+    Surfaced, never a silent drop."""
+
+    symbol: str
+    code: str = field(default="LIVE_EXIT_DOUBLE_DISPATCH_SKIPPED", init=False)
+
+
+@dataclass(frozen=True)
+class CancelAckTimeout:
+    """CANCEL_ACK_TIMEOUT [WARNING] (I-6) - a cancel_order ACK did not arrive within param:cancel_
+    timeout_window; the req_id registry logs it before the executions-channel state check (attempt 1
+    -> retry once; attempt 2 -> the ambiguous-state HOLD). q5_logs: "cancel-ACK timeout events
+    logged via req_id registry"."""
+
+    symbol: str
+    cl_ord_id: str
+    attempt: int
+    code: str = field(default="CANCEL_ACK_TIMEOUT", init=False)
+
+
+@dataclass(frozen=True)
+class LiveExitHeldAmbiguous:
+    """LIVE_EXIT_HELD_AMBIGUOUS [CRITICAL] (I-6) - the cancel ACK timed out TWICE and the executions
+    channel could not confirm the cancel, so the order state is AMBIGUOUS: the position is HELD, the
+    operator alerted, and NO market sell is issued ("NEVER market sell with ambiguous order state").
+    The resting emergSL may still be live - it is the only protection until the operator clears."""
+
+    symbol: str
+    cl_ord_id: str
+    code: str = field(default="LIVE_EXIT_HELD_AMBIGUOUS", init=False)
+
+
+@dataclass(frozen=True)
+class MppRejectRetry:
+    """MPP_REJECT_RETRY [WARNING] (C-1) - the market close rejected on a wide spread (Kraken Max-
+    Price-Protection); retrying with a marketable IOC limit at best_bid -/+ 0.2%*attempt (the n-th
+    of up to param:mpp_retry_count attempts)."""
+
+    symbol: str
+    attempt: int
+    code: str = field(default="MPP_REJECT_RETRY", init=False)
+
+
+@dataclass(frozen=True)
+class LiveExitMppExhausted:
+    """LIVE_EXIT_MPP_EXHAUSTED [CRITICAL] (C-1) - the market close and all param:mpp_retry_count IOC
+    retries rejected; the position is HELD and the operator alerted (the emergSL was already
+    cancelled, so the position is unprotected until the operator intervenes)."""
+
+    symbol: str
+    code: str = field(default="LIVE_EXIT_MPP_EXHAUSTED", init=False)
+
+
 # Default paper wallet seed (decision:D-05): $5,000 each for the Long + Short module
 # wallets. Sourced from the registry (the two seeds are equal); the per-module assembler
 # passes the wallet's own seed explicitly when it constructs each module's WSManager.
@@ -153,6 +283,8 @@ class WSManager:
         now_monotonic: MonotonicClock | None = None,
         now_utc: UtcClock | None = None,
         exit_semaphore: object | None = None,
+        cancel_ack_wait: "CancelAckWait | None" = None,
+        market_rejected: "MarketRejectedProbe | None" = None,
     ) -> None:
         self._mode = mode  # frozen for process lifetime (rule:HR-WM-021)
         self._on_event = on_event
@@ -192,6 +324,27 @@ class WSManager:
         # 006), retained per symbol for the close net-P&L (the synthetic ledger is paper-only).
         self._pending_exit_reason: dict[str, str] = {}
         self._live_fees_entry: dict[str, Decimal] = {}
+        # LIVE EXIT DETECTION -> MARKET-SELL DISPATCH (sec 3 Image3 / sec 4.1). _live_exit_intents:
+        # the sync-detector -> async-driver queue (the read loop enqueues; drive_live_exits drains).
+        # _live_exit_held: symbols HELD after an I-6 ambiguous-state 2nd cancel timeout or a C-1
+        # MPP-exhaustion - re-dispatch is suppressed until the operator clears (clear_live_exit_held).
+        # _cancel_acks: the I-6 req_id registry - cl_ord_ids the executions channel confirmed cancelled
+        # (record_cancel_ack); the cancel-timeout fallback reads it for the "confirmed -> proceed" branch.
+        self._live_exit_intents: list[LiveExitIntent] = []
+        self._live_exit_held: set[str] = set()
+        self._cancel_acks: set[str] = set()
+        self._exit_seq = 0
+        # The two CIATS-owned exit params (existence canonical at mod:Exit_Controller D3; values home
+        # TB00000 sec 8 via the registry): the cancel-ACK timeout window (I-6) + the MPP retry count (C-1).
+        self._cancel_timeout_window = float(registry.value("cancel_timeout_window"))
+        self._mpp_retry_count = int(registry.value("mpp_retry_count"))
+        # The async I-6 / C-1 edges are INJECTED (the seam-style "injected async I/O body" pattern), so
+        # the cancel-then-sell driver is deterministic under test. Defaults wire the live behavior: the
+        # cancel-ACK wait polls the _cancel_acks registry up to the timeout window; the MPP-reject probe
+        # reports no rejection (the live reject-frame wiring is a later slice).
+        self._cancel_ack_wait: CancelAckWait = cancel_ack_wait or self._default_cancel_ack_wait
+        self._market_rejected: MarketRejectedProbe = market_rejected or self._default_market_rejected
+        self._cancel_ack_poll_s = 0.05
         # Per-pair ticker event_trigger mode (WS-TKR-003); a pair appears here once it has
         # carried an open position (default trades elsewhere).
         self._ticker_event_trigger: dict[str, str] = {}
@@ -431,6 +584,244 @@ class WSManager:
         # already read the heat for the TRADE_CLOSE before this clear.
         self._live_fees_entry.pop(symbol, None)
         self._mae_tracker.clear(symbol)
+        # Drop any live-exit dispatch state for the now-closed symbol: a queued intent that the close
+        # (this dispatch, or the off-book emergSL firing first) has overtaken must not later re-dispatch
+        # onto an empty symbol; the held marker + cancel-ACK registry reset for a clean reopen.
+        self._live_exit_intents = [i for i in self._live_exit_intents if i.symbol != symbol]
+        self._live_exit_held.discard(symbol)
+        self._cancel_acks.discard(_emergsl_cl_ord_id(closed_position))
+
+    # --- the LIVE EXIT DETECTION -> MARKET-SELL DISPATCH (sec 3 Image3 / sec 4.1 / sec 12.5) -------
+    # The sync read-loop handlers DETECT (handle_ticker L2 MAE / on_*_close L1a) and enqueue an
+    # INTENT; drive_live_exits (async) drains the queue and runs dispatch_live_exit per intent. The
+    # sync->async seam: a sync detector cannot await the order seam, so it hands off through the queue.
+    def record_cancel_ack(self, cl_ord_id: str) -> None:
+        """I-6 req_id registry: the executions handler records a confirmed cancel ACK for cl_ord_id
+        here when a cancel confirmation frame arrives on the executions channel. The cancel-timeout
+        fallback reads it (the default cancel-ACK wait + the "confirmed -> proceed" state check). The
+        live wire detail (the exact exec_type that confirms a cancel) is a later slice; this is the
+        surface it feeds."""
+        self._cancel_acks.add(cl_ord_id)
+
+    def clear_live_exit_held(self, symbol: str) -> None:
+        """Operator surface: clear a symbol HELD after an I-6 ambiguous-state cancel timeout or a C-1
+        MPP exhaustion, so a fresh detection can re-dispatch (the diagram's 'alert operator' terminal
+        state is resolved by hand). A no-op for a symbol that is not held."""
+        self._live_exit_held.discard(symbol)
+
+    @property
+    def live_exit_intents_pending(self) -> int:
+        """The number of detected live-exit intents awaiting async dispatch (read helper for the read
+        loop + tests)."""
+        return len(self._live_exit_intents)
+
+    def _enqueue_live_exit(self, intent: LiveExitIntent) -> None:
+        """Sync-side: queue a detected live exit for the async driver. The double-dispatch guard
+        skips a symbol that already has an exit in flight (a reason stamped), is HELD, or is already
+        queued - one exit per open position (no double cancel/sell)."""
+        symbol = intent.symbol
+        if (
+            symbol in self._pending_exit_reason
+            or symbol in self._live_exit_held
+            or any(i.symbol == symbol for i in self._live_exit_intents)
+        ):
+            return
+        self._live_exit_intents.append(intent)
+        self._emit_event(LiveExitDetected(symbol, intent.exit_reason, intent.trigger))
+
+    def _detect_and_enqueue_live_exit(
+        self, position: Position, bid: object | None, ask: object | None
+    ) -> None:
+        """LIVE ticker-bbo exit detection (sec 12.5 step 1, live). Reuses the same ar:AR-048 L2 MAE
+        detector as paper (detect_paper_exit), but ONLY the layer:L2_MAE_Threshold breach is a
+        TothBot-dispatched live exit: the layer:L3 off-book emergSL is Kraken-side (it fires
+        autonomously on the matching engine; TothBot never dispatches it). A fired L2 enqueues an
+        intent (best_quote = the realizable bbo: bid for a long, ask for a short, for the C-1 retry)."""
+        signal = detect_paper_exit(position, bid, ask)
+        if signal is None or signal.layer != "L2_MAE":
+            return
+        quote = bid if position.side is PositionSide.LONG else ask
+        self._enqueue_live_exit(
+            LiveExitIntent(
+                position.symbol, position.side, signal.exit_reason,
+                trigger="L2_MAE", layer="L2_MAE", best_quote=quote,
+            )
+        )
+
+    def _enqueue_live_regime_exit(
+        self,
+        position: Position,
+        signal: RegimeExitSignal,
+        bid: object | None,
+        ask: object | None,
+        pair_status: PairStatus,
+    ) -> None:
+        """LIVE layer:L1a regime-exit detection (the EC-L1A-001/002 mirror of the paper drive). Carries
+        the ar:AR-040 pair_status into the intent for the Step-1 precondition (checked at dispatch),
+        and the realizable bbo for the C-1 MPP retry."""
+        quote = bid if position.side is PositionSide.LONG else ask
+        self._enqueue_live_exit(
+            LiveExitIntent(
+                position.symbol, position.side, signal.exit_reason,
+                trigger=signal.trigger, layer=signal.layer,
+                best_quote=quote, pair_status=pair_status,
+            )
+        )
+
+    async def drive_live_exits(self) -> list[ExitDispatchOutcome]:
+        """Drain the live-exit intent queue, dispatching each through dispatch_live_exit. The async
+        seam driver the live read loop pumps after a batch of inbound frames: the sync detector
+        enqueues, this owns the cancel-then-sell sequence. Returns the per-intent outcomes."""
+        outcomes: list[ExitDispatchOutcome] = []
+        while self._live_exit_intents:
+            intent = self._live_exit_intents.pop(0)
+            outcomes.append(await self.dispatch_live_exit(intent))
+        return outcomes
+
+    async def dispatch_live_exit(self, intent: LiveExitIntent) -> ExitDispatchOutcome:
+        """The async live exit driver (sec 4.1 SEQUENCE CRITICAL): the AR-040 Step-1 precondition ->
+        the double-dispatch guard -> stamp the reason -> (1) cancel the off-book emergSL with the I-6
+        cancel-timeout fallback -> (2) the market close with the C-1 MPP-rejection retry -> the reason
+        already stamped carries onto the executions-confirmed TRADE_CLOSE. Mirrors dispatch_entry; the
+        actual close fill arrives later on the executions channel (record_execution -> _drive_live_
+        close). LIVE only (paper routes the ticker-detected close through on_paper_close)."""
+        symbol = intent.symbol
+        # Step-1 pair-status precondition FIRST (ar:AR-040 / rule:HR-EC-016(a)): cancel_only /
+        # maintenance -> HOLD + CRITICAL alert + NO order (the resting emergSL is the only protection).
+        # Canonically the L1a Step-1 gate; applied to every dispatch (you never cancel/sell in a pair-
+        # disruption state). For ticker-L2 the pair_status defaults ONLINE until the live instrument-
+        # status channel lands, so this is a no-op there for now.
+        if l1a_precondition_blocks(intent.pair_status):
+            self._emit_event(
+                L1aExitHeld(symbol, intent.pair_status.value, intent.exit_reason, intent.trigger)
+            )
+            return ExitDispatchOutcome.HELD_PAIR_STATUS
+        # Double-dispatch guard: a reason already stamped = an exit in flight; a held symbol awaits the
+        # operator. Skip the re-dispatch (no double cancel/sell).
+        if symbol in self._pending_exit_reason or symbol in self._live_exit_held:
+            self._emit_event(LiveExitDoubleDispatchSkipped(symbol))
+            return ExitDispatchOutcome.SKIPPED_IN_FLIGHT
+        position = self.positions.get(symbol)
+        if position is None:
+            # The symbol closed (the emergSL fired first, or a manual close) between detection and
+            # dispatch - nothing to close. Surfaced, never a silent drop.
+            self._emit_event(LiveExitDoubleDispatchSkipped(symbol))
+            return ExitDispatchOutcome.NO_POSITION
+        # Stamp the reason NOW: it is BOTH the in-flight marker (the guard above) AND the reason the
+        # executions close fill carries onto the 25-field TRADE_CLOSE (note_live_exit_dispatch).
+        self.note_live_exit_dispatch(symbol, intent.exit_reason)
+        side = position.side
+        emergsl_cl_ord_id = _emergsl_cl_ord_id(position)
+        deadline = self._dispatch_deadline()
+        # (1) SEQUENCE CRITICAL: cancel the resting off-book emergSL and CONFIRM it (I-6) before any
+        # sell - a close fill must never race a still-resting stop into a double exit.
+        confirmed = await self._cancel_emergsl_with_i6(symbol, emergsl_cl_ord_id, deadline)
+        if not confirmed:
+            # I-6 2nd timeout, state unknown -> ambiguous order state: HOLD + alert operator, issue NO
+            # market sell. Release the in-flight stamp (no exit went out, so a later emergSL fire is the
+            # EMERGENCY_SL_FIRED backstop, not this reason) and mark the symbol HELD (operator clears).
+            self._pending_exit_reason.pop(symbol, None)
+            self._live_exit_held.add(symbol)
+            self._emit_event(LiveExitHeldAmbiguous(symbol, emergsl_cl_ord_id))
+            return ExitDispatchOutcome.HELD_AMBIGUOUS
+        # (2) the market close, with the C-1 MPP-rejection retry.
+        sold = await self._dispatch_market_sell_with_mpp_retry(
+            symbol, side, position.qty, intent.best_quote, deadline
+        )
+        if not sold:
+            # C-1: the market close + all mpp_retry_count IOC retries rejected. The emergSL is already
+            # cancelled, so the position is unprotected -> HOLD + alert operator. Release the stamp.
+            self._pending_exit_reason.pop(symbol, None)
+            self._live_exit_held.add(symbol)
+            self._emit_event(LiveExitMppExhausted(symbol))
+            return ExitDispatchOutcome.HELD_MPP_EXHAUSTED
+        self._emit_event(LiveExitDispatched(symbol, intent.exit_reason))
+        return ExitDispatchOutcome.DISPATCHED
+
+    async def _cancel_emergsl_with_i6(
+        self, symbol: str, cl_ord_id: str, deadline: str
+    ) -> bool:
+        """Step (1) of the cancel-then-sell with the I-6 cancel-timeout fallback (sec 4.1): send the
+        cancel, await the ACK up to param:cancel_timeout_window; on timeout check the executions
+        channel state (confirmed -> proceed; unknown -> retry ONCE); on a 2nd timeout still unknown
+        return False (the caller HOLDs - NEVER a market sell with ambiguous order state). True = the
+        emergSL cancel is confirmed and the market sell may proceed."""
+        timeout = self._cancel_timeout_window
+        for attempt in (1, 2):
+            await self.seam.cancel_order(
+                build_cancel_order(symbol, cl_ord_id=cl_ord_id, deadline=deadline)
+            )
+            if await self._cancel_ack_wait(cl_ord_id, timeout):
+                return True
+            self._emit_event(CancelAckTimeout(symbol, cl_ord_id, attempt))
+            # timeout -> check the executions channel: confirmed-cancelled proceeds even without the ACK.
+            if cl_ord_id in self._cancel_acks:
+                return True
+            # attempt 1: state unknown -> retry the cancel once (loop). attempt 2: fall through to HOLD.
+        return False
+
+    async def _dispatch_market_sell_with_mpp_retry(
+        self,
+        symbol: str,
+        side: PositionSide,
+        qty: object,
+        best_quote: object | None,
+        deadline: str,
+    ) -> bool:
+        """Step (2): the market close, with the C-1 MPP-rejection retry. Sends the whole-position
+        market order; if Kraken rejects it (MPP on a wide spread) retries up to param:mpp_retry_count
+        marketable IOC limits walked out by 0.2%*attempt (best_bid - for a long sell, best_ask + for a
+        short buy-to-cover). True = a close order was accepted (the executions fill confirms the close);
+        False = every attempt rejected (the caller HOLDs + alerts)."""
+        market = build_market_sell_order(
+            symbol, side, order_qty=qty, cl_ord_id=self._exit_cl_ord_id(symbol, 0), deadline=deadline
+        )
+        await self.seam.dispatch_market_sell(market)
+        if not await self._market_rejected(market):
+            return True
+        # C-1 MPP rejection. The IOC retry needs the realizable bbo to price the marketable limit; with
+        # no quote it cannot retry safely.
+        if best_quote is None:
+            return False
+        for attempt in range(1, self._mpp_retry_count + 1):
+            self._emit_event(MppRejectRetry(symbol, attempt))
+            limit_price = mpp_retry_limit_price(side, best_quote, attempt)
+            retry = build_mpp_retry_order(
+                symbol, side, order_qty=qty, limit_price=limit_price,
+                cl_ord_id=self._exit_cl_ord_id(symbol, attempt), deadline=deadline,
+            )
+            await self.seam.dispatch_market_sell(retry)
+            if not await self._market_rejected(retry):
+                return True
+        return False
+
+    def _exit_cl_ord_id(self, symbol: str, attempt: int) -> str:
+        """A unique client order id for an exit order (the market close attempt 0, then the mpp{n}
+        IOC retries). Monotonic per WSManager so a retry never collides with the original."""
+        self._exit_seq += 1
+        tag = "exit" if attempt == 0 else f"mpp{attempt}"
+        return f"{symbol}-{tag}-{self._exit_seq}"
+
+    def _dispatch_deadline(self) -> str:
+        """The A-2 deadline:now+5s for an outbound exit order (the same 5s window as the entry)."""
+        return (self._now_utc() + timedelta(seconds=5)).isoformat()
+
+    async def _default_cancel_ack_wait(self, cl_ord_id: str, timeout: float) -> bool:
+        """Default I-6 cancel-ACK wait (live): poll the _cancel_acks registry up to the timeout window
+        (the monotonic clock is injected, so the window is honored deterministically). Tests inject a
+        stub for fully deterministic timing. True = the ACK arrived within the window."""
+        deadline = self._now_monotonic() + timeout
+        while cl_ord_id not in self._cancel_acks:
+            if self._now_monotonic() >= deadline:
+                return cl_ord_id in self._cancel_acks
+            await asyncio.sleep(self._cancel_ack_poll_s)
+        return True
+
+    async def _default_market_rejected(self, message: dict) -> bool:
+        """Default C-1 MPP-reject probe: report no rejection (the live reject-frame wiring - reading a
+        Kraken add_order error/reject response - is a later slice). Tests inject a stub to drive the
+        C-1 retry path."""
+        return False
 
     def restore_position_mirror(
         self, snap_orders: Sequence[Mapping[str, object]]
@@ -660,9 +1051,10 @@ class WSManager:
     def handle_ticker(self, frame: Mapping[str, object]) -> None:
         """Ticker-channel handler (D1 WS-TKR-002 event_trigger:bbo for open-position pairs).
         BOTH modes mark the max-over-life MAE (the live MTM marking of open positions) so the close
-        reads true worst-over-the-hold heat. PAPER additionally runs the ticker-bbo exit DETECTION
-        (ar:AR-048) and routes any fired exit through the sec-12.5 close; the LIVE exit is executions-
-        driven (the detection -> market-sell dispatch is the async-seam slice), so live only marks."""
+        reads true worst-over-the-hold heat. Then each mode runs the ticker-bbo L2 MAE DETECTION
+        (ar:AR-048): PAPER routes the fired exit through the sec-12.5 synthetic close (on_paper_close);
+        LIVE enqueues a market-sell exit INTENT the async drive_live_exits driver dispatches (the sync
+        read loop cannot await the order seam). The layer:L3 off-book emergSL is Kraken-side in both."""
         for entry in _ticker_entries(frame):
             symbol = _opt_str(entry.get("symbol"))
             if symbol is None:
@@ -672,15 +1064,17 @@ class WSManager:
                 continue
             # Mark the max-over-life MAE on EVERY ticker in BOTH modes - the heat the close reads. In
             # live this feeds the executions-confirmed TRADE_CLOSE mae_pct_reached (sec 12.5 LIVE FLOW)
-            # the same as paper: true worst-over-the-hold excursion, not the at-exit fallback.
+            # the same as paper: true worst-over-the-hold excursion, not the at-exit fallback. Mark
+            # FIRST (incl. the breaching tick) so the running max captures the tick that fires the exit.
             self._mae_tracker.mark(position, entry.get("bid"), entry.get("ask"))
-            # Exit DETECTION + close routing is PAPER-mode (the synthetic ticker-bbo exit); mark FIRST
-            # (incl. the breaching tick) so the running max captures the final tick that fires the close.
-            if not self.is_paper:
-                continue
-            signal = detect_paper_exit(position, entry.get("bid"), entry.get("ask"))
-            if signal is not None:
-                self._drive_paper_exit(position, signal)
+            if self.is_paper:
+                signal = detect_paper_exit(position, entry.get("bid"), entry.get("ask"))
+                if signal is not None:
+                    self._drive_paper_exit(position, signal)
+            else:
+                # LIVE: detect the L2 MAE on the ticker bbo and ENQUEUE the market-sell intent; the
+                # async driver owns the cancel-then-sell (the L3 emergSL fires Kraken-side, not here).
+                self._detect_and_enqueue_live_exit(position, entry.get("bid"), entry.get("ask"))
 
     def _drive_paper_exit(self, position: Position, signal) -> None:
         """The sec-12.5 paper EXIT FLOW for one detected condition: (2) apply the synthetic
@@ -722,19 +1116,21 @@ class WSManager:
     ) -> None:
         """EC-L1A-002 Daily Regime Downgrade (ar:AR-062): run the L1a daily-downgrade check on
         a fresh mod:Regime_Engine classification for an open-position pair, immediately after
-        the 00:00 UTC compute_regime. Paper-mode close routing; a no-op in live (exit detection
-        is executions-driven there, a later slice). bid/ask are the realizable market-sell fill
-        prices (ar:AR-048: bid for a long, ask for a short), supplied from the latest ticker by
-        the daily-compute orchestrator (path C); pair_status feeds the rule:HR-EC-016(a)
-        Step-1 precondition (the live instrument-status channel is a later slice)."""
-        if not self.is_paper:
-            return
+        the 00:00 UTC compute_regime. PAPER routes the fired downgrade through the sec-12.5 synthetic
+        close; LIVE enqueues an L1a market-sell intent the async driver dispatches (cancel emergSL ->
+        market sell). bid/ask are the realizable market-sell fill prices (ar:AR-048: bid for a long,
+        ask for a short), supplied from the latest ticker by the daily-compute orchestrator (path C);
+        pair_status feeds the rule:HR-EC-016(a) Step-1 precondition (checked at dispatch in live)."""
         position = self.positions.get(symbol)
         if position is None:
             return
         signal = detect_daily_regime_downgrade(position, classification)
-        if signal is not None:
+        if signal is None:
+            return
+        if self.is_paper:
             self._drive_regime_exit(position, signal, bid, ask, pair_status)
+        else:
+            self._enqueue_live_regime_exit(position, signal, bid, ask, pair_status)
 
     def on_htf_ohlc_close(
         self,
@@ -748,16 +1144,19 @@ class WSManager:
     ) -> None:
         """EC-L1A-001 HTF Regime Reversal (ar:AR-062): run the L1a 1H-EMA-reversal check on
         every 1H ohlc(60) close for an open-position pair. htf_ema_short / htf_ema_long are the
-        current 1H EMA(20) / EMA(50). Paper-mode close routing; a no-op in live. bid/ask +
+        current 1H EMA(20) / EMA(50). PAPER routes the fired reversal through the sec-12.5 synthetic
+        close; LIVE enqueues an L1a market-sell intent the async driver dispatches. bid/ask +
         pair_status as on_regime_classified."""
-        if not self.is_paper:
-            return
         position = self.positions.get(symbol)
         if position is None:
             return
         signal = detect_htf_regime_reversal(position, htf_ema_short, htf_ema_long)
-        if signal is not None:
+        if signal is None:
+            return
+        if self.is_paper:
             self._drive_regime_exit(position, signal, bid, ask, pair_status)
+        else:
+            self._enqueue_live_regime_exit(position, signal, bid, ask, pair_status)
 
     def _drive_regime_exit(
         self,
@@ -865,6 +1264,18 @@ def _ticker_entries(frame: Mapping[str, object]) -> list[Mapping[str, object]]:
 
 def _opt_str(value: object) -> str | None:
     return None if value is None else str(value)
+
+
+def _emergsl_cl_ord_id(position: Position) -> str:
+    """The cl_ord_id of the resting off-book emergSL leg for build_cancel_order. Prefers the
+    position's recorded emergsl_id (the AR-054 ON-FILL batch_add leg); falls back to the entry
+    cl_ord_id with the '-sl' suffix dispatch_entry stamps on the emergSL leg, else a symbol-derived
+    id so the cancel always carries a client id."""
+    if position.emergsl_id is not None:
+        return position.emergsl_id
+    if position.cl_ord_id is not None:
+        return f"{position.cl_ord_id}-sl"
+    return f"{position.symbol}-sl"
 
 
 def _frame_fee(event: Mapping[str, object]) -> Decimal:

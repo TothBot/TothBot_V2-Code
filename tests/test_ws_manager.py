@@ -49,11 +49,26 @@ from tothbot.exchange.regime_exit import (
 from tothbot.regime.engine import classify_from_indicators
 from tothbot.regime.taxonomy import Regime
 from tothbot.exchange.ws_manager import (
+    CancelAckTimeout,
+    ExitDispatchOutcome,
+    LiveExitDetected,
+    LiveExitDispatched,
+    LiveExitDoubleDispatchSkipped,
+    LiveExitHeldAmbiguous,
+    LiveExitIntent,
+    LiveExitMppExhausted,
+    MppRejectRetry,
     SelectionStateUpdated,
     TickerTriggerSwitched,
     WSManager,
 )
 from tothbot.execution.exit_controller import ExitReason, PaperCloseSkipped, TradeClose
+from tothbot.execution.exit_dispatch import (
+    build_cancel_order,
+    build_market_sell_order,
+    build_mpp_retry_order,
+    mpp_retry_limit_price,
+)
 
 
 # -- connection: endpoints + invariants ---------------------------------
@@ -621,13 +636,14 @@ def test_non_adverse_ticker_leaves_position_open():
     assert m.has_position("BTC/USD")
 
 
-def test_handle_ticker_is_noop_in_live_mode():
-    # handle_ticker is the PAPER ticker-bbo detection path; live exit detection is executions-driven
-    # (sec 12.5 LIVE FLOW), so the ticker handler stays inert in live (no close, no emit, no raise).
-    closes: list = []
-    m = WSManager(Mode.LIVE, on_event=closes.append)
+def test_handle_ticker_no_open_position_is_inert_in_live():
+    # handle_ticker over a symbol with NO open position is inert in live (nothing to mark, nothing to
+    # detect/enqueue) - the live exit path only engages an open position.
+    events: list = []
+    m = WSManager(Mode.LIVE, on_event=events.append)
     m.handle_ticker(_ticker("BTC/USD", "1", "2"))
-    assert not any(isinstance(e, TradeClose) for e in closes)
+    assert not any(isinstance(e, (TradeClose, LiveExitDetected)) for e in events)
+    assert m.live_exit_intents_pending == 0
 
 
 def test_release_exit_semaphore_guarded_when_none():
@@ -758,14 +774,15 @@ def test_l1a_no_open_position_is_noop():
     assert not any(isinstance(e, (TradeClose, PaperRegimeExitDetected)) for e in events)
 
 
-def test_l1a_is_noop_in_live_mode():
-    # the L1a regime-exit handlers are PAPER detection paths (live L1a is executions-driven); they
-    # must stay inert in live - no close, no TRADE_CLOSE emit, no raise.
-    closes: list = []
-    m = WSManager(Mode.LIVE, on_event=closes.append)
+def test_l1a_no_open_position_is_inert_in_live():
+    # the L1a regime-exit handlers over a symbol with NO open position are inert in live (no detect,
+    # no enqueue, no close, no raise) - the live L1a path only engages an open position.
+    events: list = []
+    m = WSManager(Mode.LIVE, on_event=events.append)
     m.on_regime_classified("BTC/USD", _trending_neg(), bid="61000", ask="61100")
     m.on_htf_ohlc_close("BTC/USD", "99", "100", bid="61000", ask="61100")
-    assert not any(isinstance(e, TradeClose) for e in closes)
+    assert not any(isinstance(e, (TradeClose, LiveExitDetected)) for e in events)
+    assert m.live_exit_intents_pending == 0
 
 
 # -- WS_Manager LIVE EXIT lifecycle (sec 12.5 LIVE FLOW: executions close -> TRADE_CLOSE) ----
@@ -875,15 +892,15 @@ def test_live_short_close_mirror():
     assert not m.dispatch_semaphore_locked(PositionSide.SHORT)
 
 
-def test_live_handle_ticker_marks_mae_without_detecting_an_exit():
+def test_live_handle_ticker_marks_mae_and_a_benign_tick_enqueues_nothing():
     # the live MTM marking: handle_ticker marks the max-over-life MAE for an open position in LIVE
-    # (the heat the close reads), but runs NO exit detection (live exit is executions-driven), so the
-    # position stays open even on a deeply adverse tick.
+    # (the heat the close reads). A non-breaching tick enqueues NO exit and the position stays open.
     m = WSManager(Mode.LIVE)
-    _open_live_long(m)
-    m.handle_ticker(_ticker("BTC/USD", "57000", "57100"))  # bid 57000: (60000-57000)/60000 = 0.05
-    assert m.has_position("BTC/USD")                        # NO live exit detection - still open
-    assert m.mae_pct_high_for("BTC/USD") == Decimal("0.05")
+    _open_live_long(m)                                      # atr 2000 -> L2 threshold 3000
+    m.handle_ticker(_ticker("BTC/USD", "57500", "57600"))  # mae (60000-57500)=2500 < 3000 -> no breach
+    assert m.has_position("BTC/USD")
+    assert m.live_exit_intents_pending == 0                 # below threshold -> no intent
+    assert m.mae_pct_high_for("BTC/USD") == Decimal(str(Decimal("2500") / Decimal("60000")))
 
 
 def test_live_close_carries_max_over_life_heat_from_ticker_marking():
@@ -901,6 +918,272 @@ def test_live_close_carries_max_over_life_heat_from_ticker_marking():
     assert len(tc) == 1 and tc[0].mae_pct_reached == Decimal("0.05")
     # the close drops the heat tracking - a reopened symbol starts fresh.
     assert m.mae_pct_high_for("BTC/USD") is None
+
+
+# -- LIVE EXIT DETECTION -> MARKET-SELL DISPATCH (sec 3 Image3 / sec 4.1 / sec 12.5) ----------
+
+def _live_manager(**kw):
+    """A LIVE WSManager with an injected live_sender capturing every (op, message) to Kraken."""
+    sent: list = []
+    events: list = []
+
+    async def _live(op, message):
+        sent.append((op, message))
+
+    mgr = WSManager(Mode.LIVE, live_sender=_live, on_event=events.append, **kw)
+    return mgr, sent, events
+
+
+def _open_live_short(m, *, atr="2000", emergsl="66000", fee="7.8"):
+    """Open a BTC/USD SHORT in LIVE via the executions channel: a sell-to-open margin fill carrying
+    the entry-time D6 snapshot (emergSL ABOVE entry) + the actual taker entry fee."""
+    m.record_execution(
+        {"exec_type": "filled", "symbol": "BTC/USD", "side": "sell",
+         "cum_qty": "0.05", "avg_price": "60000", "cl_ord_id": "cl-s1", "fee": fee},
+        regime_at_entry="TRENDING_NEG_NORMAL", atr_14_entry=atr, emergsl_price=emergsl,
+    )
+
+
+async def _always_ack(cl_ord_id, timeout):
+    return True
+
+
+async def _always_timeout(cl_ord_id, timeout):
+    return False
+
+
+# --- the pure exit-order builders (exit_dispatch.py) ---
+
+def test_build_market_sell_order_long_is_spot_market_sell():
+    msg = build_market_sell_order(
+        "BTC/USD", PositionSide.LONG, order_qty=Decimal("0.05"), cl_ord_id="x", deadline="d"
+    )
+    p = msg["params"]
+    assert msg["method"] == "add_order"
+    assert p["side"] == "sell" and p["order_type"] == "market" and p["order_qty"] == "0.05"
+    assert p["stp_type"] == "cancel_newest"
+    assert "margin" not in p and "reduce_only" not in p   # spot LONG sell carries neither (ar:AR-009)
+
+
+def test_build_market_sell_order_short_is_margin_buy_to_cover_reduce_only():
+    msg = build_market_sell_order(
+        "BTC/USD", PositionSide.SHORT, order_qty=Decimal("0.05"), cl_ord_id="x", deadline="d"
+    )
+    p = msg["params"]
+    assert p["side"] == "buy" and p["order_type"] == "market"   # SHORT buys to cover
+    assert p["margin"] is True and p["reduce_only"] is True     # ar:AR-009 closes the margin short only
+
+
+def test_build_cancel_order_targets_the_emergsl_cl_ord_id():
+    msg = build_cancel_order("BTC/USD", cl_ord_id="cl-1-sl", deadline="d")
+    assert msg["method"] == "cancel_order"
+    assert msg["params"]["cl_ord_id"] == "cl-1-sl" and msg["params"]["symbol"] == "BTC/USD"
+
+
+def test_mpp_retry_limit_price_walks_out_by_the_diagram_increment():
+    # LONG sell walks DOWN from best_bid by 0.2%*n; SHORT buy-to-cover walks UP from best_ask.
+    assert mpp_retry_limit_price(PositionSide.LONG, "57000", 1) == Decimal("57000") * Decimal("0.998")
+    assert mpp_retry_limit_price(PositionSide.SHORT, "57000", 2) == Decimal("57000") * Decimal("1.004")
+
+
+def test_build_mpp_retry_order_is_a_marketable_ioc_limit():
+    msg = build_mpp_retry_order(
+        "BTC/USD", PositionSide.LONG, order_qty=Decimal("0.05"),
+        limit_price=Decimal("56886"), cl_ord_id="x", deadline="d",
+    )
+    p = msg["params"]
+    assert p["order_type"] == "limit" and p["time_in_force"] == "ioc"
+    assert p["side"] == "sell" and p["limit_price"] == "56886"
+
+
+# --- the sync detection -> intent enqueue ---
+
+def test_live_ticker_l2_breach_enqueues_a_market_sell_intent():
+    mgr, sent, events = _live_manager()
+    _open_live_long(mgr)                                       # atr 2000 -> L2 threshold 3000
+    mgr.handle_ticker(_ticker("BTC/USD", "57000", "57100"))   # (60000-57000)=3000 >= 3000 breach
+    assert mgr.live_exit_intents_pending == 1
+    det = [e for e in events if isinstance(e, LiveExitDetected)]
+    assert len(det) == 1 and det[0].exit_reason == "MAE_THRESHOLD_BREACH"
+
+
+def test_live_l3_emergsl_touch_is_not_tothbot_dispatched():
+    # the off-book layer:L3 emergSL fires Kraken-side (autonomously on the matching engine); TothBot
+    # dispatches NO exit for it. A position with no L2 context (atr=None) only detects the L3 touch.
+    mgr, sent, events = _live_manager()
+    _open_live_long(mgr, atr=None)                            # no atr -> only the emergSL touch detects
+    mgr.handle_ticker(_ticker("BTC/USD", "53000", "53100"))  # bid 53000 <= emergsl 54000 -> L3 touch
+    assert mgr.live_exit_intents_pending == 0
+    assert not any(isinstance(e, LiveExitDetected) for e in events)
+
+
+def test_live_double_enqueue_is_guarded():
+    mgr, sent, events = _live_manager()
+    _open_live_long(mgr)
+    mgr.handle_ticker(_ticker("BTC/USD", "57000", "57100"))
+    mgr.handle_ticker(_ticker("BTC/USD", "56000", "56100"))   # a second, deeper breach
+    assert mgr.live_exit_intents_pending == 1                 # one open position -> one queued intent
+
+
+def test_live_l1a_htf_reversal_enqueues_an_intent():
+    mgr, sent, events = _live_manager()
+    _open_live_long(mgr)
+    mgr.on_htf_ohlc_close("BTC/USD", "99", "100", bid="61000", ask="61100")  # EMA20 < EMA50
+    assert mgr.live_exit_intents_pending == 1
+    det = [e for e in events if isinstance(e, LiveExitDetected)]
+    assert len(det) == 1 and det[0].trigger == "EC-L1A-001"
+
+
+# --- the async cancel-then-sell driver ---
+
+def test_live_exit_dispatch_cancel_then_market_sell_happy_path():
+    mgr, sent, events = _live_manager(cancel_ack_wait=_always_ack)
+    _open_live_long(mgr)
+    mgr.handle_ticker(_ticker("BTC/USD", "57000", "57100"))
+    outcomes = asyncio.run(mgr.drive_live_exits())
+    assert outcomes == [ExitDispatchOutcome.DISPATCHED]
+    # SEQUENCE CRITICAL: the emergSL cancel_order THEN the market close (never the reverse).
+    assert [op for op, _ in sent] == [OutboundOp.CANCEL_ORDER, OutboundOp.DISPATCH_MARKET_SELL]
+    cancel_msg, sell_msg = sent[0][1], sent[1][1]
+    assert cancel_msg["method"] == "cancel_order" and cancel_msg["params"]["cl_ord_id"] == "cl-1-sl"
+    assert sell_msg["params"]["order_type"] == "market" and sell_msg["params"]["side"] == "sell"
+    # the reason is stamped so the executions close fill carries it onto the TRADE_CLOSE.
+    assert mgr._pending_exit_reason["BTC/USD"] == ExitReason.MAE_THRESHOLD_BREACH.value
+    assert any(isinstance(e, LiveExitDispatched) for e in events)
+
+
+def test_live_exit_dispatch_then_executions_close_carries_the_reason():
+    mgr, sent, events = _live_manager(cancel_ack_wait=_always_ack)
+    _open_live_long(mgr)
+    mgr.handle_ticker(_ticker("BTC/USD", "57000", "57100"))
+    asyncio.run(mgr.drive_live_exits())
+    # the close fill arrives on the executions channel and carries the stamped reason (not the
+    # EMERGENCY_SL_FIRED default) onto the 25-field TRADE_CLOSE.
+    mgr.record_execution(
+        {"exec_type": "filled", "symbol": "BTC/USD", "side": "sell",
+         "cum_qty": "0.05", "avg_price": "57000", "fee": "7.4"}
+    )
+    tc = [e for e in events if isinstance(e, TradeClose)]
+    assert len(tc) == 1 and tc[0].exit_reason is ExitReason.MAE_THRESHOLD_BREACH
+    # the close cleared the in-flight state (no leak across trades).
+    assert "BTC/USD" not in mgr._pending_exit_reason
+    assert mgr.live_exit_intents_pending == 0
+
+
+def test_live_short_exit_dispatch_is_a_margin_buy_to_cover():
+    mgr, sent, events = _live_manager(cancel_ack_wait=_always_ack)
+    _open_live_short(mgr)                                     # entry 60000, emergSL 66000
+    mgr.handle_ticker(_ticker("BTC/USD", "62900", "63000"))  # ask 63000: (63000-60000)=3000 >= 3000
+    assert mgr.live_exit_intents_pending == 1
+    outcomes = asyncio.run(mgr.drive_live_exits())
+    assert outcomes == [ExitDispatchOutcome.DISPATCHED]
+    sell = [m for op, m in sent if op is OutboundOp.DISPATCH_MARKET_SELL][0]
+    assert sell["params"]["side"] == "buy" and sell["params"]["reduce_only"] is True
+    assert mgr._pending_exit_reason["BTC/USD"] == ExitReason.MAE_THRESHOLD_BREACH.value
+
+
+def test_live_exit_dispatch_guard_skips_when_an_exit_is_already_in_flight():
+    mgr, sent, events = _live_manager()
+    _open_live_long(mgr)
+    mgr.note_live_exit_dispatch("BTC/USD", ExitReason.MAE_THRESHOLD_BREACH.value)  # already in flight
+    intent = LiveExitIntent(
+        "BTC/USD", PositionSide.LONG, "MAE_THRESHOLD_BREACH", "L2_MAE", "L2_MAE", best_quote="57000"
+    )
+    outcome = asyncio.run(mgr.dispatch_live_exit(intent))
+    assert outcome is ExitDispatchOutcome.SKIPPED_IN_FLIGHT
+    assert sent == []                                        # no second cancel / sell
+    assert any(isinstance(e, LiveExitDoubleDispatchSkipped) for e in events)
+
+
+# --- the I-6 cancel-timeout fallback ---
+
+def test_live_exit_i6_cancel_timeout_confirmed_by_executions_proceeds():
+    mgr, sent, events = _live_manager(cancel_ack_wait=_always_timeout)
+    _open_live_long(mgr)
+    mgr.record_cancel_ack("cl-1-sl")                         # the executions channel confirms the cancel
+    mgr.handle_ticker(_ticker("BTC/USD", "57000", "57100"))
+    outcomes = asyncio.run(mgr.drive_live_exits())
+    assert outcomes == [ExitDispatchOutcome.DISPATCHED]      # proceeded despite the ACK timeout
+    assert any(isinstance(e, CancelAckTimeout) and e.attempt == 1 for e in events)
+    assert OutboundOp.DISPATCH_MARKET_SELL in [op for op, _ in sent]
+
+
+def test_live_exit_i6_second_timeout_holds_ambiguous_and_never_sells():
+    mgr, sent, events = _live_manager(cancel_ack_wait=_always_timeout)
+    _open_live_long(mgr)
+    mgr.handle_ticker(_ticker("BTC/USD", "57000", "57100"))
+    outcomes = asyncio.run(mgr.drive_live_exits())
+    assert outcomes == [ExitDispatchOutcome.HELD_AMBIGUOUS]
+    # two cancel attempts, NO market sell ("NEVER market sell with ambiguous order state").
+    assert [op for op, _ in sent] == [OutboundOp.CANCEL_ORDER, OutboundOp.CANCEL_ORDER]
+    assert OutboundOp.DISPATCH_MARKET_SELL not in [op for op, _ in sent]
+    assert [e.attempt for e in events if isinstance(e, CancelAckTimeout)] == [1, 2]
+    assert any(isinstance(e, LiveExitHeldAmbiguous) for e in events)
+    # held -> the in-flight stamp released + the symbol suppressed from re-dispatch (operator clears).
+    assert "BTC/USD" not in mgr._pending_exit_reason
+    mgr.handle_ticker(_ticker("BTC/USD", "57000", "57100"))
+    assert mgr.live_exit_intents_pending == 0
+    # the operator clears the HOLD and a fresh detection can re-engage.
+    mgr.clear_live_exit_held("BTC/USD")
+    mgr.handle_ticker(_ticker("BTC/USD", "57000", "57100"))
+    assert mgr.live_exit_intents_pending == 1
+
+
+# --- the C-1 MPP-rejection retry ---
+
+def test_live_exit_c1_mpp_rejection_retries_an_ioc_limit():
+    rejects = {"n": 1}
+
+    async def _reject_market_once(message):
+        if rejects["n"] > 0 and message["params"]["order_type"] == "market":
+            rejects["n"] -= 1
+            return True
+        return False
+
+    mgr, sent, events = _live_manager(cancel_ack_wait=_always_ack, market_rejected=_reject_market_once)
+    _open_live_long(mgr)
+    mgr.handle_ticker(_ticker("BTC/USD", "57000", "57100"))
+    outcomes = asyncio.run(mgr.drive_live_exits())
+    assert outcomes == [ExitDispatchOutcome.DISPATCHED]
+    sells = [m for op, m in sent if op is OutboundOp.DISPATCH_MARKET_SELL]
+    assert sells[0]["params"]["order_type"] == "market"      # the rejected market close
+    assert sells[1]["params"]["order_type"] == "limit"       # the accepted C-1 IOC retry
+    assert sells[1]["params"]["time_in_force"] == "ioc"
+    assert sells[1]["params"]["limit_price"] == str(Decimal("57000") * Decimal("0.998"))  # 0.2%*1
+    assert any(isinstance(e, MppRejectRetry) and e.attempt == 1 for e in events)
+
+
+def test_live_exit_c1_mpp_all_retries_rejected_holds_and_alerts():
+    async def _reject_all(message):
+        return True
+
+    mgr, sent, events = _live_manager(cancel_ack_wait=_always_ack, market_rejected=_reject_all)
+    _open_live_long(mgr)
+    mgr.handle_ticker(_ticker("BTC/USD", "57000", "57100"))
+    outcomes = asyncio.run(mgr.drive_live_exits())
+    assert outcomes == [ExitDispatchOutcome.HELD_MPP_EXHAUSTED]
+    # the market close + all param:mpp_retry_count (3) IOC retries were sent, all rejected.
+    sells = [m for op, m in sent if op is OutboundOp.DISPATCH_MARKET_SELL]
+    assert len(sells) == 1 + 3
+    assert any(isinstance(e, LiveExitMppExhausted) for e in events)
+    assert "BTC/USD" in mgr._live_exit_held
+
+
+# --- the AR-040 pair-status precondition (Step 1) ---
+
+def test_live_exit_ar040_pair_status_holds_before_any_order():
+    mgr, sent, events = _live_manager(cancel_ack_wait=_always_ack)
+    _open_live_long(mgr)
+    # an L1a downgrade fires, but the pair is cancel_only -> HOLD, NO cancel, NO sell (ar:AR-040).
+    mgr.on_regime_classified(
+        "BTC/USD", _trending_neg(), bid="61000", ask="61100", pair_status=PairStatus.CANCEL_ONLY
+    )
+    assert mgr.live_exit_intents_pending == 1
+    outcomes = asyncio.run(mgr.drive_live_exits())
+    assert outcomes == [ExitDispatchOutcome.HELD_PAIR_STATUS]
+    assert sent == []                                        # NOTHING transmitted (resting emergSL holds)
+    assert any(isinstance(e, L1aExitHeld) for e in events)
+    assert "BTC/USD" not in mgr._pending_exit_reason          # never stamped (no dispatch)
 
 
 # -- two independent per-module wallets (mod:Long_Module + mod:Short_Module, sec 7) ----

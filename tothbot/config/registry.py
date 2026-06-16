@@ -110,8 +110,21 @@ REGISTRY: tuple[Param, ...] = (
     # -- CIATS: exit controller ----------------------------------------
     Param("mae_mult", 1.5, _C, _M, "x ATR(14)", "Layer 2 MAE threshold breach multiplier."),
     Param("emergency_sl_mult", 3.0, _C, _M, "x ATR(14)", "Layer 3 Kraken resting emergency stop (off-book, failure only)."),
-    Param("cancel_timeout_window", 5.0, _C, _M, "s", ""),
-    Param("mpp_retry_count", 3, _C, _M, "count", ""),
+    Param(
+        "cancel_timeout_window", 5.0, _C, _M, "s",
+        "I-6 cancel-timeout fallback: how long mod:Exit_Controller waits for a "
+        "cancel_order ACK on the resting emergSL before the executions-channel "
+        "state check (confirmed -> proceed; unknown -> retry once; 2nd timeout "
+        "-> HOLD + alert, NEVER market sell with ambiguous order state). "
+        "Canonical at mod:Exit_Controller D3; value home here.",
+    ),
+    Param(
+        "mpp_retry_count", 3, _C, _M, "count",
+        "C-1 MPP-rejection retry count: the number of marketable IOC-limit retries "
+        "after a market close rejects on a wide spread (Kraken Max-Price-Protection), "
+        "each walked best_bid -/+ 0.2% out per attempt. Canonical at "
+        "mod:Exit_Controller D3; value home here.",
+    ),
 
     # -- CIATS: self-tuning step (the FORM->TEST->ROUTE loop's bounded magnitude) --
     Param(
