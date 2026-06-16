@@ -129,6 +129,13 @@ class Logger:
         if self._on_alert is not None:
             self._on_alert(record)
 
+    def set_alert_sink(self, on_alert: EventSink | None) -> None:
+        """Rebind the HR-LG-009 operator-alert sink. The cold-start runner wires the real SMTP alert
+        send here AFTER both the Logger and the sender are constructed (the sender's evt:ALERT_SENT /
+        evt:ALERT_SMTP_FAILED route back through this Logger's on_event, so the two are mutually
+        dependent - this setter resolves the construction cycle)."""
+        self._on_alert = on_alert
+
     def corpus_for(self, module: str) -> list:
         """The module's Stream-2 CIATS corpus (the closed-trade outcomes that side has produced).
         Empty if the module has no closed trades yet. No cross-module pooling (sec 7)."""

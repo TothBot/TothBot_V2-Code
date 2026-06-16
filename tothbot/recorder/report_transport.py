@@ -85,6 +85,7 @@ def smtplib_send(
     starttls: bool = False,
     username: str | None = None,
     password: str | None = None,
+    timeout: float | None = None,
 ) -> SmtpSend:
     """Build the LOW-LEVEL SmtpSend bound to a real smtplib.SMTP server - the actual operator delivery
     edge for the periodic-pull track (mirroring the C1 alert SMTP seam, on the DISTINCT pull track).
@@ -99,7 +100,11 @@ def smtplib_send(
         if factory is None:
             import smtplib  # lazy: the socket library is the edge, not a module-load dependency
 
-            factory = smtplib.SMTP
+            # The per-attempt timeout (HR-LG-009 ALERT_SMTP_TIMEOUT_SEC) lives on the socket edge.
+            factory = (
+                (lambda h, p: smtplib.SMTP(h, p, timeout=timeout))
+                if timeout is not None else smtplib.SMTP
+            )
         client = factory(host, port)
         try:
             if starttls:
