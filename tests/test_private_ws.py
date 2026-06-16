@@ -376,6 +376,54 @@ def test_reconnect_gap_close_degraded_when_query_returns_no_closed_fill():
     assert wm.gap_calls == [("ETH/USD", None, None)]   # no closed fill -> degraded
 
 
+class _IdleTransport(_FakeTransport):
+    """A private socket that captures sends but whose recv never returns (so the receive loop's
+    wait_for times out each tick) - lets a single _step exercise the idle-tick after_batch pump."""
+
+    async def recv(self) -> dict:
+        await asyncio.Event().wait()  # never set -> wait_for(recv, tick_interval) times out
+        raise AssertionError  # pragma: no cover
+
+
+async def _always_ack(cl_ord_id, timeout):
+    return True
+
+
+async def _never_reject(message):
+    return False
+
+
+def test_live_loop_pump_dispatches_a_detected_exit_end_to_end():
+    # The capstone: the WIRED private loop, on an idle tick, PUMPS drive_live_exits so a detected L2
+    # MAE intent (enqueued by handle_ticker) dispatches its cancel-then-sell over THIS bound socket.
+    m = WSManager(Mode.LIVE, cancel_ack_wait=_always_ack, market_rejected=_never_reject)
+    t = _IdleTransport()
+
+    async def _open():
+        return t
+
+    asm = PrivateConnectionAssembler(
+        m, open_socket=_open, acquire_token=_tok, sleep=_noop_sleep, tick_interval=0.01
+    )
+    pc = asyncio.run(asm.build())
+    # open a live long (the L2 detector reads the entry-time atr) and detect an adverse breach
+    m.record_execution(
+        {"exec_type": "filled", "symbol": "BTC/USD", "side": "buy", "cum_qty": "0.05",
+         "avg_price": "60000", "cl_ord_id": "cl-1", "fee": "7.8"},
+        atr_14_entry="2000", emergsl_price="54000",
+    )
+    m.handle_ticker({"channel": "ticker", "type": "update",
+                     "data": [{"symbol": "BTC/USD", "bid": "57000", "ask": "57100"}]})  # MAE 3000>=3000
+    assert m.live_exit_intents_pending == 1
+
+    # drive ONE loop step: recv idles -> the after_batch pump drains drive_live_exits.
+    asyncio.run(pc.loop._step())
+    assert m.live_exit_intents_pending == 0                  # the intent was dispatched
+    methods = [msg.get("method") for msg in t.sent]
+    assert "cancel_order" in methods                          # (1) cancel the off-book emergSL
+    assert "add_order" in methods                             # (2) the market close, over the bound socket
+
+
 def test_executions_snapshot_emits_gap_close_estimated_on_the_sync_path():
     events: list = []
     m = WSManager(Mode.LIVE, on_event=events.append)
