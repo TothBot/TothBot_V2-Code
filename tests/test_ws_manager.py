@@ -552,16 +552,23 @@ def test_exit_controllers_are_per_module_wallet():
     assert m.exit_controller is m.exit_controllers[PositionSide.LONG]
 
 
-def test_exit_controllers_are_none_in_live():
+def test_exit_controllers_exist_in_live():
+    # sec 12.5 LIVE FLOW: the Exit Controller is a pure close engine above the dispatch seam, so it
+    # is constructed in BOTH modes - live needs it to emit evt:TRADE_CLOSE off the executions close.
     m = WSManager(Mode.LIVE)
-    assert m.exit_controllers is None
-    assert m.exit_controller is None
+    assert m.exit_controllers is not None
+    assert set(m.exit_controllers) == {PositionSide.LONG, PositionSide.SHORT}
+    assert m.exit_controller is m.exit_controllers[PositionSide.LONG]
 
 
-def test_set_ciats_exit_sinks_is_a_safe_noop_in_live():
+def test_set_ciats_exit_sinks_wires_in_live():
+    # the live close emits its TRADE_CLOSE through the same per-module CIATS membrane (sec 12.5
+    # LIVE FLOW), so set_ciats_exit_sinks wires the live controllers (no longer a no-op).
     m = WSManager(Mode.LIVE)
-    m.set_ciats_exit_sinks({PositionSide.LONG: lambda e: None})  # must not raise (no controllers)
-    assert m.exit_controllers is None
+    long_sink: list = []
+    sink = long_sink.append
+    m.set_ciats_exit_sinks({PositionSide.LONG: sink})  # must not raise; wires the sink
+    assert m.exit_controllers[PositionSide.LONG]._on_event is sink
 
 
 def test_long_close_emits_through_the_long_ciats_sink_only():
@@ -615,9 +622,12 @@ def test_non_adverse_ticker_leaves_position_open():
 
 
 def test_handle_ticker_is_noop_in_live_mode():
-    m = WSManager(Mode.LIVE)
-    m.handle_ticker(_ticker("BTC/USD", "1", "2"))  # no exit_controller, must not raise
-    assert m.exit_controller is None
+    # handle_ticker is the PAPER ticker-bbo detection path; live exit detection is executions-driven
+    # (sec 12.5 LIVE FLOW), so the ticker handler stays inert in live (no close, no emit, no raise).
+    closes: list = []
+    m = WSManager(Mode.LIVE, on_event=closes.append)
+    m.handle_ticker(_ticker("BTC/USD", "1", "2"))
+    assert not any(isinstance(e, TradeClose) for e in closes)
 
 
 def test_release_exit_semaphore_guarded_when_none():
@@ -749,11 +759,148 @@ def test_l1a_no_open_position_is_noop():
 
 
 def test_l1a_is_noop_in_live_mode():
-    m = WSManager(Mode.LIVE)
-    # no exit_controller in live; the L1a handlers must be inert, not raise.
+    # the L1a regime-exit handlers are PAPER detection paths (live L1a is executions-driven); they
+    # must stay inert in live - no close, no TRADE_CLOSE emit, no raise.
+    closes: list = []
+    m = WSManager(Mode.LIVE, on_event=closes.append)
     m.on_regime_classified("BTC/USD", _trending_neg(), bid="61000", ask="61100")
     m.on_htf_ohlc_close("BTC/USD", "99", "100", bid="61000", ask="61100")
-    assert m.exit_controller is None
+    assert not any(isinstance(e, TradeClose) for e in closes)
+
+
+# -- WS_Manager LIVE EXIT lifecycle (sec 12.5 LIVE FLOW: executions close -> TRADE_CLOSE) ----
+
+def _open_live_long(m, *, atr="2000", emergsl="54000", fee="7.8"):
+    """Open a BTC/USD long in LIVE via the executions channel (the live write source, PA-004 div #4):
+    a buy fill carrying the entry-time D6 snapshot + the actual taker entry fee (FEE-CALC-006)."""
+    m.record_execution(
+        {"exec_type": "filled", "symbol": "BTC/USD", "side": "buy",
+         "cum_qty": "0.05", "avg_price": "60000", "cl_ord_id": "cl-1", "fee": fee},
+        regime_at_entry="TRENDING_POS_NORMAL", atr_14_entry=atr, emergsl_price=emergsl,
+    )
+
+
+def test_live_executions_close_emits_trade_close():
+    # sec 12.5 LIVE FLOW: an opposite-side executions fill closes the position and emits the 24-field
+    # TRADE_CLOSE off the close fill (no synthetic ledger). Default reason = EMERGENCY_SL_FIRED (the
+    # off-book backstop fired - TothBot dispatched no exit, so nothing stamped the reason).
+    closes: list = []
+    m = WSManager(Mode.LIVE, on_event=closes.append)
+    _open_live_long(m)
+    assert m.has_position("BTC/USD")
+    m.record_execution(
+        {"exec_type": "filled", "symbol": "BTC/USD", "side": "sell",
+         "cum_qty": "0.05", "avg_price": "66000", "fee": "8.58"}
+    )
+    assert not m.has_position("BTC/USD")
+    tc = [e for e in closes if isinstance(e, TradeClose)]
+    assert len(tc) == 1
+    rec = tc[0]
+    assert rec.exit_reason is ExitReason.EMERGENCY_SL_FIRED
+    assert rec.symbol == "BTC/USD"
+    assert rec.entry_fill_price == Decimal("60000")
+    assert rec.exit_price == Decimal("66000")
+    assert rec.qty == Decimal("0.05")
+    assert rec.fees_entry_usd == Decimal("7.8") and rec.fees_exit_usd == Decimal("8.58")
+    # net P&L (long): gross (66000-60000)*0.05 = 300, minus 7.8 entry, minus 8.58 exit = 283.62.
+    assert rec.net_pl_usd == Decimal("283.62")
+    assert rec.net_gain_usd == Decimal("283.62") and rec.net_loss_usd == Decimal("0")
+
+
+def test_live_close_carries_dispatched_exit_reason():
+    # a TothBot-dispatched live exit (L1a/L2 market sell) stamps the reason via note_live_exit_dispatch;
+    # the executions close fill carries it onto the TRADE_CLOSE (not the emergSL default).
+    closes: list = []
+    m = WSManager(Mode.LIVE, on_event=closes.append)
+    _open_live_long(m)
+    m.note_live_exit_dispatch("BTC/USD", ExitReason.MAE_THRESHOLD_BREACH.value)
+    m.record_execution(
+        {"exec_type": "filled", "symbol": "BTC/USD", "side": "sell",
+         "cum_qty": "0.05", "avg_price": "57000", "fee": "7.4"}
+    )
+    tc = [e for e in closes if isinstance(e, TradeClose)]
+    assert len(tc) == 1 and tc[0].exit_reason is ExitReason.MAE_THRESHOLD_BREACH
+
+
+def test_live_close_releases_g7_semaphore_and_clears_entry_fee():
+    # the G7 capital-commitment semaphore acquired at the live OPEN (D2 position-lifetime) is released
+    # at the close, and the retained live entry fee is dropped (no leak across trades).
+    m = WSManager(Mode.LIVE)
+    _open_live_long(m)
+    assert m.dispatch_semaphore_locked(PositionSide.LONG)
+    assert m.fees_entry_for("BTC/USD") == Decimal("7.8")
+    m.record_execution(
+        {"exec_type": "filled", "symbol": "BTC/USD", "side": "sell",
+         "cum_qty": "0.05", "avg_price": "66000", "fee": "8.58"}
+    )
+    assert not m.dispatch_semaphore_locked(PositionSide.LONG)
+    assert m.fees_entry_for("BTC/USD") is None
+
+
+def test_live_close_emits_through_the_ciats_sink():
+    # the live close emits its TRADE_CLOSE through the side's CIATS membrane when wired (sec 12.5
+    # LIVE FLOW parity with the paper close), not the general telemetry sink.
+    general: list = []
+    long_sink: list = []
+    m = WSManager(Mode.LIVE, on_event=general.append)
+    m.set_ciats_exit_sinks({PositionSide.LONG: long_sink.append})
+    _open_live_long(m)
+    m.record_execution(
+        {"exec_type": "filled", "symbol": "BTC/USD", "side": "sell",
+         "cum_qty": "0.05", "avg_price": "66000", "fee": "8.58"}
+    )
+    assert len([e for e in long_sink if isinstance(e, TradeClose)]) == 1
+    assert not any(isinstance(e, TradeClose) for e in general)
+
+
+def test_live_short_close_mirror():
+    # the Long/Short mirror: a SHORT live position (sell-to-open) closes on a buy-to-cover executions
+    # fill; net P&L uses the short leg (entry - exit) * qty.
+    closes: list = []
+    m = WSManager(Mode.LIVE, on_event=closes.append)
+    m.record_execution(
+        {"exec_type": "filled", "symbol": "BTC/USD", "side": "sell",
+         "cum_qty": "0.05", "avg_price": "60000", "cl_ord_id": "cl-s1", "fee": "7.8"},
+        regime_at_entry="TRENDING_NEG_NORMAL", atr_14_entry="2000", emergsl_price="66000",
+    )
+    assert m.dispatch_semaphore_locked(PositionSide.SHORT)
+    m.record_execution(
+        {"exec_type": "filled", "symbol": "BTC/USD", "side": "buy",
+         "cum_qty": "0.05", "avg_price": "57000", "fee": "7.4"}
+    )
+    tc = [e for e in closes if isinstance(e, TradeClose)]
+    assert len(tc) == 1
+    # short gross = (60000 - 57000) * 0.05 = 150; minus 7.8 entry, 7.4 exit = 134.8.
+    assert tc[0].net_pl_usd == Decimal("134.8")
+    assert not m.dispatch_semaphore_locked(PositionSide.SHORT)
+
+
+def test_live_handle_ticker_marks_mae_without_detecting_an_exit():
+    # the live MTM marking: handle_ticker marks the max-over-life MAE for an open position in LIVE
+    # (the heat the close reads), but runs NO exit detection (live exit is executions-driven), so the
+    # position stays open even on a deeply adverse tick.
+    m = WSManager(Mode.LIVE)
+    _open_live_long(m)
+    m.handle_ticker(_ticker("BTC/USD", "57000", "57100"))  # bid 57000: (60000-57000)/60000 = 0.05
+    assert m.has_position("BTC/USD")                        # NO live exit detection - still open
+    assert m.mae_pct_high_for("BTC/USD") == Decimal("0.05")
+
+
+def test_live_close_carries_max_over_life_heat_from_ticker_marking():
+    # the live close lifts mae_pct_reached to the worst-over-the-hold heat the ticker marking saw -
+    # a deep-then-benign trade (deep drawdown, favorable exit) reports the deep heat, not at-exit 0.
+    closes: list = []
+    m = WSManager(Mode.LIVE, on_event=closes.append)
+    _open_live_long(m)
+    m.handle_ticker(_ticker("BTC/USD", "57000", "57100"))  # deep heat 0.05 marked while open
+    m.record_execution(
+        {"exec_type": "filled", "symbol": "BTC/USD", "side": "sell",
+         "cum_qty": "0.05", "avg_price": "66000", "fee": "8.58"}   # benign favorable exit (at-exit 0)
+    )
+    tc = [e for e in closes if isinstance(e, TradeClose)]
+    assert len(tc) == 1 and tc[0].mae_pct_reached == Decimal("0.05")
+    # the close drops the heat tracking - a reopened symbol starts fresh.
+    assert m.mae_pct_high_for("BTC/USD") is None
 
 
 # -- two independent per-module wallets (mod:Long_Module + mod:Short_Module, sec 7) ----

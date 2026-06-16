@@ -243,11 +243,20 @@ class PositionClosedDuringGap:
 @dataclass(frozen=True)
 class ExecOutcome:
     """The result of one apply_execution() - the dispatched exec_type, the action
-    taken, and the resulting position (None when closed / not position-affecting)."""
+    taken, and the resulting position (None when closed / not position-affecting).
+
+    On an executions-fill CLOSE (an opposite-side fill clearing the position - the LIVE
+    exit per sec 12.5), `position` is None (the symbol is gone from the mirror) but
+    `closed_position` carries the just-closed record and `exit_fill_price` the close
+    fill's authoritative avg_price (WS-EXE-012): mod:WS_Manager hands both to the side's
+    mod:Exit_Controller live close so the executions-confirmed close emits evt:TRADE_CLOSE
+    (the 12.5 LIVE FLOW, byte-identical to the paper close path)."""
 
     exec_type: ExecType | None
     action: PositionAction
     position: Position | None = None
+    closed_position: Position | None = None    # the record an executions-fill close just cleared
+    exit_fill_price: Decimal | None = None      # the close fill's avg_price (WS-EXE-012)
 
 
 class SoleWriterViolationError(RuntimeError):
@@ -395,7 +404,7 @@ class PositionMirror:
                               regime_at_entry, emergsl_id, atr_14_entry, emergsl_price,
                               signal_params, market_regime, entry_timestamp_utc)
         if _closes(existing.side, fill_side):
-            return self._close(existing, seq)
+            return self._close(existing, seq, avg_price)
         # Same-side fill on an open position: cum_qty + avg_price are cumulative and
         # authoritative (AR-054 admits no separate adds; refresh defensively).
         return self._update(existing, cum_qty, avg_price, seq)
@@ -430,14 +439,19 @@ class PositionMirror:
         self._emit(PositionStateWrite(existing.symbol, PositionAction.UPDATED, qty, avg_price, seq))
         return ExecOutcome(ExecType.TRADE, PositionAction.UPDATED, position)
 
-    def _close(self, existing: Position, seq) -> ExecOutcome:
+    def _close(self, existing: Position, seq, exit_price: Decimal | None = None) -> ExecOutcome:
         del self._positions[existing.symbol]
         self._emit(
             PositionStateWrite(
                 existing.symbol, PositionAction.CLOSED, existing.qty, existing.avg_entry_price, seq
             )
         )
-        return ExecOutcome(ExecType.FILLED, PositionAction.CLOSED, None)
+        # Carry the just-closed record + the close fill's avg_price (WS-EXE-012) so the live
+        # close path (sec 12.5 LIVE FLOW) can emit evt:TRADE_CLOSE off the executions fill.
+        return ExecOutcome(
+            ExecType.FILLED, PositionAction.CLOSED, None,
+            closed_position=existing, exit_fill_price=exit_price,
+        )
 
     def close(self, symbol: str, *, writer: str) -> Position | None:
         """Explicitly clear a symbol's open position (sec 12.5 step 7: the Exit Controller

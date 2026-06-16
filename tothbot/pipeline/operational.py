@@ -328,12 +328,13 @@ async def assemble_operational(
         trade_record_sink=trade_record_sink,
     )
     # THE ASSEMBLY TIE-IN (TB00748 (b)): wire each side's CIATS learning sink into the injected wm's
-    # per-module Exit_Controller, so a paper close emits its evt:TRADE_CLOSE THROUGH the emitting
-    # side's ciats_sink in the running organism (the learning close + the HR-CI-003 inbox boundary
-    # poll, no manual sink call). This resolves the construction-order seam cleanly: the wm is
+    # per-module Exit_Controller, so a close emits its evt:TRADE_CLOSE THROUGH the emitting side's
+    # ciats_sink in the running organism (the learning close + the HR-CI-003 inbox boundary poll, no
+    # manual sink call) - in BOTH modes (the live executions-confirmed close emits through the same
+    # membrane, sec 12.5 LIVE FLOW). This resolves the construction-order seam cleanly: the wm is
     # injected (built before this assembly), the conductors/sinks are built here - so the assembly
     # hands the freshly-built sinks to the wm. Guarded: a wm without the surface (a lightweight test
-    # stand-in / a non-paper wm) is left untouched. operational.py still owns construction order only.
+    # stand-in) is left untouched. operational.py still owns construction order only.
     set_exit_sinks = getattr(wm, "set_ciats_exit_sinks", None)
     if callable(set_exit_sinks):
         set_exit_sinks(ciats_sinks)

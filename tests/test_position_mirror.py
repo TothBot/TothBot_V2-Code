@@ -142,11 +142,17 @@ def test_opposite_side_fill_closes_long():
     mirror, events = _mirror()
     mirror.apply_execution(_fill(side="buy"), writer=WRITER_ID)
     outcome = mirror.apply_execution(
-        _fill(side="sell", exec_type="filled", cum_qty="0.5", sequence=9), writer=WRITER_ID
+        _fill(side="sell", exec_type="filled", cum_qty="0.5", avg_price="66000.0", sequence=9),
+        writer=WRITER_ID,
     )
     assert outcome.action is PositionAction.CLOSED
     assert "BTC/USD" not in mirror
     assert len(mirror) == 0
+    # the executions close carries the just-closed record + the close fill avg_price (WS-EXE-012)
+    # so the LIVE close path (sec 12.5) can emit TRADE_CLOSE off the fill.
+    assert outcome.position is None
+    assert outcome.closed_position is not None and outcome.closed_position.symbol == "BTC/USD"
+    assert outcome.exit_fill_price == Decimal("66000.0")
     closed = [e for e in events if isinstance(e, PositionStateWrite)
               and e.action is PositionAction.CLOSED]
     assert closed and closed[0].symbol == "BTC/USD"

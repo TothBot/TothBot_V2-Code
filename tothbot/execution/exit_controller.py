@@ -192,6 +192,27 @@ class ExitController:
             return None
         return self._close_position(position, _dec(exit_price), exit_reason, _dec(fees_exit), wm)
 
+    def on_live_close(
+        self,
+        position: object,
+        exit_price: object,
+        exit_reason: ExitReason,
+        fees_exit: object,
+        wm: object,
+    ) -> TradeClose:
+        """sec 12.5 LIVE FLOW: the executions-confirmed close entry point. In live the exit is
+        executions-driven (step-1 origin = an opposite-side trade/filled fill, or the off-book
+        emergSL trigger fill) - mod:Position_Mirror has ALREADY cleared the symbol off that fill
+        (PA-004 div #4: live writes come from the executions channel), so the `position` is handed
+        in directly (not re-read from the mirror) and the close runs with clear_mirror=False (step 7
+        is a no-op - the executions fill owned the clear). Steps 6/8/9 (emit TRADE_CLOSE, update
+        Selection Controller state, release the semaphore) are byte-identical to the paper path
+        (rule:HR-EC-013 close-path parity / PA-005). exit_price is the close fill's authoritative
+        avg_price (WS-EXE-012); fees_exit is the executions-channel fee (FEE-CALC-006, actual)."""
+        return self._close_position(
+            position, _dec(exit_price), exit_reason, _dec(fees_exit), wm, clear_mirror=False
+        )
+
     def _close_position(
         self,
         position: object,
@@ -199,10 +220,16 @@ class ExitController:
         exit_reason: ExitReason,
         fees_exit: Decimal,
         wm: object,
+        *,
+        clear_mirror: bool = True,
     ) -> TradeClose:
         """sec 12.5 steps 6-9: assemble + emit the 24-field TRADE_CLOSE record, then
         clear the mirror, update Selection Controller state (AR-073), and release the
-        semaphore - the mirror + SC writes routed through the WSManager sole writer."""
+        semaphore - the mirror + SC writes routed through the WSManager sole writer.
+
+        clear_mirror=True (paper, the ticker-detected close): step 7 requests the mirror clear
+        through the sole writer. clear_mirror=False (live, the executions-confirmed close): the
+        opposite-side fill already cleared the mirror, so step 7 is skipped (no double-close)."""
         symbol = position.symbol
         entry = position.avg_entry_price
         qty = position.qty
@@ -281,8 +308,10 @@ class ExitController:
         )
         # 6. emit TRADE_CLOSE (the canonical Stream-2 record).
         self._emit(record)
-        # 7. clear the Position Mirror through the sole writer (rule:HR-PM-009).
-        wm.close_position(symbol)
+        # 7. clear the Position Mirror through the sole writer (rule:HR-PM-009). LIVE skips this:
+        #    the executions-fill close already cleared the symbol (clear_mirror=False, no double-close).
+        if clear_mirror:
+            wm.close_position(symbol)
         # 8. update Selection Controller state via the WSManager AR-073 path (HR-EC-014).
         wm.update_selection_state_on_close(symbol, is_win, position.side)
         # 9. release the G7 capital-commitment semaphore for THIS module (ar:AR-043, D2 position-

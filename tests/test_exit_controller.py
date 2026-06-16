@@ -113,6 +113,23 @@ def test_long_win_drives_close_clear_scwin_and_semaphore():
     assert wm.sem_released == 1                  # step 9 semaphore release
 
 
+def test_on_live_close_emits_and_updates_but_does_not_clear_mirror():
+    # sec 12.5 LIVE FLOW: on_live_close runs steps 6/8/9 (emit TRADE_CLOSE, SC update, semaphore
+    # release) byte-identical to the paper close, but takes the position DIRECTLY (the executions
+    # fill already cleared the mirror) so step 7 is skipped - no wm.close_position call.
+    events = []
+    pos = _pos()
+    wm = _FakeWM(pos, fees_entry=Decimal("7.8"))
+    rec = _ec(events).on_live_close(pos, "66000", ExitReason.EMERGENCY_SL_FIRED, "8.58", wm)
+    assert isinstance(rec, TradeClose)
+    assert rec.net_pl_usd == Decimal("283.62")        # identical net-P&L math to the paper close
+    assert rec.exit_reason is ExitReason.EMERGENCY_SL_FIRED
+    assert any(isinstance(e, TradeClose) for e in events)
+    assert wm.closed == []                              # step 7 SKIPPED (no double-close)
+    assert wm.sc_updates == [("BTC/USD", True, PositionSide.LONG)]  # step 8 still runs
+    assert wm.sem_released == 1                          # step 9 still runs
+
+
 def test_long_loss_increments_consecutive_loss_and_reaches_mae():
     wm = _FakeWM(_pos(), fees_entry=Decimal("7.8"))
     rec = _ec([]).on_paper_close(

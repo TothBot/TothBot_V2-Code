@@ -184,6 +184,14 @@ class WSManager:
         # so record_execution can attach it to the position at the opening fill (the snapshot is
         # TothBot-internal context, not on the Kraken wire frame). Cleared once the entry resolves.
         self._pending_entries: dict[str, dict] = {}
+        # LIVE exit bookkeeping (sec 12.5 LIVE FLOW). _pending_exit_reason: the exit_reason stamped
+        # by a TothBot-dispatched live exit (L1a/L2 market sell) at dispatch, read when the executions
+        # close fill confirms (an un-stamped close IS the off-book emergSL backstop firing - mod:Exit_
+        # Controller EMERGENCY_SL_FIRED "backfilled from the executions channel", sec 7). _live_fees_
+        # entry: the actual taker entry fee from the live opening fill's executions fee field (FEE-CALC-
+        # 006), retained per symbol for the close net-P&L (the synthetic ledger is paper-only).
+        self._pending_exit_reason: dict[str, str] = {}
+        self._live_fees_entry: dict[str, Decimal] = {}
         # Per-pair ticker event_trigger mode (WS-TKR-003); a pair appears here once it has
         # carried an open position (default trades elsewhere).
         self._ticker_event_trigger: dict[str, str] = {}
@@ -244,22 +252,23 @@ class WSManager:
                 on_event=on_event,
             )
             self.paper_dispatch = PaperDispatchSimulator(fill_simulator=self.paper_fill)
-            # mod:Exit_Controller owns the sec-12.5 close path; in paper mode WSManager
-            # detects the exit on the ticker bbo and routes it here. Live exit handling is
-            # executions-driven (a later slice), so the controllers are paper-only for now.
-            # ONE controller PER MODULE WALLET (sec 7 - the exit_controller is documented "one
-            # per module wallet"; the TRADE_CLOSE record carries no side field, so the partition
-            # IS the emitting wallet). Each side's controller routes its close to that side - the
-            # close path selects by the closing position's side (_exit_controller_for). Each is
-            # constructed with the general on_event (telemetry); set_ciats_exit_sinks rebinds it
-            # to the side's CIATS learning sink so a close emits THROUGH the per-module membrane.
-            self.exit_controllers: dict[PositionSide, ExitController] | None = {
-                side: ExitController(on_event=on_event, clock=self._now_utc)
-                for side in (PositionSide.LONG, PositionSide.SHORT)
-            }
         else:
             self.paper_dispatch = PaperDispatchSimulator()
-            self.exit_controllers = None
+
+        # mod:Exit_Controller owns the sec-12.5 close path in BOTH modes (it is a pure close
+        # engine above the dispatch seam - "no paper_trading_mode branch above seam", sec 7). PAPER:
+        # WSManager detects the exit on the ticker bbo and routes it through on_paper_close (the
+        # synthetic close). LIVE: the exit is executions-driven (sec 12.5 LIVE FLOW) - the close fill
+        # on the executions channel runs on_live_close, byte-identical emit (rule:HR-EC-013 / PA-005).
+        # ONE controller PER MODULE WALLET (sec 7 - "one per module wallet"; the TRADE_CLOSE record
+        # carries no side field, so the partition IS the emitting wallet). Each side's controller
+        # routes its close to that side (_exit_controller_for). Constructed with the general on_event
+        # (telemetry); set_ciats_exit_sinks rebinds it to the side's CIATS learning sink so a close
+        # emits THROUGH the per-module membrane.
+        self.exit_controllers: dict[PositionSide, ExitController] = {
+            side: ExitController(on_event=on_event, clock=self._now_utc)
+            for side in (PositionSide.LONG, PositionSide.SHORT)
+        }
 
         # Outbound order-dispatch mode gate (contract:WSManager_Dispatch_Seam).
         self.seam = DispatchSeam(
@@ -287,19 +296,16 @@ class WSManager:
         return self.private is not None
 
     @property
-    def exit_controller(self) -> ExitController | None:
-        """Back-compat accessor - the LONG/default module's Exit Controller (paper), or None in
-        live. The mirror of the ledger/spot_usd_balance default-wallet accessors; use
-        exit_controllers[side] for the short module's controller (sec 7 per-module)."""
-        return None if self.exit_controllers is None else self.exit_controllers[PositionSide.LONG]
+    def exit_controller(self) -> ExitController:
+        """Back-compat accessor - the LONG/default module's Exit Controller (both modes). The
+        mirror of the ledger/spot_usd_balance default-wallet accessors; use exit_controllers[side]
+        for the short module's controller (sec 7 per-module)."""
+        return self.exit_controllers[PositionSide.LONG]
 
     def _exit_controller_for(self, side: PositionSide) -> ExitController:
-        """The mod:Exit_Controller for the closing position's side (sec 7 per-module wallet).
-        Paper-mode only - raises in live (exit handling is executions-driven, a later slice)."""
-        if self.exit_controllers is None:
-            raise RuntimeError(
-                "no Exit Controller (live mode - exit handling is executions-driven, a later slice)"
-            )
+        """The mod:Exit_Controller for the closing position's side (sec 7 per-module wallet). Valid
+        in BOTH modes - paper routes the ticker-detected close through on_paper_close, live routes
+        the executions-confirmed close through on_live_close (sec 12.5 LIVE FLOW)."""
         return self.exit_controllers[side]
 
     def set_ciats_exit_sinks(self, sinks: Mapping[PositionSide, EventSink]) -> None:
@@ -309,10 +315,9 @@ class WSManager:
         mod:Logger Stream-1/Stream-2 with the module tag - all in the running organism, no manual
         sink call. The operational assembly calls this after it builds the per-side sinks (the
         construction-order tie-in: the wm is injected, the conductors are built inside assemble_
-        operational). Paper-mode only; a no-op in live (no controllers) and for any side without a
-        sink. Idempotent - a later call rebinds (e.g. a re-assembly)."""
-        if self.exit_controllers is None:
-            return
+        operational). Wired in BOTH modes (the live close emits its TRADE_CLOSE through the same
+        per-module CIATS membrane, sec 12.5 LIVE FLOW); a no-op for any side without a sink.
+        Idempotent - a later call rebinds (e.g. a re-assembly)."""
         for side, controller in self.exit_controllers.items():
             sink = sinks.get(side)
             if sink is not None:
@@ -383,11 +388,48 @@ class WSManager:
             # held. acquire() is False only if already held (a gate-bypass defect, the position still
             # opened) - the defensive no-double-commit marker; the close releases once.
             self._dispatch_sem[outcome.position.side].acquire()
+            # LIVE: retain the opening fill's actual taker entry fee (executions fee field, FEE-CALC-
+            # 006) for the close net-P&L - there is no synthetic ledger in live to hold it.
+            if self.is_live:
+                self._live_fees_entry[outcome.position.symbol] = _frame_fee(event)
         elif outcome.action is PositionAction.CLOSED:
             closed_symbol = _opt_str(event.get("symbol"))
             if closed_symbol is not None:
                 self._update_ticker_event_trigger(closed_symbol, has_position=False)
+            # sec 12.5 LIVE FLOW: the executions-confirmed close emits evt:TRADE_CLOSE through the
+            # side's Exit Controller (steps 6/8/9), byte-identical to the paper close (PA-005). The
+            # mirror was already cleared by the opposite-side fill, so on_live_close skips step 7.
+            if self.is_live and outcome.closed_position is not None:
+                self._drive_live_close(outcome.closed_position, outcome.exit_fill_price, event)
         return outcome
+
+    def note_live_exit_dispatch(self, symbol: str, exit_reason: str) -> None:
+        """Stamp the exit_reason for a TothBot-dispatched LIVE exit (the L1a/L2 market-sell close)
+        so the executions close fill carries it through to evt:TRADE_CLOSE. Called by the live exit
+        DISPATCH path when it sends the market sell; the executions confirm pops it. A close with no
+        stamp is the off-book emergSL backstop firing (EMERGENCY_SL_FIRED), per mod:Exit_Controller
+        ('in live it is backfilled from the executions channel', sec 7)."""
+        self._pending_exit_reason[symbol] = exit_reason
+
+    def _drive_live_close(
+        self, closed_position: Position, exit_fill_price: "Decimal | None", event: Mapping[str, object]
+    ) -> None:
+        """Run the sec-12.5 LIVE close for an executions-confirmed close fill: resolve the exit_reason
+        (the TothBot-dispatched stamp, else EMERGENCY_SL_FIRED), read the close fill avg_price + the
+        actual executions exit fee (FEE-CALC-006), route through the side's Exit Controller, then drop
+        the symbol's retained live entry fee."""
+        symbol = closed_position.symbol
+        reason_str = self._pending_exit_reason.pop(symbol, None) or ExitReason.EMERGENCY_SL_FIRED.value
+        exit_price = exit_fill_price if exit_fill_price is not None else closed_position.avg_entry_price
+        self._exit_controller_for(closed_position.side).on_live_close(
+            closed_position, exit_price, ExitReason(reason_str), _frame_fee(event), self
+        )
+        # Drop the per-symbol live state the executions close leaves behind (the live mirror clear
+        # ran in apply_execution, not via close_position, so do it here): the retained entry fee and
+        # the max-over-life MAE high-water - a reopened symbol starts fresh. The Exit Controller
+        # already read the heat for the TRADE_CLOSE before this clear.
+        self._live_fees_entry.pop(symbol, None)
+        self._mae_tracker.clear(symbol)
 
     def restore_position_mirror(
         self, snap_orders: Sequence[Mapping[str, object]]
@@ -454,13 +496,13 @@ class WSManager:
         )
 
     def fees_entry_for(self, symbol: str) -> Decimal | None:
-        """The taker entry fee retained for the symbol's open paper position
-        (pos.fees_entry_usd), or None (no open paper position / live mode). The Exit
-        Controller reads this through wm in the sec-12.5 close to compute net P&L. A symbol is
-        open in at most ONE wallet (the mirror is symbol-keyed), so the first wallet holding a
-        retained fee for it is the owner."""
+        """The taker entry fee retained for the symbol's open position, or None. The Exit
+        Controller reads this through wm in the sec-12.5 close to compute net P&L. LIVE: the actual
+        opening-fill executions fee retained at the open (FEE-CALC-006; no synthetic ledger). PAPER:
+        the synthetic ledger's pos.fees_entry_usd. A symbol is open in at most ONE wallet (the mirror
+        is symbol-keyed), so the first wallet holding a retained fee for it is the owner."""
         if self.modules is None:
-            return None
+            return self._live_fees_entry.get(symbol)
         for module in self.modules.values():
             fee = module.ledger.fees_entry_for(symbol)
             if fee is not None:
@@ -616,11 +658,10 @@ class WSManager:
 
     def handle_ticker(self, frame: Mapping[str, object]) -> None:
         """Ticker-channel handler (D1 WS-TKR-002 event_trigger:bbo for open-position pairs).
-        In paper mode, evaluates each open position against the bbo tick (ar:AR-048) and
-        routes any fired exit through the sec-12.5 close. Live exit detection is executions-
-        driven (a later slice), so this is a paper-mode no-op in live."""
-        if not self.is_paper:
-            return
+        BOTH modes mark the max-over-life MAE (the live MTM marking of open positions) so the close
+        reads true worst-over-the-hold heat. PAPER additionally runs the ticker-bbo exit DETECTION
+        (ar:AR-048) and routes any fired exit through the sec-12.5 close; the LIVE exit is executions-
+        driven (the detection -> market-sell dispatch is the async-seam slice), so live only marks."""
         for entry in _ticker_entries(frame):
             symbol = _opt_str(entry.get("symbol"))
             if symbol is None:
@@ -628,9 +669,14 @@ class WSManager:
             position = self.positions.get(symbol)
             if position is None:
                 continue
-            # Mark the max-over-life MAE FIRST (this tick, incl. the breaching one), THEN detect the
-            # exit - so the running max captures the final tick that fires the close.
+            # Mark the max-over-life MAE on EVERY ticker in BOTH modes - the heat the close reads. In
+            # live this feeds the executions-confirmed TRADE_CLOSE mae_pct_reached (sec 12.5 LIVE FLOW)
+            # the same as paper: true worst-over-the-hold excursion, not the at-exit fallback.
             self._mae_tracker.mark(position, entry.get("bid"), entry.get("ask"))
+            # Exit DETECTION + close routing is PAPER-mode (the synthetic ticker-bbo exit); mark FIRST
+            # (incl. the breaching tick) so the running max captures the final tick that fires the close.
+            if not self.is_paper:
+                continue
             signal = detect_paper_exit(position, entry.get("bid"), entry.get("ask"))
             if signal is not None:
                 self._drive_paper_exit(position, signal)
@@ -818,3 +864,11 @@ def _ticker_entries(frame: Mapping[str, object]) -> list[Mapping[str, object]]:
 
 def _opt_str(value: object) -> str | None:
     return None if value is None else str(value)
+
+
+def _frame_fee(event: Mapping[str, object]) -> Decimal:
+    """The actual fee on an executions fill frame (FEE-CALC-006: the Kraken executions-channel fee
+    field, Decimal(str(fee)) on receipt - the closed-trade record-of-truth, never the calculated
+    estimate). Decimal('0') when the frame carries no fee field (a frame that never moved capital)."""
+    fee = event.get("fee")
+    return Decimal(str(fee)) if fee is not None else Decimal("0")
