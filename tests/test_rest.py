@@ -27,11 +27,14 @@ from tothbot.rest.client import (
     OhlcResponse,
     PATH_OHLC,
     PATH_OPEN_ORDERS,
+    PATH_QUERY_ORDERS,
     PATH_WS_TOKEN,
     RestOhlcBar,
+    gap_close_fill,
     parse_account_balance,
     parse_ohlc,
     parse_open_orders,
+    parse_query_orders,
     parse_websockets_token,
     raise_for_error,
 )
@@ -288,3 +291,61 @@ def test_client_close_delegates_to_transport():
     client = KrakenRestClient(_CREDS, transport=fake)
     asyncio.run(client.close())
     assert fake.closed
+
+
+# --- QueryOrders (REST-QOI) + gap_close_fill (the ar:AR-056 gap-close actual fill) ----
+
+def test_parse_query_orders_decimal_typed_and_keyed_by_txid():
+    payload = {
+        "error": [],
+        "result": {
+            "OEMERG-1": {"status": "closed", "vol": "0.5", "vol_exec": "0.5",
+                         "price": "99.50", "fee": "0.12", "cost": "49.75"},
+        },
+    }
+    parsed = parse_query_orders(payload)
+    assert set(parsed) == {"OEMERG-1"}
+    o = parsed["OEMERG-1"]
+    assert o["price"] == Decimal("99.50")
+    assert o["fee"] == Decimal("0.12")
+    assert o["vol_exec"] == Decimal("0.5")
+    assert isinstance(o["price"], Decimal)
+
+
+def test_gap_close_fill_returns_actual_price_and_fee_on_closed_fill():
+    order = {"status": "closed", "vol_exec": Decimal("0.5"), "price": Decimal("99.50"),
+             "fee": Decimal("0.12")}
+    assert gap_close_fill(order) == (Decimal("99.50"), Decimal("0.12"))
+
+
+def test_gap_close_fill_none_when_not_closed_or_zero_fill():
+    assert gap_close_fill({"status": "open", "vol_exec": Decimal("0.5"), "price": Decimal("1")}) is None
+    assert gap_close_fill({"status": "closed", "vol_exec": Decimal("0"), "price": Decimal("1")}) is None
+    assert gap_close_fill({"status": "canceled", "vol_exec": Decimal("0"), "price": Decimal("1")}) is None
+
+
+def test_gap_close_fill_defaults_fee_to_zero_when_absent():
+    order = {"status": "closed", "vol_exec": Decimal("0.5"), "price": Decimal("99.50")}
+    assert gap_close_fill(order) == (Decimal("99.50"), Decimal("0"))
+
+
+def test_client_query_orders_signs_and_parses():
+    fake = _FakeRestTransport(
+        post_result={"error": [], "result": {"O9": {"status": "closed", "vol_exec": "1",
+                                                    "price": "100", "fee": "0.5"}}}
+    )
+    client = KrakenRestClient(_CREDS, transport=fake)
+    out = asyncio.run(client.query_orders(["O9"]))
+    assert out["O9"]["price"] == Decimal("100")
+    url, data, _ = fake.post_calls[0]
+    assert url == REST_BASE_URL + PATH_QUERY_ORDERS
+    assert data["txid"] == "O9"
+    assert data["trades"] is True
+
+
+def test_client_query_orders_empty_short_circuits_without_call():
+    fake = _FakeRestTransport()
+    client = KrakenRestClient(_CREDS, transport=fake)
+    out = asyncio.run(client.query_orders([]))
+    assert out == {}
+    assert not fake.post_calls

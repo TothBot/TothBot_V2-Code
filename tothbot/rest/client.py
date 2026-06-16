@@ -34,6 +34,19 @@ PATH_OHLC = "/0/public/OHLC"                      # channel:kraken_rest_GetOHLCD
 PATH_TICKER = "/0/public/Ticker"                  # channel:kraken_rest_Ticker (liquidity probe)
 PATH_OPEN_ORDERS = "/0/private/OpenOrders"        # channel:kraken_rest_GetOpenOrders
 PATH_BALANCE = "/0/private/Balance"               # channel:kraken_rest_GetAccountBalance
+PATH_QUERY_ORDERS = "/0/private/QueryOrders"      # channel:kraken_rest_QueryOrdersInfo (REST-QOI-002)
+
+# REST-HTTP-002 MANDATORY aiohttp ClientSession config VALUES (the single shared session,
+# REST-HTTP-005). Without an explicit timeout a degraded-network call hangs indefinitely and
+# starves the asyncio loop (REST-HTTP-001/002); force_close=False keeps HTTP keepalive so the
+# TCP connection is reused across calls (REST-HTTP-004). These are wire constants from 0500000
+# sec 7 container:Kraken_REST_API, NOT CIATS-tunable seeds.
+HTTP_TIMEOUT_TOTAL_SEC = 10
+HTTP_TIMEOUT_CONNECT_SEC = 5
+HTTP_TIMEOUT_SOCK_READ_SEC = 8
+HTTP_CONN_LIMIT = 10
+HTTP_CONN_LIMIT_PER_HOST = 5
+HTTP_CONN_FORCE_CLOSE = False
 
 
 class KrakenRestError(RuntimeError):
@@ -178,6 +191,51 @@ def parse_account_balance(payload: Mapping[str, object]) -> dict[str, Decimal]:
     return {asset: _dec(amount) for asset, amount in result.items()}
 
 
+# The order-info numeric fields converted to Decimal on parse (REST-OO-003 / REST-QOI-003:
+# every numeric value is a string, NO float arithmetic on financial values - ar:AR-047).
+_ORDER_DECIMAL_FIELDS = ("vol", "vol_exec", "cost", "fee", "price", "stopprice", "limitprice")
+
+
+def parse_query_orders(payload: Mapping[str, object]) -> dict[str, dict]:
+    """QueryOrders (QueryOrdersInfo) -> {txid: order-info dict}, Decimal-typed (REST-QOI-003).
+
+    The targeted single-order reconciliation source (the ar:AR-056 gap-close ACTUAL fill, FEE-
+    CALC-006): the result is the SAME order-info structure as GetOpenOrders' open-map values but
+    keyed directly by the queried txid (no "open" wrapper) and containing ONLY the requested
+    order_ids. Each order's numeric fields (vol_exec, cost, fee, price avg-fill, ...) are converted
+    to Decimal(str(value)) on parse. A non-numeric / absent field is left as-is."""
+    result = raise_for_error(payload)
+    out: dict[str, dict] = {}
+    for txid, order in result.items():
+        if not isinstance(order, Mapping):
+            continue
+        parsed = dict(order)
+        for fld in _ORDER_DECIMAL_FIELDS:
+            if parsed.get(fld) is not None:
+                parsed[fld] = _dec(parsed[fld])
+        out[str(txid)] = parsed
+    return out
+
+
+def gap_close_fill(order: Mapping[str, object]) -> tuple[Decimal, Decimal] | None:
+    """The ACTUAL close fill (avg_price, fee) for a gap-closed order, or None if it did not fill.
+
+    ar:AR-056 / FEE-CALC-006: a position absent from the reconnect snapshot closed during the gap
+    (its off-book emergSL fired offline). QueryOrders on that emergSL order returns its real fill -
+    the authoritative exit_price + fee for the evt:TRADE_CLOSE (the record-of-truth, never the
+    entry-time estimate). A fill exists only when the order is 'closed' with a non-zero vol_exec;
+    a still-open / canceled / zero-fill order yields None (the caller falls to the degraded estimate)."""
+    status = order.get("status")
+    vol_exec = order.get("vol_exec")
+    price = order.get("price")
+    if status != "closed" or vol_exec is None or price is None:
+        return None
+    if _dec(vol_exec) <= 0:
+        return None
+    fee = order.get("fee")
+    return _dec(price), (_dec(fee) if fee is not None else Decimal("0"))
+
+
 # --- the HTTP edge ------------------------------------------------------------
 
 @runtime_checkable
@@ -208,7 +266,20 @@ class AiohttpRestTransport:
         if self._session is None:
             import aiohttp  # lazy (VPS-runtime dependency)
 
-            self._session = aiohttp.ClientSession()
+            # REST-HTTP-002 MANDATORY config: an explicit timeout (no indefinite hang on a
+            # degraded network) + a keepalive connector (force_close=False reuses the TCP
+            # connection across calls, REST-HTTP-004). ONE session for the process (REST-HTTP-005).
+            timeout = aiohttp.ClientTimeout(
+                total=HTTP_TIMEOUT_TOTAL_SEC,
+                connect=HTTP_TIMEOUT_CONNECT_SEC,
+                sock_read=HTTP_TIMEOUT_SOCK_READ_SEC,
+            )
+            connector = aiohttp.TCPConnector(
+                limit=HTTP_CONN_LIMIT,
+                limit_per_host=HTTP_CONN_LIMIT_PER_HOST,
+                force_close=HTTP_CONN_FORCE_CLOSE,
+            )
+            self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
         return self._session
 
     async def get(self, url: str, params: Mapping[str, object]) -> dict:
@@ -306,3 +377,16 @@ class KrakenRestClient:
         """GetAccountBalance (private). The balance reconcile fallback."""
         payload = await self._private(PATH_BALANCE, {})
         return parse_account_balance(payload)
+
+    async def query_orders(self, txids: Sequence[str]) -> dict[str, dict]:
+        """QueryOrders / QueryOrdersInfo (private, REST-QOI-002). Targeted single-order
+        reconciliation: txid=comma-separated order_ids + trades=true. Returns {txid: order-info},
+        the ar:AR-056 gap-close ACTUAL-fill source (FEE-CALC-006) - pass an emergSL order id, read
+        gap_close_fill() off the result. An empty txid list short-circuits to {} (no call)."""
+        ids = [str(t) for t in txids if t]
+        if not ids:
+            return {}
+        payload = await self._private(
+            PATH_QUERY_ORDERS, {"txid": ",".join(ids), "trades": True}
+        )
+        return parse_query_orders(payload)
