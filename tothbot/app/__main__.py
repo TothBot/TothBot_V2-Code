@@ -38,9 +38,24 @@ from ..exchange.pacing import SubscribeTokenBucket
 from ..exchange.transport import Transport, connect
 from ..rest.client import KrakenRestClient
 from .runner import OpsSettings, run
-from .universe import load_universe
+from .universe import DEFAULT_ALWAYS_INCLUDE, load_universe
 
 ConnectFn = Callable[..., Awaitable[Transport]]
+
+
+def _parse_universe_override(environ: Mapping[str, str] | None) -> tuple[str, ...]:
+    """The TOTHBOT_UNIVERSE pin (comma-separated WS-v2 symbols) for a smoke / first-run test, or ()
+    when unset/blank (-> the full ar:AR-070 load). The BTC/USD anchor (ar:AR-074) is always unioned in
+    so the daily market_regime anchor computes even when the operator did not list it. Sorted +
+    de-duplicated so the ShardPlan partition is deterministic."""
+    import os
+
+    env = environ if environ is not None else os.environ
+    raw = env.get("TOTHBOT_UNIVERSE")
+    pinned = {p.strip() for p in raw.split(",") if p.strip()} if raw else set()
+    if not pinned:
+        return ()
+    return tuple(sorted(pinned | set(DEFAULT_ALWAYS_INCLUDE)))
 
 
 def make_public_open_socket(connect_fn: ConnectFn = connect) -> Callable[[int], Awaitable[Transport]]:
@@ -70,12 +85,22 @@ async def _amain(
         )
 
     open_socket = make_public_open_socket(connect_fn)
-    # ar:AR-070: derive the monitored universe from the instrument snapshot BEFORE assembling the data
-    # layer (it needs the pair set up front). A failed load raises UniverseLoadError -> the process exits
-    # (a cold-start must never trade against an unknown universe; mirrors REST-WST-006 HALT-on-no-token).
-    universe = await load_universe(open_socket)
+    # TOTHBOT_UNIVERSE override (a comma-separated pin, e.g. "BTC/USD,ETH/USD,SOL/USD") - a small fixed
+    # universe for a smoke / first-run test: it SKIPS the AR-070 instrument-snapshot load and uses the
+    # pinned pairs directly (the BTC/USD anchor is always unioned in, ar:AR-074, so the daily market_
+    # regime anchor still computes). Empty / unset -> the full ar:AR-070 load from the instrument snapshot.
+    pinned = _parse_universe_override(environ)
+    if pinned:
+        universe = pinned
+        print(f"tothbot.app: TOTHBOT_UNIVERSE pinned ({len(universe)} pairs): {', '.join(universe)}")
+    else:
+        # ar:AR-070: derive the monitored universe from the instrument snapshot BEFORE assembling the
+        # data layer (it needs the pair set up front). A failed load raises UniverseLoadError -> the
+        # process exits (never trade against an unknown universe; mirrors REST-WST-006 HALT-on-no-token).
+        universe = await load_universe(open_socket)
+        print(f"tothbot.app: AR-070 universe loaded ({len(universe)} pairs)")
     settings = replace(settings, universe=universe)
-    print(f"tothbot.app: AR-070 universe loaded ({len(universe)} pairs), starting {settings.mode.value} organism")
+    print(f"tothbot.app: starting {settings.mode.value} organism")
 
     await run_fn(
         settings,

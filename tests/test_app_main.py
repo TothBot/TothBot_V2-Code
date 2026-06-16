@@ -86,6 +86,29 @@ def test_amain_loads_universe_and_runs_paper_edges():
     assert callable(edges["open_socket"])
 
 
+def test_amain_universe_override_pins_pairs_and_skips_ar070_load():
+    # TOTHBOT_UNIVERSE pins a small fixed universe for a smoke run: load_universe is SKIPPED (the
+    # socket is never opened for a snapshot), the pinned pairs are used directly, and the BTC/USD
+    # anchor is unioned in (ar:AR-074) even though the operator listed only ETH/USD + SOL/USD.
+    connected: list = []
+
+    async def fake_connect(role):  # pragma: no cover - must NOT be called on the pinned path
+        connected.append(role)
+        raise AssertionError("pinned universe must not open a socket for the AR-070 load")
+
+    captured: dict = {}
+
+    async def fake_run(settings, **edges):
+        captured["settings"] = settings
+
+    asyncio.run(_amain(
+        {"TOTHBOT_MODE": "paper", "TOTHBOT_UNIVERSE": "ETH/USD, SOL/USD"},
+        connect_fn=fake_connect, run_fn=fake_run,
+    ))
+    assert captured["settings"].universe == ("BTC/USD", "ETH/USD", "SOL/USD")  # anchor unioned, sorted
+    assert connected == []  # the AR-070 snapshot load was skipped
+
+
 def test_amain_live_mode_halts_with_clear_message():
     async def fake_connect(role):  # pragma: no cover - never reached (the guard fires first)
         raise AssertionError("live must not connect")
