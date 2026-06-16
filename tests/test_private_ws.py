@@ -670,6 +670,47 @@ def test_build_balances_handler_feeds_the_live_wallet_cache():
     assert m.live_spot_wallet_usd() is None
 
 
+def test_build_captures_the_long_startup_baseline_once_never_on_reconnect():
+    # REST-BAL-004 / ar:AR-052: build() captures the LONG drawdown baseline ONCE at startup from the
+    # GetAccountBalance USD edge (assigned directly as portfolio_baseline_USD); a reconnect NEVER
+    # recaptures it (HR-WM-011 / AR-056 - the baseline survives the WS-REC-004 cache drop).
+    m = WSManager(Mode.LIVE)
+    calls: list = []
+
+    async def _balance():
+        calls.append(1)
+        return Decimal("7500.0")
+
+    async def _open():
+        return _IdleTransport()
+
+    asm = PrivateConnectionAssembler(
+        m, open_socket=_open, acquire_token=_tok, fetch_account_balance=_balance,
+        sleep=_noop_sleep,
+    )
+    pc = asyncio.run(asm.build())
+    assert m.portfolio_baseline(PositionSide.LONG) == Decimal("7500.0")   # captured at startup
+    assert m.portfolio_baseline(PositionSide.SHORT) is None               # short baseline deferred
+    assert len(calls) == 1
+    # a reconnect re-runs the restore steps but NOT the startup baseline capture (captured once).
+    asyncio.run(pc.driver.initiate(0, _random_reason()))
+    assert m.portfolio_baseline(PositionSide.LONG) == Decimal("7500.0")
+    assert len(calls) == 1
+
+
+def test_build_without_account_balance_edge_leaves_baseline_unset():
+    # back-compat: no REST-BAL-004 edge wired -> no live baseline captured (the sweep skips the long
+    # until one lands); build still succeeds (the edge is optional, like fetch_snap_orders).
+    m = WSManager(Mode.LIVE)
+
+    async def _open():
+        return _IdleTransport()
+
+    asm = PrivateConnectionAssembler(m, open_socket=_open, acquire_token=_tok, sleep=_noop_sleep)
+    asyncio.run(asm.build())
+    assert m.portfolio_baseline(PositionSide.LONG) is None
+
+
 # -- the private connection satisfies the Transport protocol at its edge --
 
 def test_fake_transport_is_transport():

@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 
 from .channels import PrivateChannel
 from .dispatch import DispatchTable, Handler
+from .position_mirror import PositionSide
 from .keepalive import ConnectionKeepalive
 from .rate_counter import RateCounter
 from .reconcile import ReconciliationTracker
@@ -66,6 +67,12 @@ FetchSnapOrders = Callable[[], Awaitable[Sequence[Mapping[str, object]]]]
 # given the gap-closed position's order id(s), return {txid: order-info} so gap_close_fill reads the
 # real exit avg_price + fee (FEE-CALC-006 record-of-truth). None -> the degraded entry-time estimate.
 QueryOrders = Callable[[Sequence[str]], Awaitable[Mapping[str, Mapping[str, object]]]]
+# The REST-BAL-004 startup drawdown-baseline source (ar:AR-052): the GetAccountBalance spot/main USD
+# assigned DIRECTLY as portfolio_baseline_USD, captured ONCE at startup (after the snap_orders Step 6),
+# never on reconnect (HR-WM-011 / AR-056). Returns the LONG (spot) portfolio USD; None -> no baseline
+# captured (the sweep skips the long until it lands). The SHORT margin-account-equity baseline source
+# (the REST endpoint for the margin equity) is a follow-on - the diagram leaves it undecided.
+FetchAccountBalance = Callable[[], Awaitable[object]]
 BalancesHandler = Handler                                # balances frame consumer (ledger = Path B)
 Clock = Callable[[], float]
 Sleep = Callable[[float], Awaitable[None]]
@@ -315,6 +322,7 @@ class PrivateConnectionAssembler:
         acquire_token: AcquireToken,
         fetch_snap_orders: FetchSnapOrders | None = None,
         query_orders: QueryOrders | None = None,
+        fetch_account_balance: FetchAccountBalance | None = None,
         balances_handler: BalancesHandler | None = None,
         coordinator: ShardReconnectCoordinator | None = None,
         on_event: EventSink | None = None,
@@ -335,6 +343,7 @@ class PrivateConnectionAssembler:
         self._acquire_token = acquire_token
         self._fetch_snap_orders = fetch_snap_orders
         self._query_orders = query_orders
+        self._fetch_account_balance = fetch_account_balance
         self._balances_handler = balances_handler or _balances_handler_for(ws_manager)
         self._coordinator = coordinator or ShardReconnectCoordinator()
         self._external_on_event = on_event
@@ -414,6 +423,7 @@ class PrivateConnectionAssembler:
         transport = await self._open_socket(PRIVATE_SHARD_INDEX)
         await self._subscribe(transport, self._token)
         self._emit(PrivateConnected())
+        await self._capture_startup_baseline()
 
         dispatch = DispatchTable()
         dispatch.register(PrivateChannel.EXECUTIONS, self._ingest)
@@ -468,6 +478,23 @@ class PrivateConnectionAssembler:
             coordinator=self._coordinator,
             driver=self._driver,
         )
+
+    async def _capture_startup_baseline(self) -> None:
+        """REST-BAL-004 / ar:AR-052: capture the LONG drawdown baseline ONCE at startup - the
+        GetAccountBalance spot/main USD assigned directly as portfolio_baseline_USD (rule:HR-WM-011:
+        never updated, never reset on reconnect; WSManager.set_live_portfolio_baseline enforces the
+        once-only capture). Runs ONLY in build() (the initial startup), never in a reconnect restore
+        step (AR-056). A no-op when no REST edge is wired (a test stand-in) or the wm lacks the baseline
+        surface (back-compat). The SHORT margin-account-equity baseline source is a follow-on - the
+        diagram pins the long (spot USD) but leaves the short margin-equity REST endpoint undecided."""
+        if self._fetch_account_balance is None:
+            return
+        capture = getattr(self._wm, "set_live_portfolio_baseline", None)
+        if not callable(capture):
+            return
+        usd = await self._fetch_account_balance()
+        if usd is not None:
+            capture(PositionSide.LONG, usd)   # ar:AR-052 long; the short baseline is deferred
 
     def _bind_reconnect(self):
         async def initiate(reason: DisconnectReason) -> Transport:
