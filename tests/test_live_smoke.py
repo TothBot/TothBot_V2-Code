@@ -254,10 +254,12 @@ def test_trade_close_closes_the_ciats_learning_loop():
 # --------------------------------------------------------------------------- TB00748 (c): the
 # RUNNING wm emits each exit THROUGH the side's CIATS sink (no manual sink call)
 
-def _assemble_real_wm():
+def _assemble_real_wm(*, report_emit=None, report_categories=None):
     """Assemble the paper organism over a REAL WSManager (not the decide-size stand-in), so the
     exit path is wired end-to-end: assemble_operational hands the per-side ciats_sinks to the wm's
-    per-module Exit Controllers (TB00748 (b)). Returns (system, wm, logger)."""
+    per-module Exit Controllers (TB00748 (b)). `report_emit` / `report_categories` wire the
+    contract:Operator_Reporting_Hierarchy C2-C6 PULL cadence into the OHLC_5m system clock (TB00755).
+    Returns (system, wm, logger)."""
     wm, logger = WSManager(Mode.PAPER, now_monotonic=lambda: 1.0), Logger()
 
     async def no_sleep(_s):
@@ -269,6 +271,7 @@ def _assemble_real_wm():
         wm=wm, logger=logger, mpp_store=MppCapStore(), reward_store=ExpectedRewardStore(),
         mode=Mode.PAPER, now_utc=lambda: datetime(2026, 6, 15, 7, 30, tzinfo=timezone.utc),
         rest_sleep=no_sleep, pace_sleep=no_sleep,
+        report_emit=report_emit, report_categories=report_categories,
     ))
     return system, wm, logger
 
@@ -601,4 +604,96 @@ def test_cadence_scheduler_delivers_the_monthly_report_over_the_smtp_transport()
     # NO new capture: the scheduled pull read the same Stream-1, it did not append to it.
     assert len(logger.operational) == captured_before
     # NO C1 alert was raised by the scheduled pull (the pull track never touches logger.alert).
+    assert not _mae_alert(logger)
+
+
+# ------------------------------------------------ TB00755: the cadence scheduler + SMTP transport BOUND
+# INTO THE LIVE ORGANISM CLOCK - assemble_operational wires the scheduler off the OHLC_5m system clock;
+# a run of 5m closes crossing a calendar month boundary FIRES the C4 MONTHLY pull over the real SMTP
+# transport, no manual tick, no new capture, no C1
+
+class _CaptureSmtp:
+    """A smtplib.SMTP stand-in for the live-organism proof: captures the (from, to, message) the
+    transport delivers, no socket. Shared sink list so the test reads what was sent."""
+
+    def __init__(self, sink):
+        self._sink = sink
+
+    def starttls(self):  # pragma: no cover - not configured in this proof
+        pass
+
+    def login(self, user, password):  # pragma: no cover - not configured in this proof
+        pass
+
+    def sendmail(self, from_addr, to_addrs, message):
+        self._sink.append((from_addr, to_addrs, message))
+
+    def quit(self):
+        pass
+
+
+def test_live_clock_fires_the_monthly_pull_over_the_smtp_transport():
+    # The TB00755 capstone: assemble_operational WIRES the PullCadenceScheduler off the OHLC_5m system
+    # clock + a real SmtpReportTransport (its socket the injected smtplib edge). A degrading June run
+    # builds the corpus + the reported theory; then 5m closes whose UTC instants cross the June->July
+    # month boundary drive the driver's clock -> the scheduler FIRES the C4 MONTHLY pull for June ->
+    # the SMTP transport delivers the rendered body, with NO manual tick, NO new capture, NO C1 alert.
+    from tothbot.exchange.candle_close import CandleCloseDetector, committed_candle_from_frame
+    from tothbot.recorder.report_transport import SmtpReportTransport, smtplib_send
+    from tothbot.recorder.reporting import ReportCategory
+
+    sent: list = []
+    transport = SmtpReportTransport(
+        send=smtplib_send("mail", smtp_factory=lambda host, port: _CaptureSmtp(sent)),
+        sender="tothbot@toth.bot", recipients=["wstothjr@gmail.com"])
+    system, _wm, logger = _assemble_real_wm(
+        report_emit=transport, report_categories=[ReportCategory.C4_MONTHLY])
+
+    # the assembly built the cadence scheduler AND wired its tick into the OHLC_5m system clock.
+    assert system.pull_scheduler is not None
+    assert system.driver._on_clock_tick.__self__ is system.pull_scheduler
+
+    # a degrading June run (winners hot, losers cool -> a stop-width LOOSEN -> a CHECK-failed theory
+    # REPORTED into Stream-1, no C1) builds the LONG corpus the C4 MONTHLY report reads.
+    sink = system.ciats_sinks[PositionSide.LONG]
+    for _ in range(120):
+        sink(_close_at("5", "2026-06-10T12:00:00+00:00", heat=5))
+    for _ in range(80):
+        sink(_close_at("-10", "2026-06-12T12:00:00+00:00", heat=1))
+    captured_before = len(logger.operational)
+
+    # Reseed the 5m detector to a clean June-2026 boundary: a real organism warmed in June 2026 has a
+    # contemporaneous clock, but the _FakeRest warm-up uses a 2023 epoch base - so set the live clock
+    # origin to the test timeline (the cadence reads the candle interval_begin as a UTC instant).
+    JUN1 = int(datetime(2026, 6, 1, tzinfo=timezone.utc).timestamp())
+    DAY = 86400
+
+    def _candle(begin):
+        return {"symbol": "BTC/USD", "interval_begin": begin, "open": "100", "high": "101",
+                "low": "99", "close": "100", "volume": "1000"}
+
+    system.driver._det5["BTC/USD"] = CandleCloseDetector(
+        "BTC/USD", last_interval_begin=JUN1, last_complete_candle=committed_candle_from_frame(_candle(JUN1)))
+    system.driver._stepped5["BTC/USD"] = JUN1
+
+    # Drive the OHLC_5m system clock. The detector fires the PRIOR candle on each roll, so the fired-
+    # close UTC instants run: June 1 (baseline), June 20 (same month), July 2 (rolls -> fire June).
+    asyncio.run(system.driver.on_ohlc_5m({"data": [_candle(JUN1 + 19 * DAY)]}))   # fires June 1
+    assert sent == []                                                              # baseline, no fire
+    asyncio.run(system.driver.on_ohlc_5m({"data": [_candle(JUN1 + 31 * DAY)]}))   # fires June 20
+    assert sent == []                                                              # same month, no fire
+    asyncio.run(system.driver.on_ohlc_5m({"data": [_candle(JUN1 + 40 * DAY)]}))   # fires July 2 -> roll
+
+    # the month boundary fired exactly the C4 MONTHLY pull for June, delivered over the SMTP transport.
+    assert len(sent) == 1
+    frm, to, msg = sent[0]
+    assert frm == "tothbot@toth.bot" and to == ["wstothjr@gmail.com"]
+    assert "Subject: TothBot C4 MONTHLY" in msg
+    # the delivered body carries the LONG module's realized June performance + the reported theory.
+    assert "module: LONG" in msg and "trades: 200" in msg and "net P/L: -200 USD" in msg
+    assert "REPORTED theories" in msg and "CHECK failed" in msg
+    # the periodic-pull track marker, DISTINCT from the C1 immediate push.
+    assert "X-TothBot-Track: periodic-pull" in msg
+    # NO new capture by the clock-driven pull, and NO C1 alert raised.
+    assert len(logger.operational) == captured_before
     assert not _mae_alert(logger)
