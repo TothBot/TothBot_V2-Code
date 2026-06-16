@@ -93,6 +93,7 @@ from .position_mirror import (
 )
 from .seam import DispatchSeam, EventSink, LiveSender, PaperSimulator
 from ..config import registry
+from ..config.fees import FEE_TAKER_PCT
 from ..config.settings import Mode
 from ..execution.exit_controller import ExitController, ExitReason
 from ..execution.exit_dispatch import (
@@ -281,6 +282,19 @@ class LiveExitMppExhausted:
 
     symbol: str
     code: str = field(default="LIVE_EXIT_MPP_EXHAUSTED", init=False)
+
+
+@dataclass(frozen=True)
+class GapCloseEstimated:
+    """GAP_CLOSE_ESTIMATED [WARNING] (ar:AR-056 / FEE-CALC-006) - a reconnect gap-close TRADE_CLOSE was
+    emitted from the ENTRY-TIME emergsl_price estimate + a calculated taker fee because the ACTUAL
+    close fill was not available (the REST QueryOrders / ownTrades backfill did not supply it). The
+    authoritative record-of-truth is the actual executions fill (FEE-CALC-006); this is the degraded
+    fallback, surfaced so a later actual-fill backfill can supersede it."""
+
+    symbol: str
+    estimated_exit_price: Decimal
+    code: str = field(default="GAP_CLOSE_ESTIMATED", init=False)
 
 
 @dataclass(frozen=True)
@@ -897,8 +911,53 @@ class WSManager:
         self, snap_orders: Sequence[Mapping[str, object]]
     ) -> list[PositionClosedDuringGap]:
         """Reconcile the mirror against the executions snapshot on reconnect/startup
-        (AR-056 RESTORE_POSITION_MIRROR / Step 6); returns the gap-closed positions."""
+        (AR-056 RESTORE_POSITION_MIRROR / Step 6); returns the gap-closed positions. The caller
+        emits the Trade Outcome Bus record for each via on_reconnect_gap_close (the gap-close fill
+        comes from the REST QueryOrders / executions backfill, a separate edge)."""
         return self.positions.restore_from_snapshot(snap_orders, writer=WRITER_ID)
+
+    def on_reconnect_gap_close(
+        self,
+        gap: PositionClosedDuringGap,
+        *,
+        exit_price: object | None = None,
+        fees_exit: object | None = None,
+    ) -> TradeClose:
+        """ar:AR-056: emit the evt:TRADE_CLOSE for a position that closed during a disconnect gap -
+        its off-book layer:L3 emergSL fired while TothBot was offline (the PositionClosedDuringGap
+        restore_from_snapshot returned). exit_reason = EMERGENCY_SL_FIRED (the layer:L3 q5_logs crash-
+        recovery reason "backfilled from the executions channel on TothBot recovery").
+
+        EXIT-PRICE / FEES SOURCE (FEE-CALC-006, the record-of-truth): the ACTUAL close fill - the REST
+        QueryOrders / ownTrades (or executions backfill) avg_price + fee - passed in as exit_price +
+        fees_exit. When the actual fill is unavailable, the DEGRADED fallback estimates the close from
+        the entry-time emergsl_price (the stop trigger) + a calculated taker fee (FEE-CALC-001), and
+        surfaces GAP_CLOSE_ESTIMATED so a later actual backfill can supersede it.
+
+        Routed through the side's mod:Exit_Controller on_live_close with clear_mirror=False -
+        restore_from_snapshot already removed the symbol (no double-close); steps 6/8/9 (emit, the
+        AR-073 Selection-Controller update, the G7 semaphore release) run byte-identical to every
+        close. Then the per-symbol live state is dropped (the retained entry fee + the MAE tracker +
+        any stale live-exit intent), like _drive_live_close."""
+        position = gap.position
+        symbol = position.symbol
+        if exit_price is not None:
+            px = _dec(exit_price)
+            fee = _dec(fees_exit) if fees_exit is not None else Decimal("0")
+        else:
+            # DEGRADED fallback: no actual fill -> the entry-time emergsl_price estimate + a calculated
+            # taker fee (FEE-CALC-001 fee_exit = qty * exit_price * FEE_TAKER_PCT). Surfaced as estimated.
+            px = _dec(position.emergsl_price) if position.emergsl_price is not None else position.avg_entry_price
+            fee = position.qty * px * Decimal(str(FEE_TAKER_PCT))
+            self._emit_event(GapCloseEstimated(symbol, px))
+        record = self._exit_controller_for(position.side).on_live_close(
+            position, px, ExitReason.EMERGENCY_SL_FIRED, fee, self
+        )
+        self._live_fees_entry.pop(symbol, None)
+        self._mae_tracker.clear(symbol)
+        self._live_exit_intents = [i for i in self._live_exit_intents if i.symbol != symbol]
+        self._live_exit_held.discard(symbol)
+        return record
 
     # --- Synthetic Capital Ledger: WSManager is the SOLE writer (rule:HR-WM-032) --
     # The mirror image of the Position-Mirror sole-writer pattern: these are the ONLY
@@ -1364,6 +1423,11 @@ def _ticker_entries(frame: Mapping[str, object]) -> list[Mapping[str, object]]:
 
 def _opt_str(value: object) -> str | None:
     return None if value is None else str(value)
+
+
+def _dec(value: object) -> Decimal:
+    """Decimal(str(value)) on receipt - NO float ever enters the math (ar:AR-047)."""
+    return value if isinstance(value, Decimal) else Decimal(str(value))
 
 
 def _emergsl_cl_ord_id(position: Position) -> str:

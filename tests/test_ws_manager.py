@@ -53,6 +53,7 @@ from tothbot.exchange.ws_manager import (
     ExitDispatchOutcome,
     LiveExitDetected,
     LiveExitDispatched,
+    GapCloseEstimated,
     LiveExitDeferredNoQuote,
     LiveExitDoubleDispatchSkipped,
     LiveExitHeldAmbiguous,
@@ -1318,6 +1319,51 @@ def test_live_limit_only_other_statuses_are_noops():
     for status in (PairStatus.ONLINE, PairStatus.CANCEL_ONLY, PairStatus.MAINTENANCE):
         mgr.on_instrument_status("BTC/USD", status, bid="61000", ask="61100")
     assert mgr.live_exit_intents_pending == 0
+
+
+# --- the AR-056 reconnect gap-close TRADE_CLOSE (an emergSL fired while offline) ---
+
+def test_reconnect_gap_close_emits_trade_close_from_the_actual_fill():
+    events: list = []
+    m = WSManager(Mode.LIVE, on_event=events.append)
+    _open_live_long(m)                                  # entry 60000, emergsl 54000, fee 7.8, qty 0.05
+    assert m.dispatch_semaphore_locked(PositionSide.LONG)
+    gaps = m.restore_position_mirror([])               # empty snapshot -> BTC/USD closed during the gap
+    assert len(gaps) == 1 and gaps[0].symbol == "BTC/USD"
+    # the ACTUAL emergSL fill from REST QueryOrders / ownTrades (FEE-CALC-006 record-of-truth).
+    rec = m.on_reconnect_gap_close(gaps[0], exit_price="53900", fees_exit="7.0")
+    assert rec.exit_reason is ExitReason.EMERGENCY_SL_FIRED
+    assert rec.exit_price == Decimal("53900") and rec.fees_exit_usd == Decimal("7.0")
+    # long net: (53900-60000)*0.05 = -305; -7.8 entry -7.0 exit = -319.8 (a loss).
+    assert rec.net_pl_usd == Decimal("-319.8") and rec.net_loss_usd == Decimal("319.8")
+    # the gap-close releases the G7 semaphore + clears the retained entry fee (no leak across trades).
+    assert not m.dispatch_semaphore_locked(PositionSide.LONG)
+    assert m.fees_entry_for("BTC/USD") is None
+    assert not any(isinstance(e, GapCloseEstimated) for e in events)
+
+
+def test_reconnect_gap_close_falls_back_to_the_emergsl_estimate_when_no_actual_fill():
+    events: list = []
+    m = WSManager(Mode.LIVE, on_event=events.append)
+    _open_live_long(m)
+    gaps = m.restore_position_mirror([])
+    rec = m.on_reconnect_gap_close(gaps[0])             # no actual fill -> estimate from emergsl 54000
+    assert rec.exit_price == Decimal("54000")
+    assert rec.fees_exit_usd == Decimal("0.05") * Decimal("54000") * Decimal(str(0.0026))
+    est = [e for e in events if isinstance(e, GapCloseEstimated)]
+    assert len(est) == 1 and est[0].estimated_exit_price == Decimal("54000")
+
+
+def test_reconnect_gap_close_short_mirror():
+    m = WSManager(Mode.LIVE)
+    _open_live_short(m)                                 # entry 60000, emergsl 66000, fee 7.8
+    assert m.dispatch_semaphore_locked(PositionSide.SHORT)
+    gaps = m.restore_position_mirror([])
+    rec = m.on_reconnect_gap_close(gaps[0], exit_price="66100", fees_exit="7.5")
+    assert rec.exit_reason is ExitReason.EMERGENCY_SL_FIRED
+    # short net: (60000-66100)*0.05 = -305; -7.8 -7.5 = -320.3 (a loss).
+    assert rec.net_pl_usd == Decimal("-320.3")
+    assert not m.dispatch_semaphore_locked(PositionSide.SHORT)
 
 
 # -- two independent per-module wallets (mod:Long_Module + mod:Short_Module, sec 7) ----
