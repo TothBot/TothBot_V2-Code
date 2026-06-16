@@ -539,3 +539,66 @@ def test_monthly_pull_trigger_renders_and_emits_the_operator_report():
     assert not _mae_alert(logger)
     # the SHORT module section is isolated (no closes flowed to it).
     assert "module: SHORT" in rendered.body
+
+
+# ------------------------------------------------ TB00754: the C4 MONTHLY pull DELIVERED end-to-end by
+# the cadence scheduler over the REAL SMTP transport - a degrading run -> the deterministic clock rolls
+# from June into July -> the scheduler fires the C4 MONTHLY pull -> the SMTP transport delivers the
+# rendered body to the operator surface, on the DISTINCT periodic-pull track, no new capture, no C1
+
+def test_cadence_scheduler_delivers_the_monthly_report_over_the_smtp_transport():
+    # The TB00754 capstone: the same degrading June run -> a PullCadenceScheduler driven by a
+    # deterministic injected clock; when the clock rolls from June into July the C4 MONTHLY bucket
+    # rolls over and the scheduler fires the pull for the COMPLETED month - which builds + renders +
+    # EMITS through the wired SmtpReportTransport. The real transport (its socket send injected and
+    # captured) delivers the rendered body carrying the LONG module's realized trade performance + the
+    # REPORTED disproven theory, on the periodic-pull track (NOT the C1 SMTP alert seam), with no new
+    # capture and no C1 alert raised by the scheduled pull.
+    from tothbot.recorder.report_render import PullReportService
+    from tothbot.recorder.report_transport import (
+        PullCadenceScheduler,
+        SmtpReportTransport,
+    )
+    from tothbot.recorder.reporting import ReportCategory
+
+    system, _wm, logger = _assemble_real_wm()
+    sink = system.ciats_sinks[PositionSide.LONG]
+    for _ in range(120):
+        sink(_close_at("5", "2026-06-10T12:00:00+00:00", heat=5))   # winners, hot
+    for _ in range(80):
+        sink(_close_at("-10", "2026-06-12T12:00:00+00:00", heat=1))  # losers, cool -> 200 + CUSUM breach
+
+    stores = {s.value: system.conductors[s].parameter_store for s in (PositionSide.LONG, PositionSide.SHORT)}
+    captured_before = len(logger.operational)
+
+    # wire the REAL delivery edge: the SMTP transport with its socket-level send injected (captured).
+    sent: list = []
+    transport = SmtpReportTransport(
+        send=lambda frm, to, msg: sent.append((frm, to, msg)),
+        sender="tothbot@toth.bot", recipients=["wstothjr@gmail.com"])
+    service = PullReportService(logger, stores, emit=transport)
+    scheduler = PullCadenceScheduler(service, [ReportCategory.C4_MONTHLY])
+
+    # the deterministic clock: a June tick (baseline, no fire) then a July tick (the month rolls over).
+    assert scheduler.tick(datetime(2026, 6, 30, 23, 55, tzinfo=timezone.utc)) == []
+    assert sent == []
+    fired = scheduler.tick(datetime(2026, 7, 1, 0, 5, tzinfo=timezone.utc))
+
+    # the scheduler fired exactly the C4 MONTHLY pull for the completed month.
+    assert [c for c, _ in fired] == [ReportCategory.C4_MONTHLY]
+    # the REAL transport delivered exactly one message to the operator surface.
+    assert len(sent) == 1
+    frm, to, msg = sent[0]
+    assert frm == "tothbot@toth.bot" and to == ("wstothjr@gmail.com",)
+    # the delivered body carries the LONG module's realized trade performance (200 trades, net -200).
+    assert "Subject: TothBot C4 MONTHLY" in msg
+    assert "module: LONG" in msg and "trades: 200" in msg and "net P/L: -200 USD" in msg
+    assert "inference-valid" in msg                            # the 200-trade floor is reached
+    # the REPORTED disproven stop-width theory rides the pull report, not a C1 push.
+    assert "REPORTED theories" in msg and "CHECK failed" in msg
+    # the periodic-pull track marker - DISTINCT from the C1 immediate push.
+    assert "X-TothBot-Track: periodic-pull" in msg
+    # NO new capture: the scheduled pull read the same Stream-1, it did not append to it.
+    assert len(logger.operational) == captured_before
+    # NO C1 alert was raised by the scheduled pull (the pull track never touches logger.alert).
+    assert not _mae_alert(logger)
