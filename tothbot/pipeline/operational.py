@@ -465,6 +465,9 @@ async def assemble_operational(
             open_socket=open_private_socket,
             acquire_token=acquire_token,
             fetch_snap_orders=fetch_snap_orders,
+            # ar:AR-056 gap-close ACTUAL-fill source (REST QueryOrders, FEE-CALC-006); the rest_client
+            # exposes query_orders (a stand-in without it -> the degraded entry-time estimate path).
+            query_orders=getattr(rest_client, "query_orders", None),
             balances_handler=balances_handler,
             on_event=event_sink,
             clock=mono_clock,

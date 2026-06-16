@@ -50,6 +50,7 @@ from .reconnect import (
 from .reconnect_driver import ReconnectDriver
 from .receive_loop import ShardReceiveLoop, SubscriptionAck
 from .transport import Transport
+from ..rest.client import gap_close_fill
 
 # The private connection is a single connection; it reuses the shard machinery with
 # a fixed index so the one ShardReconnectCoordinator / ReconnectDriver drive it.
@@ -61,6 +62,10 @@ AcquireToken = Callable[[], Awaitable[str]]              # REST GetWebSocketsTok
 # snap_orders source for the RESTORE_POSITION_MIRROR step (REST GetOpenOrders /
 # executions snapshot). Returns the open-order snapshot to reconcile against.
 FetchSnapOrders = Callable[[], Awaitable[Sequence[Mapping[str, object]]]]
+# The ar:AR-056 gap-close ACTUAL-fill source (REST QueryOrders / QueryOrdersInfo, REST-QOI-002):
+# given the gap-closed position's order id(s), return {txid: order-info} so gap_close_fill reads the
+# real exit avg_price + fee (FEE-CALC-006 record-of-truth). None -> the degraded entry-time estimate.
+QueryOrders = Callable[[Sequence[str]], Awaitable[Mapping[str, Mapping[str, object]]]]
 BalancesHandler = Handler                                # balances frame consumer (ledger = Path B)
 Clock = Callable[[], float]
 Sleep = Callable[[float], Awaitable[None]]
@@ -161,8 +166,18 @@ class ExecutionsIngest:
         self._observe_rate_counter(data)
         if message.get("type") == "snapshot":
             self.last_snap_orders = data
-            gap = self._wm.restore_position_mirror(data)
-            self._emit(PositionMirrorRestored(len(gap)))
+            gaps = self._wm.restore_position_mirror(data)
+            # ar:AR-056: each gap-closed position (its off-book L3 emergSL fired while disconnected)
+            # emits its evt:TRADE_CLOSE. The SYNC ingest path uses the DEGRADED entry-time estimate
+            # (it cannot await the REST QueryOrders actual fill); the async WS-REC-004 RESTORE_
+            # POSITION_MIRROR step supersedes with the actual fill when a query_orders edge is wired.
+            # Whichever reconciles the symbol FIRST wins - restore_from_snapshot removes it, so the
+            # other path sees no gap (never a double TRADE_CLOSE). getattr-guarded for a stand-in wm.
+            on_gap = getattr(self._wm, "on_reconnect_gap_close", None)
+            if callable(on_gap):
+                for gap in gaps:
+                    on_gap(gap)
+            self._emit(PositionMirrorRestored(len(gaps)))
             return
         for event in data:
             # I-6: a cancel-confirm (exec_type=canceled) for the resting off-book emergSL feeds the
@@ -285,6 +300,7 @@ class PrivateConnectionAssembler:
         open_socket: OpenPrivateSocket,
         acquire_token: AcquireToken,
         fetch_snap_orders: FetchSnapOrders | None = None,
+        query_orders: QueryOrders | None = None,
         balances_handler: BalancesHandler | None = None,
         coordinator: ShardReconnectCoordinator | None = None,
         on_event: EventSink | None = None,
@@ -304,6 +320,7 @@ class PrivateConnectionAssembler:
         self._open_private_socket = open_socket
         self._acquire_token = acquire_token
         self._fetch_snap_orders = fetch_snap_orders
+        self._query_orders = query_orders
         self._balances_handler = balances_handler or _noop_balances_handler
         self._coordinator = coordinator or ShardReconnectCoordinator()
         self._external_on_event = on_event
@@ -473,12 +490,50 @@ class PrivateConnectionAssembler:
         against snap_orders. Source = the injected REST GetOpenOrders edge if wired,
         else the last executions snapshot captured by the ingest. If neither exists
         the mirror is left untouched (never reconcile against an empty set - that
-        would falsely gap-close every open position)."""
+        would falsely gap-close every open position). Each gap-closed position then
+        emits its evt:TRADE_CLOSE through on_reconnect_gap_close, with the ACTUAL close
+        fill fetched via REST QueryOrders (FEE-CALC-006) when a query_orders edge is wired."""
         if self._fetch_snap_orders is not None:
             snap = await self._fetch_snap_orders()
         else:
             snap = self._ingest.last_snap_orders
         if snap is None:
             return
-        gap = self._wm.restore_position_mirror(snap)
-        self._emit(PositionMirrorRestored(len(gap)))
+        gaps = self._wm.restore_position_mirror(snap)
+        for gap in gaps:
+            await self._emit_gap_close(gap)
+        self._emit(PositionMirrorRestored(len(gaps)))
+
+    async def _emit_gap_close(self, gap) -> None:
+        """ar:AR-056: emit the gap-close evt:TRADE_CLOSE for one PositionClosedDuringGap. Fetches the
+        ACTUAL close fill via REST QueryOrders (the FEE-CALC-006 record-of-truth: the off-book emergSL
+        order's real exit avg_price + fee); absent an actual fill, on_reconnect_gap_close falls to the
+        entry-time emergsl_price estimate (surfaced GapCloseEstimated). getattr-guarded for a stand-in."""
+        on_gap = getattr(self._wm, "on_reconnect_gap_close", None)
+        if not callable(on_gap):
+            return
+        fill = await self._resolve_gap_fill(gap)
+        if fill is None:
+            on_gap(gap)
+        else:
+            exit_price, fee = fill
+            on_gap(gap, exit_price=exit_price, fees_exit=fee)
+
+    async def _resolve_gap_fill(self, gap):
+        """REST-QOI-002: query the gap-closed position's order id(s) (the off-book emergSL leg, then
+        the entry cl_ord_id) and return the first (exit_price, fee) of a closed/filled order, else None
+        (the degraded entry-time estimate). No query_orders edge / no order id -> None."""
+        if self._query_orders is None:
+            return None
+        position = gap.position
+        txids = [
+            t for t in (getattr(position, "emergsl_id", None), getattr(position, "cl_ord_id", None)) if t
+        ]
+        if not txids:
+            return None
+        orders = await self._query_orders(txids)
+        for order in (orders or {}).values():
+            fill = gap_close_fill(order)
+            if fill is not None:
+                return fill
+        return None

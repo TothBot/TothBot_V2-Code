@@ -35,8 +35,9 @@ from tothbot.exchange.rate_counter import (
     RateCounterUpdate,
     RateCounterWarning,
 )
+from tothbot.exchange.position_mirror import Position, PositionClosedDuringGap, PositionSide
 from tothbot.exchange.transport import Transport, TransportClosed
-from tothbot.exchange.ws_manager import WSManager
+from tothbot.exchange.ws_manager import GapCloseEstimated, WSManager
 
 
 class _FakeTransport:
@@ -290,6 +291,108 @@ def test_reconnect_runs_private_restore_and_restores_mirror():
 def _random_reason():
     from tothbot.exchange.reconnect import DisconnectReason
     return DisconnectReason.RANDOM
+
+
+# -- ar:AR-056 gap-close: the WS-REC-004 restore emits TRADE_CLOSE w/ the QueryOrders fill --
+
+from types import SimpleNamespace  # noqa: E402
+
+
+class _GapRecordingWM:
+    """A live wm stand-in: returns scripted gaps from restore_position_mirror + records each
+    on_reconnect_gap_close (symbol, exit_price, fees_exit) so the actual-vs-degraded fill is asserted."""
+
+    is_live = True
+
+    def __init__(self, gaps) -> None:
+        self._gaps = list(gaps)
+        self.transmitter = SimpleNamespace(bind=lambda _t: None)
+        self.gap_calls: list = []
+
+    def restore_position_mirror(self, _snap):
+        return list(self._gaps)
+
+    def on_reconnect_gap_close(self, gap, *, exit_price=None, fees_exit=None):
+        self.gap_calls.append((gap.symbol, exit_price, fees_exit))
+
+
+def _gap(symbol="ETH/USD", emergsl_id="OEMERG", cl_ord_id="cl-e1"):
+    pos = Position(symbol=symbol, side=PositionSide.SHORT, qty=Decimal("2"),
+                   avg_entry_price=Decimal("3000"), cl_ord_id=cl_ord_id,
+                   emergsl_id=emergsl_id, emergsl_price=Decimal("3100"))
+    return PositionClosedDuringGap(symbol, pos)
+
+
+async def _open_noop():
+    return _FakeTransport()
+
+
+async def _tok():
+    return "t"
+
+
+async def _one_snap():
+    return [{"symbol": "BTC/USD", "order_id": "O1"}]
+
+
+def test_reconnect_gap_close_uses_actual_query_orders_fill():
+    wm = _GapRecordingWM([_gap()])
+
+    async def _q(txids):
+        assert "OEMERG" in txids   # the off-book emergSL leg queried first (REST-QOI-002)
+        return {"OEMERG": {"status": "closed", "vol_exec": Decimal("2"),
+                           "price": Decimal("3050"), "fee": Decimal("1.2")}}
+
+    asm = PrivateConnectionAssembler(
+        wm, open_socket=_open_noop, acquire_token=_tok,
+        fetch_snap_orders=_one_snap, query_orders=_q, sleep=_noop_sleep,
+    )
+    asyncio.run(asm._restore_position_mirror())
+    # FEE-CALC-006 record-of-truth: the ACTUAL close fill avg_price + fee (not the estimate).
+    assert wm.gap_calls == [("ETH/USD", Decimal("3050"), Decimal("1.2"))]
+
+
+def test_reconnect_gap_close_degraded_when_no_query_orders_edge():
+    wm = _GapRecordingWM([_gap()])
+    asm = PrivateConnectionAssembler(
+        wm, open_socket=_open_noop, acquire_token=_tok,
+        fetch_snap_orders=_one_snap, sleep=_noop_sleep,
+    )
+    asyncio.run(asm._restore_position_mirror())
+    assert wm.gap_calls == [("ETH/USD", None, None)]   # degraded -> entry-time estimate path
+
+
+def test_reconnect_gap_close_degraded_when_query_returns_no_closed_fill():
+    wm = _GapRecordingWM([_gap()])
+
+    async def _q(txids):
+        return {"OEMERG": {"status": "open", "vol_exec": Decimal("0"), "price": Decimal("3100")}}
+
+    asm = PrivateConnectionAssembler(
+        wm, open_socket=_open_noop, acquire_token=_tok,
+        fetch_snap_orders=_one_snap, query_orders=_q, sleep=_noop_sleep,
+    )
+    asyncio.run(asm._restore_position_mirror())
+    assert wm.gap_calls == [("ETH/USD", None, None)]   # no closed fill -> degraded
+
+
+def test_executions_snapshot_emits_gap_close_estimated_on_the_sync_path():
+    events: list = []
+    m = WSManager(Mode.LIVE, on_event=events.append)
+    # an open SHORT carrying the entry-time emergsl_price (the degraded estimate basis)
+    m.record_execution(
+        {"exec_type": "filled", "symbol": "ETH/USD", "side": "sell", "cum_qty": "2",
+         "avg_price": "3000", "cl_ord_id": "cl-e1", "fee": "1.0"},
+        emergsl_price="3100", atr_14_entry="50",
+    )
+    asm = PrivateConnectionAssembler(
+        m, open_socket=_open_noop, acquire_token=_tok, sleep=_noop_sleep
+    )
+    # the re-subscribe snapshot frame shows ETH/USD gone -> gap-closed during the disconnect
+    asm.ingest({"channel": "executions", "type": "snapshot",
+                "data": [{"symbol": "BTC/USD", "order_id": "O1"}]})
+    assert not m.has_position("ETH/USD")
+    assert any(isinstance(e, GapCloseEstimated) and e.symbol == "ETH/USD" for e in events)
 
 
 # -- the private restore subset excludes public-channel steps -----------
