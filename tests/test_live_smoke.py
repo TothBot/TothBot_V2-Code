@@ -751,3 +751,34 @@ def test_running_closes_persist_to_the_durable_file_and_c5_reads_it_back():
 
         # NO durable-write failure was raised (no C1 TRADE_RECORD_WRITE_FAILED alert).
         assert not any(getattr(a, "code", None) == "TRADE_RECORD_WRITE_FAILED" for a in logger.alerts)
+
+
+# ------------------------------------------------ TB00757: the max-over-life MAE (MTM) tracker on the
+# live organism - a position runs DEEP against itself (a deep non-triggering ticker marks the high) then
+# exits BENIGN (an HTF regime reversal in profit); the TRADE_CLOSE carries the DEEP max-over-life heat,
+# not the shallow at-exit reading
+
+def test_running_position_reports_max_over_life_mae_not_the_benign_at_exit():
+    system, wm, logger = _assemble_real_wm()
+    _open_real_long(wm)                                        # entry 60000, atr 2000 -> L2 thr 3000
+
+    # a DEEP but sub-threshold adverse ticker (bid 57100 -> adverse 2900 < 3000): no exit fires, but
+    # the MTM tracker marks the heat (2900/60000). emergSL 54000 is far, so no L3 either.
+    wm.handle_ticker({"channel": "ticker", "type": "update",
+                      "data": [{"symbol": "BTC/USD", "bid": "57100", "ask": "57200"}]})
+    assert wm.has_position("BTC/USD")                          # still open (no exit fired)
+    assert wm.mae_pct_high_for("BTC/USD") == Decimal("2900") / Decimal("60000")
+
+    # then a BENIGN exit: an HTF 1H reversal (EMA20 < EMA50 for a long) at a PROFITABLE bid 60500 ->
+    # the run-to-reversal take-profit closes in profit (at-exit adverse excursion = 0).
+    wm.on_htf_ohlc_close("BTC/USD", "10", "20", bid="60500", ask="60600")
+    assert not wm.has_position("BTC/USD")                      # the regime exit closed it
+
+    # the emitted TRADE_CLOSE (the LONG Stream-2 corpus) carries the MAX-OVER-LIFE heat (the deep
+    # 2900/60000), NOT the benign at-exit 0 - the sharper signal the CIATS stop-width theory reads.
+    rec = logger.corpus_for("long")[-1]
+    assert rec.exit_reason is ExitReason.HTF_REGIME_REVERSAL
+    assert rec.net_pl_usd > 0                                  # the exit was in profit (benign)
+    assert rec.mae_pct_reached == Decimal("2900") / Decimal("60000")
+    assert rec.mae_pct_reached > Decimal("0")                  # the at-exit reading would have been 0
+    assert wm.mae_pct_high_for("BTC/USD") is None              # the tracker was cleared at close
