@@ -97,6 +97,7 @@ from ..config.settings import Mode
 from ..execution.exit_controller import ExitController, ExitReason
 from ..execution.exit_dispatch import (
     build_cancel_order,
+    build_limit_only_exit_order,
     build_market_sell_order,
     build_mpp_retry_order,
     mpp_retry_limit_price,
@@ -159,12 +160,19 @@ class TickerTriggerSwitched:
 class ExitDispatchOutcome(Enum):
     """The terminal state of one dispatch_live_exit run (for the driver + tests)."""
 
-    DISPATCHED = "dispatched"               # cancel confirmed -> market close out (reason stamped)
+    DISPATCHED = "dispatched"               # cancel confirmed -> close order out (reason stamped)
     SKIPPED_IN_FLIGHT = "skipped_in_flight"  # the double-dispatch guard fired (exit already in flight)
     NO_POSITION = "no_position"             # the intent's symbol had no open position (already closed)
+    NO_QUOTE = "no_quote"                   # no realizable bbo to price an IOC-limit close -> deferred
     HELD_PAIR_STATUS = "held_pair_status"   # AR-040 precondition: cancel_only / maintenance -> HOLD
     HELD_AMBIGUOUS = "held_ambiguous"       # I-6 2nd cancel timeout, state unknown -> HOLD + alert
     HELD_MPP_EXHAUSTED = "held_mpp_exhausted"  # C-1: all mpp_retry_count IOC retries rejected -> HOLD
+
+
+# The close-order kind a live exit dispatches: a MARKET close (the layer:L1a / L2 normal exits) or a
+# single IOC-LIMIT close (the ar:AR-040 PAIR_LIMIT_ONLY_EXIT - "NOT a market order", priced at the bbo).
+_CLOSE_MARKET = "market"
+_CLOSE_LIMIT_ONLY = "limit_only"
 
 
 @dataclass(frozen=True)
@@ -182,6 +190,7 @@ class LiveExitIntent:
     layer: str
     best_quote: object | None = None
     pair_status: PairStatus = PairStatus.ONLINE
+    close_type: str = _CLOSE_MARKET   # _CLOSE_MARKET (L1a/L2) | _CLOSE_LIMIT_ONLY (AR-040 limit_only)
 
 
 @dataclass(frozen=True)
@@ -272,6 +281,18 @@ class LiveExitMppExhausted:
 
     symbol: str
     code: str = field(default="LIVE_EXIT_MPP_EXHAUSTED", init=False)
+
+
+@dataclass(frozen=True)
+class LiveExitDeferredNoQuote:
+    """LIVE_EXIT_DEFERRED_NO_QUOTE [WARNING] - an AR-040 limit_only active exit fired but no realizable
+    bbo (best_bid for a long / best_ask for a short) was available to price the single IOC limit close,
+    so the close is deferred (the position retained, re-detected on the next event). The emergSL cancel
+    already ran, so the reason stamp is released. Surfaced, never silently dropped."""
+
+    symbol: str
+    exit_reason: str
+    code: str = field(default="LIVE_EXIT_DEFERRED_NO_QUOTE", init=False)
 
 
 # Default paper wallet seed (decision:D-05): $5,000 each for the Long + Short module
@@ -752,10 +773,28 @@ class WSManager:
             self._live_exit_held.add(symbol)
             self._emit_event(LiveExitHeldAmbiguous(symbol, emergsl_cl_ord_id))
             return ExitDispatchOutcome.HELD_AMBIGUOUS
-        # (2) the market close, with the C-1 MPP-rejection retry.
-        sold = await self._dispatch_market_sell_with_mpp_retry(
-            symbol, side, position.qty, intent.best_quote, deadline
-        )
+        # (2) the close order. L1a/L2 = a market close with the C-1 MPP-rejection retry; AR-040
+        # limit_only = a SINGLE IOC limit close at the bbo ("NOT a market order"), no retry.
+        if intent.close_type == _CLOSE_LIMIT_ONLY:
+            if intent.best_quote is None:
+                # no bbo to price the single IOC limit -> defer (retain the position, re-detect later).
+                # The emergSL was already cancelled, so release the stamp; the position is unprotected
+                # until the re-detection re-closes, but limit_only forbids a market backstop anyway.
+                self._pending_exit_reason.pop(symbol, None)
+                self._emit_event(LiveExitDeferredNoQuote(symbol, intent.exit_reason))
+                return ExitDispatchOutcome.NO_QUOTE
+            await self.seam.dispatch_market_sell(
+                build_limit_only_exit_order(
+                    symbol, side, order_qty=position.qty,
+                    limit_price=Decimal(str(intent.best_quote)),
+                    cl_ord_id=self._exit_cl_ord_id(symbol, 0), deadline=deadline,
+                )
+            )
+            sold = True   # the single IOC limit is out; the executions channel confirms the fill
+        else:
+            sold = await self._dispatch_market_sell_with_mpp_retry(
+                symbol, side, position.qty, intent.best_quote, deadline
+            )
         if not sold:
             # C-1: the market close + all mpp_retry_count IOC retries rejected. The emergSL is already
             # cancelled, so the position is unprotected -> HOLD + alert operator. Release the stamp.
@@ -1188,6 +1227,36 @@ class WSManager:
             self._drive_regime_exit(position, signal, bid, ask, pair_status)
         else:
             self._enqueue_live_regime_exit(position, signal, bid, ask, pair_status)
+
+    def on_instrument_status(
+        self,
+        symbol: str,
+        pair_status: PairStatus,
+        *,
+        bid: object | None = None,
+        ask: object | None = None,
+    ) -> None:
+        """ar:AR-040 instrument-status handler for an open-position pair (mod:Exit_Controller
+        q4_triggers, the 4th normal-operation reason). A transition to limit_only triggers an ACTIVE
+        exit via a SINGLE IOC limit close (LONG sell at best_bid / SHORT buy-to-cover at best_ask),
+        exit_reason PAIR_LIMIT_ONLY_EXIT - distinct from the cancel_only / maintenance HOLD branch
+        (which submits NO order; that gate lives in the L1a/L2 dispatch precondition). LIVE enqueues
+        the intent the async driver dispatches (cancel emergSL -> the single IOC limit, rule:HR-EC-013
+        cancel-then-close); a no-op for any other status. The live instrument-status channel that
+        drives this is a later slice (driven directly for now, like on_regime_classified)."""
+        if pair_status is not PairStatus.LIMIT_ONLY or not self.is_live:
+            return
+        position = self.positions.get(symbol)
+        if position is None:
+            return
+        quote = bid if position.side is PositionSide.LONG else ask
+        self._enqueue_live_exit(
+            LiveExitIntent(
+                symbol, position.side, ExitReason.PAIR_LIMIT_ONLY_EXIT.value,
+                trigger="AR-040_LIMIT_ONLY", layer="L1a_LIMIT_ONLY",
+                best_quote=quote, pair_status=pair_status, close_type=_CLOSE_LIMIT_ONLY,
+            )
+        )
 
     def _drive_regime_exit(
         self,

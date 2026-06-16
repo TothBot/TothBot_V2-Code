@@ -146,3 +146,37 @@ def build_mpp_retry_order(
         params["margin"] = True
         params["reduce_only"] = True            # ar:AR-009 buy-to-cover closes the margin short only
     return {"method": "add_order", "params": params}
+
+
+def build_limit_only_exit_order(
+    symbol: str,
+    side: PositionSide,
+    *,
+    order_qty: object,
+    limit_price: object,
+    cl_ord_id: str,
+    deadline: str,
+) -> dict:
+    """Build the ar:AR-040 PAIR_LIMIT_ONLY_EXIT close - the ACTIVE exit when an open-position pair
+    transitions to limit_only (the instrument-status channel reports the pair accepts limit orders
+    ONLY). A SINGLE marketable IOC LIMIT (mod:Exit_Controller q4_triggers: "NOT a market order"):
+    LONG sells at best_bid, SHORT buys-to-cover at best_ask (reduce_only, ar:AR-009). The emergSL is
+    cancelled FIRST by the same sequence-critical cancel (rule:HR-EC-013 - never an active close with
+    a resting stop), then this single IOC limit closes the position; exit_reason PAIR_LIMIT_ONLY_EXIT.
+    Same wire shape as the C-1 retry but priced AT the bbo (no walk-out) and a one-shot (no retry)."""
+    is_short = side is PositionSide.SHORT
+    params: dict[str, object] = {
+        "symbol": symbol,
+        "side": "buy" if is_short else "sell",   # LONG sells at best_bid; SHORT buys-to-cover at best_ask
+        "order_type": _ORDER_TYPE_LIMIT,         # a SINGLE IOC limit (limit_only accepts limit orders only)
+        "order_qty": _s(order_qty),
+        "limit_price": _s(limit_price),          # best_bid for a long, best_ask for a short
+        "time_in_force": _TIF_IOC,
+        "cl_ord_id": cl_ord_id,
+        "stp_type": _STP_CANCEL_NEWEST,
+        "deadline": deadline,
+    }
+    if is_short:
+        params["margin"] = True
+        params["reduce_only"] = True
+    return {"method": "add_order", "params": params}

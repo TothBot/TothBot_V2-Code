@@ -64,15 +64,19 @@ def _dec(value: object) -> Decimal:
 
 
 class PairStatus(Enum):
-    """ar:AR-040 instrument-status states relevant to the rule:HR-EC-016(a) L1a precondition.
+    """ar:AR-040 instrument-status states relevant to mod:Exit_Controller.
 
-    cancel_only / maintenance are the two pair-disruption states that BLOCK an L1a sell (HOLD
-    + CRITICAL alert); online is the normal proceed state. (limit_only is its own exit path -
-    exit_reason PAIR_LIMIT_ONLY_EXIT, a separate slice - not an L1a-blocking state.)"""
+    cancel_only / maintenance are the two pair-disruption states that BLOCK an L1a/L2 sell (the
+    rule:HR-EC-016(a) HOLD + CRITICAL alert); online is the normal proceed state. limit_only is its
+    OWN active-exit path (NOT a blocking state): an open-position pair transitioning to limit_only
+    triggers an ACTIVE exit via a single IOC limit order (LONG sell at best_bid / SHORT buy-to-cover
+    at best_ask), exit_reason PAIR_LIMIT_ONLY_EXIT (the mod:Exit_Controller q4_triggers AR-040
+    limit_only path, the 4th normal-operation exit reason)."""
 
     ONLINE = "online"
     CANCEL_ONLY = "cancel_only"
     MAINTENANCE = "maintenance"
+    LIMIT_ONLY = "limit_only"
 
 
 # The pair-disruption states that HOLD an L1a exit (rule:HR-EC-016(a)).

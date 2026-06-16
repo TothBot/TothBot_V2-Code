@@ -53,6 +53,7 @@ from tothbot.exchange.ws_manager import (
     ExitDispatchOutcome,
     LiveExitDetected,
     LiveExitDispatched,
+    LiveExitDeferredNoQuote,
     LiveExitDoubleDispatchSkipped,
     LiveExitHeldAmbiguous,
     LiveExitIntent,
@@ -66,6 +67,7 @@ from tothbot.exchange.ws_manager import (
 from tothbot.execution.exit_controller import ExitReason, PaperCloseSkipped, TradeClose
 from tothbot.execution.exit_dispatch import (
     build_cancel_order,
+    build_limit_only_exit_order,
     build_market_sell_order,
     build_mpp_retry_order,
     mpp_retry_limit_price,
@@ -1227,6 +1229,95 @@ def test_live_hr_ec_016b_l2_breach_upgrades_a_queued_l1a_intent():
     outcomes = asyncio.run(mgr.drive_live_exits())
     assert outcomes == [ExitDispatchOutcome.DISPATCHED]
     assert mgr._pending_exit_reason["BTC/USD"] == ExitReason.MAE_THRESHOLD_BREACH.value
+
+
+# --- the AR-040 PAIR_LIMIT_ONLY_EXIT active exit (the 4th Exit-Controller reason) ---
+
+def test_build_limit_only_exit_order_long_is_ioc_limit_at_best_bid():
+    msg = build_limit_only_exit_order(
+        "BTC/USD", PositionSide.LONG, order_qty=Decimal("0.05"),
+        limit_price=Decimal("61000"), cl_ord_id="x", deadline="d",
+    )
+    p = msg["params"]
+    assert p["side"] == "sell" and p["order_type"] == "limit" and p["time_in_force"] == "ioc"
+    assert p["limit_price"] == "61000" and "margin" not in p
+
+
+def test_build_limit_only_exit_order_short_is_margin_buy_to_cover_ioc_limit():
+    msg = build_limit_only_exit_order(
+        "BTC/USD", PositionSide.SHORT, order_qty=Decimal("0.05"),
+        limit_price=Decimal("61100"), cl_ord_id="x", deadline="d",
+    )
+    p = msg["params"]
+    assert p["side"] == "buy" and p["order_type"] == "limit" and p["time_in_force"] == "ioc"
+    assert p["margin"] is True and p["reduce_only"] is True
+
+
+def test_live_limit_only_enqueues_an_active_exit_intent():
+    mgr, sent, events = _live_manager()
+    _open_live_long(mgr)
+    mgr.on_instrument_status("BTC/USD", PairStatus.LIMIT_ONLY, bid="61000", ask="61100")
+    assert mgr.live_exit_intents_pending == 1
+    det = [e for e in events if isinstance(e, LiveExitDetected)]
+    assert len(det) == 1 and det[0].exit_reason == ExitReason.PAIR_LIMIT_ONLY_EXIT.value
+
+
+def test_live_limit_only_dispatch_cancels_then_single_ioc_limit_close():
+    mgr, sent, events = _live_manager(cancel_ack_wait=_always_ack)
+    _open_live_long(mgr)
+    mgr.on_instrument_status("BTC/USD", PairStatus.LIMIT_ONLY, bid="61000", ask="61100")
+    outcomes = asyncio.run(mgr.drive_live_exits())
+    assert outcomes == [ExitDispatchOutcome.DISPATCHED]
+    # cancel the emergSL FIRST (HR-EC-013), then a SINGLE IOC limit close at best_bid (NOT a market).
+    assert [op for op, _ in sent] == [OutboundOp.CANCEL_ORDER, OutboundOp.DISPATCH_MARKET_SELL]
+    close = sent[1][1]["params"]
+    assert close["order_type"] == "limit" and close["time_in_force"] == "ioc"
+    assert close["side"] == "sell" and close["limit_price"] == "61000"   # best_bid for a long
+    assert mgr._pending_exit_reason["BTC/USD"] == ExitReason.PAIR_LIMIT_ONLY_EXIT.value
+
+
+def test_live_limit_only_short_is_buy_to_cover_at_best_ask():
+    mgr, sent, events = _live_manager(cancel_ack_wait=_always_ack)
+    _open_live_short(mgr)
+    mgr.on_instrument_status("BTC/USD", PairStatus.LIMIT_ONLY, bid="61000", ask="61100")
+    asyncio.run(mgr.drive_live_exits())
+    close = [m for op, m in sent if op is OutboundOp.DISPATCH_MARKET_SELL][0]["params"]
+    assert close["side"] == "buy" and close["limit_price"] == "61100"   # best_ask for a short
+    assert close["reduce_only"] is True
+
+
+def test_live_limit_only_defers_when_no_realizable_quote():
+    mgr, sent, events = _live_manager(cancel_ack_wait=_always_ack)
+    _open_live_long(mgr)
+    mgr.on_instrument_status("BTC/USD", PairStatus.LIMIT_ONLY, bid=None, ask="61100")  # no bid (long)
+    outcomes = asyncio.run(mgr.drive_live_exits())
+    assert outcomes == [ExitDispatchOutcome.NO_QUOTE]
+    assert any(isinstance(e, LiveExitDeferredNoQuote) for e in events)
+    assert "BTC/USD" not in mgr._pending_exit_reason          # the stamp released on the defer
+    assert OutboundOp.DISPATCH_MARKET_SELL not in [op for op, _ in sent]   # no close order out
+
+
+def test_live_limit_only_then_executions_close_carries_the_reason():
+    mgr, sent, events = _live_manager(cancel_ack_wait=_always_ack)
+    _open_live_long(mgr)
+    mgr.on_instrument_status("BTC/USD", PairStatus.LIMIT_ONLY, bid="61000", ask="61100")
+    asyncio.run(mgr.drive_live_exits())
+    mgr.record_execution(
+        {"exec_type": "filled", "symbol": "BTC/USD", "side": "sell",
+         "cum_qty": "0.05", "avg_price": "61000", "fee": "7.9"}
+    )
+    tc = [e for e in events if isinstance(e, TradeClose)]
+    assert len(tc) == 1 and tc[0].exit_reason is ExitReason.PAIR_LIMIT_ONLY_EXIT
+
+
+def test_live_limit_only_other_statuses_are_noops():
+    # only limit_only triggers the active exit; online / cancel_only / maintenance enqueue nothing
+    # here (cancel_only / maintenance HOLD an L1a/L2 exit at dispatch, they do not themselves fire one).
+    mgr, sent, events = _live_manager()
+    _open_live_long(mgr)
+    for status in (PairStatus.ONLINE, PairStatus.CANCEL_ONLY, PairStatus.MAINTENANCE):
+        mgr.on_instrument_status("BTC/USD", status, bid="61000", ask="61100")
+    assert mgr.live_exit_intents_pending == 0
 
 
 # -- two independent per-module wallets (mod:Long_Module + mod:Short_Module, sec 7) ----
