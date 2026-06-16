@@ -208,6 +208,17 @@ class LiveExitDispatched:
 
 
 @dataclass(frozen=True)
+class LiveExitPriorityOverride:
+    """LIVE_EXIT_PRIORITY_OVERRIDE [HIGH] (rule:HR-EC-016(b)) - an L2 MAE breach arrived while an
+    L1a regime-exit was in progress (a reason stamped) or queued; the L2 takes PRIORITY: the same
+    cancel-then-sell completes but the reason carried onto the ONE TRADE_CLOSE is overridden to
+    MAE_THRESHOLD_BREACH (the original L1a reason suppressed, never a second dispatch/record)."""
+
+    symbol: str
+    code: str = field(default="LIVE_EXIT_PRIORITY_OVERRIDE", init=False)
+
+
+@dataclass(frozen=True)
 class LiveExitDoubleDispatchSkipped:
     """LIVE_EXIT_DOUBLE_DISPATCH_SKIPPED [WARNING] - a dispatch was requested for a symbol that
     already has an exit in flight (a reason stamped) or HELD; skipped to avoid a double cancel/sell.
@@ -616,15 +627,32 @@ class WSManager:
         return len(self._live_exit_intents)
 
     def _enqueue_live_exit(self, intent: LiveExitIntent) -> None:
-        """Sync-side: queue a detected live exit for the async driver. The double-dispatch guard
-        skips a symbol that already has an exit in flight (a reason stamped), is HELD, or is already
-        queued - one exit per open position (no double cancel/sell)."""
+        """Sync-side: queue a detected live exit for the async driver. The double-dispatch guard skips
+        a symbol that already has an exit in flight (a reason stamped), is HELD, or is already queued -
+        one exit per open position (no double cancel/sell).
+
+        rule:HR-EC-016(b) PRIORITY: an L2 MAE breach takes priority over an in-progress OR queued L1a
+        regime exit. Rather than a second dispatch, it OVERRIDES the in-flight stamped reason / the
+        queued intent's reason to MAE_THRESHOLD_BREACH so the SAME cancel-then-sell completes and the
+        ONE close fill carries the L2 reason (the original L1a reason suppressed - never two records)."""
         symbol = intent.symbol
-        if (
-            symbol in self._pending_exit_reason
-            or symbol in self._live_exit_held
-            or any(i.symbol == symbol for i in self._live_exit_intents)
-        ):
+        is_mae = intent.exit_reason == ExitReason.MAE_THRESHOLD_BREACH.value
+        # In flight: an exit reason is stamped (the L1a cancel sequence is underway, sec HR-EC-016(b)
+        # timing window: cancel submitted, market sell not yet emitted). L2 overrides the stamp.
+        if symbol in self._pending_exit_reason:
+            if is_mae and self._pending_exit_reason[symbol] != ExitReason.MAE_THRESHOLD_BREACH.value:
+                self._pending_exit_reason[symbol] = ExitReason.MAE_THRESHOLD_BREACH.value
+                self._emit_event(LiveExitPriorityOverride(symbol))
+            return
+        if symbol in self._live_exit_held:
+            return
+        # Queued but not yet dispatched: an L2 breach upgrades the queued L1a intent's reason in place
+        # (still ONE intent -> one dispatch); any other repeat detection is the plain double guard.
+        queued = next((i for i in self._live_exit_intents if i.symbol == symbol), None)
+        if queued is not None:
+            if is_mae and queued.exit_reason != ExitReason.MAE_THRESHOLD_BREACH.value:
+                self._live_exit_intents[self._live_exit_intents.index(queued)] = intent
+                self._emit_event(LiveExitPriorityOverride(symbol))
             return
         self._live_exit_intents.append(intent)
         self._emit_event(LiveExitDetected(symbol, intent.exit_reason, intent.trigger))
@@ -735,7 +763,10 @@ class WSManager:
             self._live_exit_held.add(symbol)
             self._emit_event(LiveExitMppExhausted(symbol))
             return ExitDispatchOutcome.HELD_MPP_EXHAUSTED
-        self._emit_event(LiveExitDispatched(symbol, intent.exit_reason))
+        # The reason the close fill will carry: the stamp may have been overridden to MAE mid-flight by
+        # an HR-EC-016(b) L2-priority breach during the cancel await; report the FINAL reason.
+        final_reason = self._pending_exit_reason.get(symbol, intent.exit_reason)
+        self._emit_event(LiveExitDispatched(symbol, final_reason))
         return ExitDispatchOutcome.DISPATCHED
 
     async def _cancel_emergsl_with_i6(

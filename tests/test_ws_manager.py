@@ -57,6 +57,7 @@ from tothbot.exchange.ws_manager import (
     LiveExitHeldAmbiguous,
     LiveExitIntent,
     LiveExitMppExhausted,
+    LiveExitPriorityOverride,
     MppRejectRetry,
     SelectionStateUpdated,
     TickerTriggerSwitched,
@@ -1184,6 +1185,48 @@ def test_live_exit_ar040_pair_status_holds_before_any_order():
     assert sent == []                                        # NOTHING transmitted (resting emergSL holds)
     assert any(isinstance(e, L1aExitHeld) for e in events)
     assert "BTC/USD" not in mgr._pending_exit_reason          # never stamped (no dispatch)
+
+
+# --- the HR-EC-016(b) Layer-2 priority over an in-progress / queued Layer-1a sequence ---
+
+def test_live_hr_ec_016b_l2_breach_overrides_in_flight_l1a_reason():
+    # HR-EC-016(b): an L2 MAE breach arriving WHILE the L1a cancel sequence is underway (the cancel
+    # ACK is being awaited, the market sell not yet emitted) overrides the reason to L2 - the SAME
+    # cancel-then-sell completes (one close), the original L1a reason suppressed.
+    holder: dict = {}
+
+    async def _ack_then_l2_breach(cl_ord_id, timeout):
+        # the read loop runs an L2-breaching ticker during the in-flight cancel await.
+        holder["m"].handle_ticker(_ticker("BTC/USD", "57000", "57100"))
+        return True
+
+    mgr, sent, events = _live_manager(cancel_ack_wait=_ack_then_l2_breach)
+    holder["m"] = mgr
+    _open_live_long(mgr)
+    mgr.on_htf_ohlc_close("BTC/USD", "99", "100", bid="61000", ask="61100")  # an L1a reversal first
+    outcomes = asyncio.run(mgr.drive_live_exits())
+    assert outcomes == [ExitDispatchOutcome.DISPATCHED]
+    # one cancel-then-sell (one close, never two), reason overridden to L2.
+    assert [op for op, _ in sent] == [OutboundOp.CANCEL_ORDER, OutboundOp.DISPATCH_MARKET_SELL]
+    assert mgr._pending_exit_reason["BTC/USD"] == ExitReason.MAE_THRESHOLD_BREACH.value
+    assert any(isinstance(e, LiveExitPriorityOverride) for e in events)
+    disp = [e for e in events if isinstance(e, LiveExitDispatched)][0]
+    assert disp.exit_reason == ExitReason.MAE_THRESHOLD_BREACH.value     # the FINAL (L2) reason
+
+
+def test_live_hr_ec_016b_l2_breach_upgrades_a_queued_l1a_intent():
+    # the queued-but-not-yet-dispatched variant: an L2 breach upgrades the queued L1a intent's reason
+    # in place (still ONE intent -> one dispatch), not a second exit.
+    mgr, sent, events = _live_manager(cancel_ack_wait=_always_ack)
+    _open_live_long(mgr)
+    mgr.on_htf_ohlc_close("BTC/USD", "99", "100", bid="61000", ask="61100")  # queue an L1a intent
+    assert mgr.live_exit_intents_pending == 1
+    mgr.handle_ticker(_ticker("BTC/USD", "57000", "57100"))                 # L2 breach upgrades it
+    assert mgr.live_exit_intents_pending == 1                               # still one intent
+    assert any(isinstance(e, LiveExitPriorityOverride) for e in events)
+    outcomes = asyncio.run(mgr.drive_live_exits())
+    assert outcomes == [ExitDispatchOutcome.DISPATCHED]
+    assert mgr._pending_exit_reason["BTC/USD"] == ExitReason.MAE_THRESHOLD_BREACH.value
 
 
 # -- two independent per-module wallets (mod:Long_Module + mod:Short_Module, sec 7) ----
