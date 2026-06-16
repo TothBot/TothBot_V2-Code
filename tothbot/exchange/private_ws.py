@@ -105,6 +105,18 @@ class PrivateConnected:
 
 
 @dataclass(frozen=True)
+class OrderRejected:
+    """ORDER_REJECTED [WARNING] {cl_ord_id, error} - an add_order RESPONSE came back success:false
+    (a Kraken Max-Price-Protection reject on a wide spread, the C-1 condition). Surfaced for audit;
+    the dispatch driver's reject probe reads the registry record_order_response feeds and walks out
+    the marketable IOC retry (sec 4.1 C-1)."""
+
+    cl_ord_id: str
+    error: str
+    code: str = field(default="ORDER_REJECTED", init=False)
+
+
+@dataclass(frozen=True)
 class PositionMirrorRestored:
     """POSITION_MIRROR_RESTORED [INFO] {gap_closed} - the RESTORE_POSITION_MIRROR step
     reconciled the mirror against snap_orders; gap_closed counts positions that closed
@@ -153,7 +165,21 @@ class ExecutionsIngest:
             self._emit(PositionMirrorRestored(len(gap)))
             return
         for event in data:
+            # I-6: a cancel-confirm (exec_type=canceled) for the resting off-book emergSL feeds the
+            # cancel-ACK registry, so the cancel-then-sell driver's "confirmed -> proceed" branch sees
+            # it (WS-EXE-009 canceled). Fed alongside the mirror dispatch (the mirror IGNORES canceled).
+            self._maybe_record_cancel_ack(event)
             self._wm.record_execution(event)
+
+    def _maybe_record_cancel_ack(self, event: Mapping[str, object]) -> None:
+        """Feed WSManager.record_cancel_ack from an executions cancel-confirm frame (the I-6
+        req_id registry). A canceled exec_type carrying a cl_ord_id confirms that order's cancel;
+        a canceled frame with no cl_ord_id carries no correlation key and is left to the mirror."""
+        if event.get("exec_type") != "canceled":
+            return
+        cl_ord_id = event.get("cl_ord_id")
+        if cl_ord_id is not None:
+            self._wm.record_cancel_ack(str(cl_ord_id))
 
     def _observe_rate_counter(self, data: Sequence[Mapping[str, object]]) -> None:
         """ar:AR-030 / A-1: route each ratecounter:true per-pair value to the RateCounter,
@@ -172,6 +198,47 @@ class ExecutionsIngest:
     def _emit(self, event: object) -> None:
         if self._on_event is not None:
             self._on_event(event)
+
+
+def _response_cl_ord_ids(message: Mapping[str, object]) -> list[str]:
+    """The cl_ord_id(s) echoed on an add_order/batch_add RESPONSE frame. WS v2 carries the client
+    id in ``result`` - a single dict for add_order ({cl_ord_id, order_id}) or a list for batch_add;
+    falls back to a top-level cl_ord_id (some reject envelopes echo it there). Empty when none."""
+    out: list[str] = []
+    result = message.get("result")
+    elems = result if isinstance(result, (list, tuple)) else [result]
+    for elem in elems:
+        if isinstance(elem, Mapping) and elem.get("cl_ord_id") is not None:
+            out.append(str(elem["cl_ord_id"]))
+    if not out and message.get("cl_ord_id") is not None:
+        out.append(str(message["cl_ord_id"]))
+    return out
+
+
+class OrderAckHandler:
+    """Routes Kraken add_order RESPONSE frames to the C-1 MPP-reject registry (the loop's on_order_ack).
+
+    The order-RPC response is a method frame {method:"add_order", success:bool, result:{cl_ord_id,..},
+    error:..}: success:false is the Max-Price-Protection reject the dispatch driver's reject probe
+    reads, success:true the accept (the probe short-circuits on it). Records EVERY add_order/batch_add
+    response through WSManager.record_order_response(cl_ord_id, rejected=not success). The cancel ACK
+    is NOT sourced here - it comes from the executions cancel-confirm frame (I-6); a cancel_order
+    response frame is ignored by this handler."""
+
+    _ADD_METHODS = frozenset({"add_order", "batch_add"})
+
+    def __init__(self, ws_manager, *, on_event: EventSink | None = None) -> None:
+        self._wm = ws_manager
+        self._on_event = on_event
+
+    def __call__(self, message: dict) -> None:
+        if message.get("method") not in self._ADD_METHODS:
+            return
+        rejected = not bool(message.get("success", True))
+        for cl_ord_id in _response_cl_ord_ids(message):
+            self._wm.record_order_response(cl_ord_id, rejected=rejected)
+            if rejected and self._on_event is not None:
+                self._on_event(OrderRejected(cl_ord_id, str(message.get("error") or "")))
 
 
 def _noop_balances_handler(_frame: dict) -> None:
@@ -321,6 +388,20 @@ class PrivateConnectionAssembler:
         dispatch.register(PrivateChannel.EXECUTIONS, self._ingest)
         dispatch.register(PrivateChannel.BALANCES, self._balances_handler)
 
+        # The sec-12.5 LIVE FLOW pump: after each inbound batch (and every idle tick), drain the
+        # live-exit driver so a detected exit (enqueued by the public ticker/instrument handlers or
+        # the daily-compute L1a path) dispatches its cancel-then-sell over THIS bound private socket
+        # within one tick_interval. SKIPPED mid-reconnect (the loop's own guard). The C-1 MPP-reject
+        # feed routes add_order RESPONSE frames -> WSManager.record_order_response. Both are guarded
+        # by getattr so a lightweight wm test stand-in (no exit surface) is left unwired (the
+        # operational.py set_ciats_exit_sinks pattern).
+        after_batch = getattr(self._wm, "drive_live_exits", None)
+        on_order_ack = (
+            OrderAckHandler(self._wm, on_event=self._on_event)
+            if callable(getattr(self._wm, "record_order_response", None))
+            else None
+        )
+
         loop = ShardReceiveLoop(
             transport,
             dispatch,
@@ -329,6 +410,8 @@ class PrivateConnectionAssembler:
             is_reconnecting=self._coordinator.any_reconnecting,  # rule:HR-WM-012
             initiate_reconnect=self._bind_reconnect(),
             on_event=self._on_event,
+            on_order_ack=on_order_ack,
+            after_batch=after_batch if callable(after_batch) else None,
             clock=self._clock,
             tick_interval=self._tick_interval,
         )

@@ -379,6 +379,12 @@ class WSManager:
         self._live_exit_intents: list[LiveExitIntent] = []
         self._live_exit_held: set[str] = set()
         self._cancel_acks: set[str] = set()
+        # The C-1 order-response registry (the MPP-reject probe feed): cl_ord_id -> rejected?, set by
+        # record_order_response when an add_order RESPONSE frame arrives on the private connection
+        # (rejected True on a Kraken Max-Price-Protection reject, False on an accept). The default
+        # _default_market_rejected polls it; recording BOTH outcomes lets the probe short-circuit on
+        # an accept (no happy-path full-window wait).
+        self._order_responses: dict[str, bool] = {}
         self._exit_seq = 0
         # The two CIATS-owned exit params (existence canonical at mod:Exit_Controller D3; values home
         # TB00000 sec 8 via the registry): the cancel-ACK timeout window (I-6) + the MPP retry count (C-1).
@@ -649,6 +655,15 @@ class WSManager:
         surface it feeds."""
         self._cancel_acks.add(cl_ord_id)
 
+    def record_order_response(self, cl_ord_id: str, *, rejected: bool) -> None:
+        """C-1 registry: the order-ack handler records each add_order RESPONSE here when it arrives
+        on the private connection - rejected=True on a Kraken Max-Price-Protection reject (the wire
+        success:false), False on an accept. The default MPP-reject probe (_default_market_rejected)
+        reads it to resolve the cancel-then-sell C-1 branch (retry on reject, proceed on accept);
+        recording the accept too lets the probe short-circuit without a full-window wait. The live
+        wire detail (the exact reject error class) is the order-ack handler's concern."""
+        self._order_responses[cl_ord_id] = rejected
+
     def clear_live_exit_held(self, symbol: str) -> None:
         """Operator surface: clear a symbol HELD after an I-6 ambiguous-state cancel timeout or a C-1
         MPP exhaustion, so a fresh detection can re-dispatch (the diagram's 'alert operator' terminal
@@ -902,10 +917,21 @@ class WSManager:
         return True
 
     async def _default_market_rejected(self, message: dict) -> bool:
-        """Default C-1 MPP-reject probe: report no rejection (the live reject-frame wiring - reading a
-        Kraken add_order error/reject response - is a later slice). Tests inject a stub to drive the
-        C-1 retry path."""
-        return False
+        """Default C-1 MPP-reject probe (live): poll the order-response registry for THIS order's
+        cl_ord_id up to param:cancel_timeout_window. The on_order_ack handler records each add_order
+        RESPONSE (record_order_response: rejected on a Kraken Max-Price-Protection reject, accepted
+        otherwise), so the probe resolves as soon as EITHER arrives - an accept short-circuits it with
+        no happy-path full-window wait. Absent any response within the window, treat as NOT rejected
+        (the executions fill is the close confirmation). Tests inject a stub for deterministic timing."""
+        cl_ord_id = _order_cl_ord_id(message)
+        if cl_ord_id is None:
+            return False
+        deadline = self._now_monotonic() + self._cancel_timeout_window
+        while cl_ord_id not in self._order_responses:
+            if self._now_monotonic() >= deadline:
+                break
+            await asyncio.sleep(self._cancel_ack_poll_s)
+        return self._order_responses.pop(cl_ord_id, False)
 
     def restore_position_mirror(
         self, snap_orders: Sequence[Mapping[str, object]]
@@ -1440,6 +1466,19 @@ def _emergsl_cl_ord_id(position: Position) -> str:
     if position.cl_ord_id is not None:
         return f"{position.cl_ord_id}-sl"
     return f"{position.symbol}-sl"
+
+
+def _order_cl_ord_id(message: Mapping[str, object]) -> str | None:
+    """The cl_ord_id of an OUTBOUND order message (build_market_sell_order / build_mpp_retry_order /
+    build_limit_only_exit_order) - the key the C-1 MPP-reject probe correlates the add_order response
+    against. Reads params.cl_ord_id (the WS v2 shape); None when the message carries no client id."""
+    params = message.get("params")
+    if isinstance(params, Mapping):
+        cl = params.get("cl_ord_id")
+        if cl is not None:
+            return str(cl)
+    cl = message.get("cl_ord_id")
+    return str(cl) if cl is not None else None
 
 
 def _frame_fee(event: Mapping[str, object]) -> Decimal:

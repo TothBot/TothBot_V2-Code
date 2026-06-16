@@ -22,8 +22,11 @@ from tothbot.config.settings import Mode
 from tothbot.exchange.channels import PrivateChannel
 from tothbot.exchange.reconnect import RestoreStep, build_private_restore_sequence
 from tothbot.exchange.private_ws import (
+    OrderAckHandler,
+    OrderRejected,
     PositionMirrorRestored,
     PrivateConnectionAssembler,
+    _response_cl_ord_ids,
     balances_subscribe,
     executions_subscribe,
 )
@@ -153,6 +156,63 @@ def test_executions_snapshot_reconciles_and_captures():
     assert m.open_position_symbols() == frozenset({"BTC/USD"})
     assert asm.ingest.last_snap_orders == [{"symbol": "BTC/USD", "order_id": "O1"}]
     assert any(isinstance(e, PositionMirrorRestored) and e.gap_closed == 1 for e in events)
+
+
+# -- I-6: an executions cancel-confirm feeds the cancel-ACK registry --------
+
+def test_executions_cancel_confirm_records_cancel_ack():
+    m = WSManager(Mode.LIVE)
+    asm = PrivateConnectionAssembler(
+        m, open_socket=lambda: _FakeTransport(), acquire_token=lambda: "t"
+    )
+    asm.ingest({"channel": "executions", "type": "update",
+                "data": [{"exec_type": "canceled", "cl_ord_id": "cl-1-sl"}]})
+    assert "cl-1-sl" in m._cancel_acks   # the I-6 "confirmed -> proceed" branch can now read it
+
+
+def test_executions_canceled_without_cl_ord_id_records_nothing():
+    m = WSManager(Mode.LIVE)
+    asm = PrivateConnectionAssembler(
+        m, open_socket=lambda: _FakeTransport(), acquire_token=lambda: "t"
+    )
+    asm.ingest({"channel": "executions", "type": "update",
+                "data": [{"exec_type": "canceled"}]})
+    assert m._cancel_acks == set()
+
+
+# -- the C-1 order-ack reject handler (add_order RESPONSE -> reject registry) --
+
+def test_response_cl_ord_ids_from_result_dict_list_and_top_level():
+    assert _response_cl_ord_ids({"result": {"cl_ord_id": "A"}}) == ["A"]
+    assert _response_cl_ord_ids({"result": [{"cl_ord_id": "A"}, {"cl_ord_id": "B"}]}) == ["A", "B"]
+    assert _response_cl_ord_ids({"cl_ord_id": "C"}) == ["C"]   # top-level fallback
+    assert _response_cl_ord_ids({"result": {}}) == []
+
+
+def test_order_ack_handler_records_reject_and_surfaces_event():
+    m = WSManager(Mode.LIVE)
+    events: list = []
+    handler = OrderAckHandler(m, on_event=events.append)
+    handler({"method": "add_order", "success": False, "error": "EOrder:MPP",
+             "result": {"cl_ord_id": "X-1"}})
+    assert m._order_responses["X-1"] is True   # the C-1 reject probe will read True
+    assert any(isinstance(e, OrderRejected) and e.cl_ord_id == "X-1" for e in events)
+
+
+def test_order_ack_handler_records_accept_without_event():
+    m = WSManager(Mode.LIVE)
+    events: list = []
+    handler = OrderAckHandler(m, on_event=events.append)
+    handler({"method": "add_order", "success": True, "result": {"cl_ord_id": "X-2"}})
+    assert m._order_responses["X-2"] is False   # accept -> the probe short-circuits to not-rejected
+    assert not events
+
+
+def test_order_ack_handler_ignores_cancel_order_response():
+    m = WSManager(Mode.LIVE)
+    handler = OrderAckHandler(m)
+    handler({"method": "cancel_order", "success": True, "result": {"cl_ord_id": "cl-1-sl"}})
+    assert m._order_responses == {}   # cancel ACK is sourced from executions, not here (I-6)
 
 
 # -- end to end: a fill frame through the receive loop opens the mirror --

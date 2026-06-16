@@ -926,14 +926,31 @@ def test_live_close_carries_max_over_life_heat_from_ticker_marking():
 
 # -- LIVE EXIT DETECTION -> MARKET-SELL DISPATCH (sec 3 Image3 / sec 4.1 / sec 12.5) ----------
 
-def _live_manager(**kw):
-    """A LIVE WSManager with an injected live_sender capturing every (op, message) to Kraken."""
+async def _never_reject(message):
+    """An add_order RESPONSE that ACCEPTED the order (the C-1 happy path: no MPP reject). The
+    test default for the market-reject probe - the analogue of injecting cancel_ack_wait=_always_
+    ack, so a dispatch test resolves the reject probe instantly instead of polling the response
+    registry. Pass market_rejected=None to exercise the real registry-backed default instead."""
+    return False
+
+
+_REAL_DEFAULT_PROBE = object()  # sentinel: use WSManager's own registry-poll default probe
+
+
+def _live_manager(*, market_rejected=_REAL_DEFAULT_PROBE, **kw):
+    """A LIVE WSManager with an injected live_sender capturing every (op, message) to Kraken. The
+    market-reject probe defaults to _never_reject (an accepted order - instant + deterministic);
+    pass market_rejected=None to exercise WSManager's registry-poll default, or a stub to drive C-1."""
     sent: list = []
     events: list = []
 
     async def _live(op, message):
         sent.append((op, message))
 
+    if market_rejected is _REAL_DEFAULT_PROBE:
+        market_rejected = _never_reject     # the accepted-order test default
+    if market_rejected is not None:
+        kw["market_rejected"] = market_rejected   # None -> WSManager's registry-poll default
     mgr = WSManager(Mode.LIVE, live_sender=_live, on_event=events.append, **kw)
     return mgr, sent, events
 
@@ -1171,6 +1188,63 @@ def test_live_exit_c1_mpp_all_retries_rejected_holds_and_alerts():
     assert len(sells) == 1 + 3
     assert any(isinstance(e, LiveExitMppExhausted) for e in events)
     assert "BTC/USD" in mgr._live_exit_held
+
+
+# --- the C-1 default MPP-reject probe over the order-response registry ---
+
+class _AdvancingClock:
+    """A monotonic clock that jumps far ahead after its first read, so a registry-poll wait
+    crosses its deadline on the next check (deterministic timeout, no real sleeping)."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        v = self.t
+        self.t += 1000.0
+        return v
+
+
+def test_default_market_rejected_true_when_reject_recorded():
+    mgr, *_ = _live_manager()  # no market_rejected injected -> the default registry probe
+    mgr.record_order_response("X-1", rejected=True)
+    msg = {"method": "add_order", "params": {"cl_ord_id": "X-1"}}
+    assert asyncio.run(mgr._default_market_rejected(msg)) is True
+
+
+def test_default_market_rejected_false_and_short_circuits_on_accept():
+    mgr, *_ = _live_manager()
+    mgr.record_order_response("X-2", rejected=False)   # an accept resolves it immediately
+    msg = {"method": "add_order", "params": {"cl_ord_id": "X-2"}}
+    assert asyncio.run(mgr._default_market_rejected(msg)) is False
+
+
+def test_default_market_rejected_false_on_no_response_within_window():
+    mgr, *_ = _live_manager(now_monotonic=_AdvancingClock())
+    msg = {"method": "add_order", "params": {"cl_ord_id": "NEVER"}}
+    assert asyncio.run(mgr._default_market_rejected(msg)) is False  # window elapsed, no response
+
+
+def test_default_market_rejected_false_when_message_has_no_cl_ord_id():
+    mgr, *_ = _live_manager()
+    assert asyncio.run(mgr._default_market_rejected({"method": "add_order", "params": {}})) is False
+
+
+def test_default_market_rejected_drives_the_full_c1_retry_via_registry():
+    # End-to-end: the DEFAULT probe (no injected market_rejected) reads the registry. Pre-record a
+    # reject for the FIRST exit order (the market close cl_ord_id is monotonic "<sym>-exit-1") and an
+    # accept for the first IOC retry ("<sym>-mpp1-2"), so the driver walks out exactly one IOC retry.
+    mgr, sent, events = _live_manager(cancel_ack_wait=_always_ack, market_rejected=None)
+    _open_live_long(mgr)
+    mgr.record_order_response("BTC/USD-exit-1", rejected=True)
+    mgr.record_order_response("BTC/USD-mpp1-2", rejected=False)
+    mgr.handle_ticker(_ticker("BTC/USD", "57000", "57100"))
+    outcomes = asyncio.run(mgr.drive_live_exits())
+    assert outcomes == [ExitDispatchOutcome.DISPATCHED]
+    sells = [m for op, m in sent if op is OutboundOp.DISPATCH_MARKET_SELL]
+    assert sells[0]["params"]["order_type"] == "market"   # rejected per the registry
+    assert sells[1]["params"]["order_type"] == "limit"    # the C-1 IOC retry that the accept cleared
+    assert any(isinstance(e, MppRejectRetry) and e.attempt == 1 for e in events)
 
 
 # --- the AR-040 pair-status precondition (Step 1) ---
