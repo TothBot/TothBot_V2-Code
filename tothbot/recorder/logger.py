@@ -1,8 +1,8 @@
 """mod:Logger - the two-stream record membrane and the SOLE CIATS data source.
 
 Source: 0500000 dv1_250 sec 7 mod:Logger + contract:Two_Stream_Record_Architecture +
-contract:CIATS_Trade_Outcome_Bus + ar:AR-014 (async bounded queue) + the 23-field evt:TRADE_
-CLOSE schema (sec 7 Image6, line "23-field schema {...}") + rule:HR-LG-007/009 (CRITICAL
+contract:CIATS_Trade_Outcome_Bus + ar:AR-014 (async bounded queue) + the 24-field evt:TRADE_
+CLOSE schema (sec 7 Image6, line "24-field schema {...}") + rule:HR-LG-007/009 (CRITICAL
 escalation + SMTP alert).
 
 mod:Logger is the single membrane every event flows through; it is the ONLY component CIATS
@@ -11,14 +11,14 @@ reads from (no other CIATS data source exists). It writes TWO streams:
   Stream-1  OPERATIONAL  - every emitted event, in order (the tothbot.log operational record).
   Stream-2  TRADE OUTCOME (contract:CIATS_Trade_Outcome_Bus) - the durable closed-trade corpus
             CIATS learns from. ONLY evt:TRADE_CLOSE records enter it, and ONLY after passing the
-            23-FIELD SCHEMA VALIDATION (a record that fails is logged SCHEMA_FINGERPRINT_MISMATCH
+            24-FIELD SCHEMA VALIDATION (a record that fails is logged SCHEMA_FINGERPRINT_MISMATCH
             and kept OUT of the corpus - never silently dropped, never corrupting the corpus).
 
 PER-MODULE pools (sec 7 / line 373: "CIATS is a PER-MODULE framework ... each with its own
 statistical pool ... sharing only the mod:Logger / CIATS_Trade_Outcome_Bus membrane; no
 cross-module pooling"). The membrane is shared; the Stream-2 corpus is partitioned by the
 emitting module (Long / Short), so each side's CIATS instance reads only its own outcomes. The
-emitter tags each record with its module (the side), since the 23-field schema itself carries
+emitter tags each record with its module (the side), since the 24-field schema itself carries
 no side field - the partition IS the side.
 
 CRITICAL escalation (rule:HR-LG-007/009): a CRITICAL-level event is additionally routed to the
@@ -51,7 +51,7 @@ EventSink = Callable[[object], None]
 
 @dataclass(frozen=True)
 class SchemaFingerprintMismatch:
-    """SCHEMA_FINGERPRINT_MISMATCH [WARNING] - an evt:TRADE_CLOSE failed the 23-field schema
+    """SCHEMA_FINGERPRINT_MISMATCH [WARNING] - an evt:TRADE_CLOSE failed the 24-field schema
     validation (missing or extra fields); kept OUT of the CIATS corpus, surfaced not dropped."""
 
     missing: frozenset
@@ -68,7 +68,7 @@ def _field_names(record: object) -> frozenset[str] | None:
 
 
 def validate_trade_close(record: object) -> SchemaFingerprintMismatch | None:
-    """Validate a TRADE_CLOSE record against the 23-field schema. Returns None if it matches
+    """Validate a TRADE_CLOSE record against the 24-field schema. Returns None if it matches
     exactly, else a SchemaFingerprintMismatch naming the missing + extra fields."""
     names = _field_names(record)
     if names is None:
@@ -101,7 +101,7 @@ class Logger:
 
     def record(self, record: object, *, module: str = "default") -> None:
         """Route one emitted record. Stream-1 always; a TRADE_CLOSE additionally enters the
-        module's Stream-2 corpus IFF it passes the 23-field schema (else SCHEMA_FINGERPRINT_
+        module's Stream-2 corpus IFF it passes the 24-field schema (else SCHEMA_FINGERPRINT_
         MISMATCH, kept out); a CRITICAL-level record is escalated to the alert sink. `module`
         tags the per-module CIATS pool (the side - the schema carries no side field)."""
         self.operational.append(record)

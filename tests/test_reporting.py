@@ -33,7 +33,7 @@ from tothbot.recorder.reporting import (
 
 
 def _tc(*, net, when, regime="TRENDING_POS_NORMAL", rr="1.6", fees="2", symbol="BTC/USD"):
-    """A schema-valid 23-field TRADE_CLOSE for the corpus, stamped with an exit instant."""
+    """A schema-valid 24-field TRADE_CLOSE for the corpus, stamped with an exit instant."""
     n = Decimal(net)
     win = n > 0
     return TradeClose(

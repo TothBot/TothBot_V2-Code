@@ -36,7 +36,7 @@ L3 emergSL touch) over each open position; on_regime_classified + on_htf_ohlc_cl
 layer:L1a regime-reversal detector (regime_exit.py, the EC-L1A-002 daily downgrade + the
 EC-L1A-001 1H HTF reversal, ar:AR-062) with the rule:HR-EC-016(a) pair-status precondition.
 Any fired exit applies the synthetic ledger credit and routes through mod:Exit_Controller
-(execution/exit_controller.py) for the SAME close sequence - the 23-field evt:TRADE_CLOSE
+(execution/exit_controller.py) for the SAME close sequence - the 24-field evt:TRADE_CLOSE
 record, the rule:HR-PM-009 mirror clear (close_position), the ar:AR-073 Selection-Controller
 state update, the semaphore release, and the WS-TKR-003 ticker trades-mode switch. The L1a
 sell is the SAME on_paper_close mechanism (a cleared mirror makes any follow-on detection a

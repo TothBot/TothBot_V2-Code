@@ -49,7 +49,7 @@ from decimal import Decimal
 
 from ..execution.exit_controller import ExitReason, TradeClose
 
-# The 23-field canonical order (sec 7 Image6 enumeration 1..23): the mandatory record-identity fields
+# The 24-field canonical order (sec 7 Image6 enumeration 1..24): the mandatory record-identity fields
 # (ts/event/level/component) lead, then the schema fields in figure order. json.dumps preserves dict
 # insertion order, so this is the on-disk field order.
 _CANONICAL_ORDER: tuple[str, ...] = (
@@ -85,7 +85,7 @@ def _jsonable(value: object) -> object:
 def serialize_trade_close(record: object) -> str:
     """Serialize a TRADE_CLOSE record to its canonical single-line NDJSON form (NO trailing newline -
     the sink adds it). Decimal-as-string throughout; the mandatory fields lead; the field order is the
-    23-field figure enumeration. This is the durable Stream-2 wire-format."""
+    24-field figure enumeration. This is the durable Stream-2 wire-format."""
     doc = {name: _jsonable(getattr(record, name, None)) for name in _CANONICAL_ORDER}
     return json.dumps(doc, separators=(",", ":"))
 
@@ -218,7 +218,7 @@ class PermanentTradeRecordSink:
 def load_trade_records(lines: Iterable[str]) -> list[TradeClose]:
     """Parse a durable JSONL stream back into TradeClose records (the cold-start corpus restore +
     the C5 ANNUAL authoritative read). Skips blank lines; each non-blank line is one NDJSON object.
-    NOTE: the 23-field schema carries NO side field (the per-module partition IS the emitting side, sec
+    NOTE: the 24-field schema carries NO side field (the per-module partition IS the emitting side, sec
     7), so this restores the COMBINED corpus (the C5 / tax / total-floor source); per-module Long/Short
     restoration would need a side field the durable schema does not carry (a documented gap)."""
     out: list[TradeClose] = []

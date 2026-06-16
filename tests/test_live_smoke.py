@@ -14,7 +14,7 @@ TRENDING_POS (long permitted), the warmed 5m indicators yield a passing long SSS
 R:R floor. The two CIATS seed values the A1 floor reads (expected_reward DEC-124, mpp DEC-128) are put
 into their stores as known values after the load seeding (the store IS the CIATS-owned source - this
 fixes the gate input, it does not bypass any wiring). The TRADE_CLOSE learning close is exercised with
-a schema-valid 23-field record routed through the per-module Logger Stream-2 sink + the CiatsConductor.
+a schema-valid 24-field record routed through the per-module Logger Stream-2 sink + the CiatsConductor.
 """
 
 from __future__ import annotations
@@ -150,7 +150,7 @@ class _TradeWM:
 
 
 def _trade_close(symbol="BTC/USD", net="120"):
-    """A schema-valid 23-field TRADE_CLOSE (the real exit_controller dataclass) for the corpus."""
+    """A schema-valid 24-field TRADE_CLOSE (the real exit_controller dataclass) for the corpus."""
     return TradeClose(
         symbol=symbol,
         entry_fill_price=Decimal("60000"), exit_price=Decimal("66000"),
@@ -248,7 +248,7 @@ def test_trade_close_closes_the_ciats_learning_loop():
     sink(tc)                                   # -> Logger Stream-2 corpus + pool ingest
     conductor.ingest_close(tc, regime=Regime.TRENDING_POS_NORMAL)
     assert pool.trade_count == 1
-    assert len(logger.corpus_for("long")) == 1            # the 23-field record entered the corpus
+    assert len(logger.corpus_for("long")) == 1            # the 24-field record entered the corpus
     assert conductor.trade_count == 1                     # the conductor's per-module pool learned it
 
 
@@ -306,7 +306,7 @@ def test_running_exit_drives_the_trade_close_through_the_wired_sink():
     assert not wm.has_position("BTC/USD")                  # the mirror cleared (the close ran)
     assert conductor.trade_count == 1                      # the LONG conductor learned the close
     assert system.conductors[PositionSide.SHORT].trade_count == 0   # the short loop did NOT (per-module)
-    assert len(logger.corpus_for("long")) == 1             # the 23-field record entered the Stream-2 corpus
+    assert len(logger.corpus_for("long")) == 1             # the 24-field record entered the Stream-2 corpus
 
 
 def test_running_exit_applies_an_inbox_approved_change_at_the_boundary():
@@ -338,7 +338,7 @@ def test_running_exit_applies_an_inbox_approved_change_at_the_boundary():
 # close DRIVES the propose/detect cadence (stage to Bill + the drift trigger), through the wired sink
 
 def _close_record(net, *, heat=None, **sp):
-    """A schema-valid 23-field TRADE_CLOSE for the corpus; net>0 = a win, net<0 = a loss. `heat` is
+    """A schema-valid 24-field TRADE_CLOSE for the corpus; net>0 = a win, net<0 = a loss. `heat` is
     the per-trade mae_pct_reached (field 11) the stop-width theory reads; **sp are signal_params
     LEVELS the entry-filter theory reads."""
     n = Decimal(net)
@@ -448,7 +448,7 @@ def test_running_closes_report_a_stop_width_loosen_without_alerting():
 # no C1 alert (the email track stays separate from the periodic pull report)
 
 def _close_at(net, when, *, heat=None):
-    """A schema-valid 23-field TRADE_CLOSE stamped with an exit instant (so the report windowing has
+    """A schema-valid 24-field TRADE_CLOSE stamped with an exit instant (so the report windowing has
     a wall-clock to bucket on - in the running organism the exit_controller sets exit_timestamp_utc)."""
     n = Decimal(net)
     win = n > 0

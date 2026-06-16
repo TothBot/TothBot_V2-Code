@@ -54,7 +54,7 @@ def test_ciats_sink_feeds_the_matching_module_conductor():
     sinks[PositionSide.LONG](tc)
     assert conductors[PositionSide.LONG].trade_count == 1   # the long loop learned it
     assert conductors[PositionSide.SHORT].trade_count == 0  # the short loop did NOT (per-module)
-    assert len(logger.corpus_for("long")) == 0              # (not a 23-field record - corpus skips it)
+    assert len(logger.corpus_for("long")) == 0              # (not a 24-field record - corpus skips it)
 
 
 # ------------------------------------------------------------------ make_cycle_parameters_provider
