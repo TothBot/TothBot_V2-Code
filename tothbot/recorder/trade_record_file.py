@@ -49,15 +49,16 @@ from decimal import Decimal
 
 from ..execution.exit_controller import ExitReason, TradeClose
 
-# The 24-field canonical order (sec 7 Image6 enumeration 1..24): the mandatory record-identity fields
+# The 25-field canonical order (sec 7 Image6 enumeration 1..25): the mandatory record-identity fields
 # (ts/event/level/component) lead, then the schema fields in figure order. json.dumps preserves dict
-# insertion order, so this is the on-disk field order.
+# insertion order, so this is the on-disk field order. (25) side is the emitting module LONG | SHORT
+# (0500000 dv1_253 TB00762 ruling A) - it carries the per-module partition onto disk.
 _CANONICAL_ORDER: tuple[str, ...] = (
     "ts", "event", "level", "component", "symbol",
     "entry_fill_price", "exit_price", "entry_timestamp_utc", "exit_timestamp_utc",
     "hold_candle_count", "mae_pct_reached", "fees_entry_usd", "fees_exit_usd", "fees_total_usd",
     "exit_reason", "asset_regime", "vol_regime", "market_regime", "signal_params", "actual_rr",
-    "net_pl_usd", "net_gain_usd", "net_loss_usd", "qty",
+    "net_pl_usd", "net_gain_usd", "net_loss_usd", "qty", "side",
 )
 # The price/fee/P-L/ratio/qty fields parsed BACK to Decimal on read (the JSON-string numerics).
 _DECIMAL_FIELDS: frozenset[str] = frozenset({
@@ -85,7 +86,7 @@ def _jsonable(value: object) -> object:
 def serialize_trade_close(record: object) -> str:
     """Serialize a TRADE_CLOSE record to its canonical single-line NDJSON form (NO trailing newline -
     the sink adds it). Decimal-as-string throughout; the mandatory fields lead; the field order is the
-    24-field figure enumeration. This is the durable Stream-2 wire-format."""
+    25-field figure enumeration (incl. (25) side). This is the durable Stream-2 wire-format."""
     doc = {name: _jsonable(getattr(record, name, None)) for name in _CANONICAL_ORDER}
     return json.dumps(doc, separators=(",", ":"))
 
@@ -122,6 +123,7 @@ def parse_trade_close(doc: dict) -> TradeClose:
         signal_params=({k: Decimal(str(v)) for k, v in sp.items()} if sp else None),
         actual_rr=dec("actual_rr"),
         qty=dec("qty"),
+        side=doc.get("side"),                 # (25) LONG | SHORT (a str enum, not Decimal)
     )
 
 
@@ -218,9 +220,10 @@ class PermanentTradeRecordSink:
 def load_trade_records(lines: Iterable[str]) -> list[TradeClose]:
     """Parse a durable JSONL stream back into TradeClose records (the cold-start corpus restore +
     the C5 ANNUAL authoritative read). Skips blank lines; each non-blank line is one NDJSON object.
-    NOTE: the 24-field schema carries NO side field (the per-module partition IS the emitting side, sec
-    7), so this restores the COMBINED corpus (the C5 / tax / total-floor source); per-module Long/Short
-    restoration would need a side field the durable schema does not carry (a documented gap)."""
+    Restores the COMBINED corpus (the C5 / tax / total-floor source); the (25) side field on each
+    record now also enables the PER-MODULE Long/Short restore (load_trade_records_by_side) - the
+    durable schema carries the emitting side since 0500000 dv1_253 (TB00762 ruling A), so a cold-start
+    can rebuild each module's CIATS corpus from disk (the gap is closed)."""
     out: list[TradeClose] = []
     for line in lines:
         s = line.strip()
@@ -228,6 +231,26 @@ def load_trade_records(lines: Iterable[str]) -> list[TradeClose]:
             continue
         out.append(parse_trade_close(json.loads(s)))
     return out
+
+
+# The (25) side enum tokens on the durable record (mirrors exit_controller's LONG | SHORT emit).
+_SIDE_LONG = "LONG"
+_SIDE_SHORT = "SHORT"
+
+
+def load_trade_records_by_side(records_dir: str, years: Sequence[int]) -> dict[str, list[TradeClose]]:
+    """Restore the durable corpus PARTITIONED by the emitting module's side (0500000 dv1_253 (25) side;
+    TB00762 ruling A, the co-equal Long/Short paradigm). Returns {"LONG": [...], "SHORT": [...]} so a
+    cold-start rebuilds each per-module CIATS corpus from disk - the capability the side field unblocks
+    (the runtime in-memory per-side partition is otherwise lost on a restart). A record with no side
+    (a legacy pre-dv1_253 pre-qty/pre-side record) is dropped from BOTH side pools (it cannot be
+    attributed to a module; it still counts in the combined load_trade_records / C5 view)."""
+    pools: dict[str, list[TradeClose]] = {_SIDE_LONG: [], _SIDE_SHORT: []}
+    for record in load_trade_records_dir(records_dir, years):
+        pool = pools.get(record.side)
+        if pool is not None:
+            pool.append(record)
+    return pools
 
 
 def load_trade_records_file(
@@ -271,11 +294,11 @@ def build_c5_from_durable_file(
     """Build the C5 ANNUAL OperatorReport from the durable trades_<year>.jsonl - the authoritative
     source per rule:HR-LG-013 (the contract: "C5 reads from the permanent trade-record file"). Loads
     the calendar-year records off disk + views them through the report builder as ONE combined corpus:
-    the durable schema carries NO side field (the per-module partition IS the emitting side, sec 7), so
-    Long/Short is not recoverable from the file - and C5 IS the combined calendar-year compliance + IRS
-    Form 8949 view (all trades), which the combined roll-up + the single 'all' module's tax lots give
-    exactly. Independent of the live in-memory corpus (a cold-start / audit can build C5 from disk
-    alone)."""
+    C5 IS the combined calendar-year compliance + IRS Form 8949 view (ALL trades, both sides), which the
+    combined roll-up + the single 'all' module's tax lots give exactly - so C5 reads the corpus combined
+    regardless of side (the durable (25) side field is available since dv1_253, but C5 is intentionally
+    the cross-module tax/compliance total; per-module Long/Short restore is load_trade_records_by_side).
+    Independent of the live in-memory corpus (a cold-start / audit can build C5 from disk alone)."""
     from .reporting import ReportCategory, build_operator_report  # local: avoid an import cycle
 
     from types import SimpleNamespace

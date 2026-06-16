@@ -17,8 +17,9 @@ while process_candidate is async, so ohlc_5m_handler() returns a sync adapter th
 async sweep on the running loop; on_ohlc_5m itself is the testable async core.
 
 make_ciats_sink wires mod:Logger as a per-MODULE on_event sink: every event -> Stream-1, and a
-TRADE_CLOSE additionally -> that module's CiatsPool.ingest (the side is the emitting module's, the
-record carries no side field - per-module exit controllers, one per wallet, sec 7). Decimal-only.
+TRADE_CLOSE additionally -> that module's CiatsPool.ingest (the side is the emitting module's; the
+record ALSO self-carries (25) side since dv1_253 for the durable per-module restore - per-module exit
+controllers, one per wallet, sec 7). Decimal-only.
 make_ciats_learning_sink is the same membrane wired to the whole CiatsConductor (the learning loop)
 instead of a bare pool, so a closed trade drives conductor.ingest_close (pool + drift series + the
 asset_regime bucket) per module - the operational assembly's TRADE_CLOSE -> CIATS learning seam.
@@ -67,8 +68,9 @@ def _regime_of(record: object) -> Regime | None:
 def make_ciats_sink(logger, module: str, pool, *, downstream: Callable[[object], None] | None = None):
     """A per-module on_event sink: record every event to mod:Logger (Stream-1, tagged `module`),
     and route a TRADE_CLOSE into THIS module's CiatsPool (the learning loop, sec 7). `module` is
-    the side name (the TRADE_CLOSE record carries no side - it is known by the per-wallet exit path
-    that emits it). An optional `downstream` sink chains (e.g. alerting)."""
+    the side name (the per-wallet exit path that emits the close knows it; the record ALSO self-carries
+    (25) side since dv1_253 for the durable restore). An optional `downstream` sink chains (e.g.
+    alerting)."""
 
     def sink(event: object) -> None:
         logger.record(event, module=module)
@@ -111,8 +113,8 @@ def make_ciats_learning_sink(
     on_approval edge), the HR-CI-007 net-P/L CUSUM out-of-cycle PLAN trigger (scan_drift DETECT/emit;
     the candidate-parameter PLAN awaits the per-trade param-level producer), and the HR-CI-003
     inter-trade boundary poll (APPLY any Bill-approved change at this confirmed close, never auto-
-    applied). `module` is the side name (the TRADE_CLOSE record carries no side field; the partition
-    IS the emitting wallet).
+    applied). `module` is the side name (the partition IS the emitting wallet; the TRADE_CLOSE record
+    also self-carries (25) side since dv1_253 for the durable per-module restore).
 
     `wallet_balance` is the side's current-balance read (a zero-arg thunk, e.g. wm.wallet_balance
     bound to this side) the Half-Kelly recompute needs; when None (live mode has no synthetic wallet)

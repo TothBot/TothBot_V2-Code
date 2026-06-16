@@ -1,7 +1,7 @@
 """mod:Exit_Controller close-path tests (0500000 dv1_242 sec 12.5 + sec 7 Image6).
 
 Drives the sec-12.5 close sequence over a fake WSManager surface (the established
-inject-the-sole-writer-surfaces pattern): net P&L per D1 FEE-CALC-004, the 24-field
+inject-the-sole-writer-surfaces pattern): net P&L per D1 FEE-CALC-004, the 25-field
 evt:TRADE_CLOSE record, the HR-PM-009 mirror clear, the AR-073 Selection-Controller
 win/loss update, and the BoundedSemaphore release.
 """
@@ -88,7 +88,7 @@ def test_long_win_net_pnl_and_trade_close_record():
     assert rec.net_gain_usd == Decimal("283.62")
     assert rec.net_loss_usd == Decimal("0")
     assert rec.fees_total_usd == Decimal("16.38")
-    # the 24-field record identity + carried fields
+    # the 25-field record identity + carried fields
     assert (rec.event, rec.level, rec.component) == ("TRADE_CLOSE", "INFO", "EXIT_CTRL")
     assert rec.symbol == "BTC/USD"
     assert rec.entry_fill_price == Decimal("60000")

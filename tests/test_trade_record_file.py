@@ -10,6 +10,7 @@ injected so the whole layer is unit-testable without real disk I/O.
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -38,7 +39,7 @@ def _tc(net="120", *, when="2026-06-10T12:00:00+00:00", regime="TRENDING_POS_NOR
         net_pl_usd=n, net_gain_usd=(n if win else Decimal("0")),
         net_loss_usd=(Decimal("0") if win else -n), asset_regime=regime, vol_regime="NORMAL_VOL",
         market_regime="TRENDING_POS_NORMAL", exit_timestamp_utc=when, hold_candle_count=12,
-        actual_rr=Decimal("1.6"), mae_pct_reached=Decimal("0.4"), qty=Decimal("0.05"),
+        actual_rr=Decimal("1.6"), mae_pct_reached=Decimal("0.4"), qty=Decimal("0.05"), side="LONG",
         signal_params={"rsi_14": Decimal("41.5"), "ema_9": Decimal("100.2")},
     )
 
@@ -233,8 +234,43 @@ def test_serialize_carries_field_24_qty_and_round_trips():
     import json
     doc = json.loads(serialize_trade_close(_tc("120")))
     assert doc["qty"] == "0.05" and isinstance(doc["qty"], str)   # field 24, Decimal-as-string
-    assert list(doc)[-1] == "qty"                                 # last in the canonical order
     assert parse_trade_close(doc).qty == Decimal("0.05")          # parses back to Decimal
+
+
+def test_serialize_carries_field_25_side_last_and_round_trips():
+    # (25) side is the final canonical field (0500000 dv1_253, TB00762 ruling A) and survives the
+    # NDJSON round-trip as the LONG | SHORT string (not a Decimal) - the per-module restore key.
+    import json
+    doc = json.loads(serialize_trade_close(_tc("120")))
+    assert doc["side"] == "LONG" and isinstance(doc["side"], str)  # field 25, str enum
+    assert list(doc)[-1] == "side"                                 # last in the canonical order
+    assert parse_trade_close(doc).side == "LONG"                   # round-trips unchanged
+
+
+def test_load_trade_records_by_side_partitions_the_durable_corpus(tmp_path):
+    # the TB00762 ruling-A payoff: the durable (25) side field lets a cold-start rebuild the per-module
+    # Long/Short CIATS corpus from disk - the runtime in-memory partition is otherwise lost on restart.
+    from tothbot.recorder.trade_record_file import load_trade_records_by_side
+
+    sink = PermanentTradeRecordSink(str(tmp_path), now_utc=lambda: datetime(2026, 6, 1, tzinfo=UTC))
+    long_rec = _tc("120")                                  # side defaults to "LONG" in _tc
+    short_rec = replace(_tc("90"), side="SHORT")
+    sink(long_rec)
+    sink(short_rec)
+    pools = load_trade_records_by_side(str(tmp_path), [2026])
+    assert [r.net_pl_usd for r in pools["LONG"]] == [Decimal("120")]
+    assert [r.net_pl_usd for r in pools["SHORT"]] == [Decimal("90")]
+
+
+def test_load_trade_records_by_side_drops_a_sideless_legacy_record(tmp_path):
+    # a legacy pre-dv1_253 record (no side) cannot be attributed to a module -> dropped from BOTH side
+    # pools (it still counts in the combined load_trade_records / C5 view, which is sideless by design).
+    from tothbot.recorder.trade_record_file import load_trade_records_by_side
+
+    sink = PermanentTradeRecordSink(str(tmp_path), now_utc=lambda: datetime(2026, 6, 1, tzinfo=UTC))
+    sink(replace(_tc("120"), side=None))                   # a sideless legacy record
+    pools = load_trade_records_by_side(str(tmp_path), [2026])
+    assert pools["LONG"] == [] and pools["SHORT"] == []
 
 
 def test_c5_from_durable_file_computes_proceeds_and_cost_basis(tmp_path):

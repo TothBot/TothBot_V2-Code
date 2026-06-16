@@ -781,7 +781,7 @@ def _open_live_long(m, *, atr="2000", emergsl="54000", fee="7.8"):
 
 
 def test_live_executions_close_emits_trade_close():
-    # sec 12.5 LIVE FLOW: an opposite-side executions fill closes the position and emits the 24-field
+    # sec 12.5 LIVE FLOW: an opposite-side executions fill closes the position and emits the 25-field
     # TRADE_CLOSE off the close fill (no synthetic ledger). Default reason = EMERGENCY_SL_FIRED (the
     # off-book backstop fired - TothBot dispatched no exit, so nothing stamped the reason).
     closes: list = []

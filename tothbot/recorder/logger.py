@@ -1,8 +1,8 @@
 """mod:Logger - the two-stream record membrane and the SOLE CIATS data source.
 
 Source: 0500000 dv1_250 sec 7 mod:Logger + contract:Two_Stream_Record_Architecture +
-contract:CIATS_Trade_Outcome_Bus + ar:AR-014 (async bounded queue) + the 24-field evt:TRADE_
-CLOSE schema (sec 7 Image6, line "24-field schema {...}") + rule:HR-LG-007/009 (CRITICAL
+contract:CIATS_Trade_Outcome_Bus + ar:AR-014 (async bounded queue) + the 25-field evt:TRADE_
+CLOSE schema (sec 7 Image6, line "25-field schema {...}") + rule:HR-LG-007/009 (CRITICAL
 escalation + SMTP alert).
 
 mod:Logger is the single membrane every event flows through; it is the ONLY component CIATS
@@ -11,15 +11,16 @@ reads from (no other CIATS data source exists). It writes TWO streams:
   Stream-1  OPERATIONAL  - every emitted event, in order (the tothbot.log operational record).
   Stream-2  TRADE OUTCOME (contract:CIATS_Trade_Outcome_Bus) - the durable closed-trade corpus
             CIATS learns from. ONLY evt:TRADE_CLOSE records enter it, and ONLY after passing the
-            24-FIELD SCHEMA VALIDATION (a record that fails is logged SCHEMA_FINGERPRINT_MISMATCH
+            25-FIELD SCHEMA VALIDATION (a record that fails is logged SCHEMA_FINGERPRINT_MISMATCH
             and kept OUT of the corpus - never silently dropped, never corrupting the corpus).
 
 PER-MODULE pools (sec 7 / line 373: "CIATS is a PER-MODULE framework ... each with its own
 statistical pool ... sharing only the mod:Logger / CIATS_Trade_Outcome_Bus membrane; no
 cross-module pooling"). The membrane is shared; the Stream-2 corpus is partitioned by the
 emitting module (Long / Short), so each side's CIATS instance reads only its own outcomes. The
-emitter tags each record with its module (the side), since the 24-field schema itself carries
-no side field - the partition IS the side.
+emitter tags each record with its module (the side) for the in-memory pool key, AND the 25-field
+schema now carries (25) side on the record itself (0500000 dv1_253, TB00762 ruling A) - so the
+partition survives to disk and a cold-start rebuilds each side's corpus (load_trade_records_by_side).
 
 CRITICAL escalation (rule:HR-LG-007/009): a CRITICAL-level event is additionally routed to the
 alert sink (the contract:Operator_Reporting_Hierarchy C1 IMMEDIATE set -> SMTP to the operator).
@@ -33,15 +34,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field, fields
 from typing import Callable
 
-# The 24 canonical evt:TRADE_CLOSE field names (0500000 dv1_252 sec 7 Image6 schema; D1 ruling
-# expanded 23 -> 24 with field (24) qty). A Stream-2 record MUST carry EXACTLY these (the schema
-# fingerprint). Mirrors execution.exit_controller.TradeClose.
+# The 25 canonical evt:TRADE_CLOSE field names (0500000 dv1_253 sec 7 Image6 schema; D1 ruling
+# expanded 23 -> 24 with field (24) qty; the TB00762 ruling expanded 24 -> 25 with field (25) side).
+# A Stream-2 record MUST carry EXACTLY these (the schema fingerprint). Mirrors execution.exit_
+# controller.TradeClose.
 TRADE_CLOSE_SCHEMA: frozenset[str] = frozenset({
     "ts", "event", "level", "component", "symbol",
     "entry_fill_price", "exit_price", "entry_timestamp_utc", "exit_timestamp_utc",
     "hold_candle_count", "mae_pct_reached", "fees_entry_usd", "fees_exit_usd", "fees_total_usd",
     "exit_reason", "asset_regime", "vol_regime", "market_regime", "signal_params", "actual_rr",
-    "net_pl_usd", "net_gain_usd", "net_loss_usd", "qty",
+    "net_pl_usd", "net_gain_usd", "net_loss_usd", "qty", "side",
 })
 
 # The default per-module corpus partitions (the two trading modules). A record's module tag keys
@@ -51,7 +53,7 @@ EventSink = Callable[[object], None]
 
 @dataclass(frozen=True)
 class SchemaFingerprintMismatch:
-    """SCHEMA_FINGERPRINT_MISMATCH [WARNING] - an evt:TRADE_CLOSE failed the 24-field schema
+    """SCHEMA_FINGERPRINT_MISMATCH [WARNING] - an evt:TRADE_CLOSE failed the 25-field schema
     validation (missing or extra fields); kept OUT of the CIATS corpus, surfaced not dropped."""
 
     missing: frozenset
@@ -68,7 +70,7 @@ def _field_names(record: object) -> frozenset[str] | None:
 
 
 def validate_trade_close(record: object) -> SchemaFingerprintMismatch | None:
-    """Validate a TRADE_CLOSE record against the 24-field schema. Returns None if it matches
+    """Validate a TRADE_CLOSE record against the 25-field schema. Returns None if it matches
     exactly, else a SchemaFingerprintMismatch naming the missing + extra fields."""
     names = _field_names(record)
     if names is None:
@@ -101,9 +103,10 @@ class Logger:
 
     def record(self, record: object, *, module: str = "default") -> None:
         """Route one emitted record. Stream-1 always; a TRADE_CLOSE additionally enters the
-        module's Stream-2 corpus IFF it passes the 24-field schema (else SCHEMA_FINGERPRINT_
+        module's Stream-2 corpus IFF it passes the 25-field schema (else SCHEMA_FINGERPRINT_
         MISMATCH, kept out); a CRITICAL-level record is escalated to the alert sink. `module`
-        tags the per-module CIATS pool (the side - the schema carries no side field)."""
+        keys the in-memory per-module CIATS pool (the side); the record also self-carries (25) side
+        for the durable per-module restore (load_trade_records_by_side)."""
         self.operational.append(record)
 
         if getattr(record, "event", None) == "TRADE_CLOSE" or getattr(record, "code", None) == "TRADE_CLOSE":

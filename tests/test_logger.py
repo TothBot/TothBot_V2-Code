@@ -1,7 +1,7 @@
 """Tests: mod:Logger - the two-stream record membrane (recorder/logger.py).
 
 Covers 0500000 dv1_250 sec 7: Stream-1 operational capture, Stream-2 per-module CIATS corpus
-(only schema-valid TRADE_CLOSE, no cross-module pooling), the 24-field schema validation
+(only schema-valid TRADE_CLOSE, no cross-module pooling), the 25-field schema validation
 (SCHEMA_FINGERPRINT_MISMATCH kept out of the corpus), and CRITICAL alert escalation.
 """
 
@@ -20,7 +20,7 @@ from tothbot.recorder.logger import (
 
 
 def _trade_close(symbol="BTC/USD", net="100"):
-    """A schema-valid 24-field TRADE_CLOSE record (the real exit_controller dataclass)."""
+    """A schema-valid 25-field TRADE_CLOSE record (the real exit_controller dataclass)."""
     return TradeClose(
         symbol=symbol,
         entry_fill_price=Decimal("60000"), exit_price=Decimal("66000"),
@@ -30,11 +30,12 @@ def _trade_close(symbol="BTC/USD", net="100"):
     )
 
 
-# -- the 24-field schema (dv1_252: field 24 qty added per the D1 ruling) ---
+# -- the 25-field schema (dv1_252: field 24 qty per D1; dv1_253: field 25 side per TB00762 ruling A) ---
 
-def test_schema_has_24_fields():
-    assert len(TRADE_CLOSE_SCHEMA) == 24
+def test_schema_has_25_fields():
+    assert len(TRADE_CLOSE_SCHEMA) == 25
     assert "qty" in TRADE_CLOSE_SCHEMA
+    assert "side" in TRADE_CLOSE_SCHEMA   # (25) LONG | SHORT, the per-module restore field
 
 
 def test_real_trade_close_passes_schema():

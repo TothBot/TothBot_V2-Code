@@ -2,7 +2,7 @@
 
 Source: 0500000 dv1_242 sec 12.5 (Paper Exit Routing Through Exit Controller) +
 sec 3 Image3 (Exit Architecture: L1a/L2/L3) + sec 7 Image6 (mod:Exit_Controller +
-evt:TRADE_CLOSE 24-field schema) + the D1 FEE-CALC-004 net-P&L formula + ar:AR-048
+evt:TRADE_CLOSE 25-field schema) + the D1 FEE-CALC-004 net-P&L formula + ar:AR-048
 (bid/ask MAE) + ar:AR-073 / rule:HR-EC-014 (Selection Controller state update).
 
 mod:Exit_Controller owns ALL normal exits (layer:L1a regime-reversal take-profit +
@@ -15,7 +15,7 @@ exit_reason, fees_exit) and runs the close.
 
 THE sec-12.5 CLOSE SEQUENCE (steps 5-9 are owned here; 1-4 + 10 are WSManager):
   5. on_paper_close -> _close_position(...)
-  6. emit evt:TRADE_CLOSE - the 24-field contract:CIATS_Trade_Outcome_Bus record
+  6. emit evt:TRADE_CLOSE - the 25-field contract:CIATS_Trade_Outcome_Bus record
      (component EXIT_CTRL), the PRIMARY DATA SUBSTRATE for CIATS Stream 2 inference.
   7. clear the Position Mirror - via the WSManager sole-writer surface (rule:HR-PM-009:
      "WS Manager is the SOLE writer to Position Mirror"; the EC does NOT mutate it
@@ -77,11 +77,11 @@ class ExitReason(Enum):
 
 @dataclass(frozen=True)
 class TradeClose:
-    """evt:TRADE_CLOSE - the 24-field contract:CIATS_Trade_Outcome_Bus record (sec 7
+    """evt:TRADE_CLOSE - the 25-field contract:CIATS_Trade_Outcome_Bus record (sec 7
     Image6 schema_fields_canonical; THIS event is the canonical schema source). Emitted
     by mod:Exit_Controller on every COMPLETE position close; mod:Logger appends it to the
     durable Stream-2 corpus. Byte-identical paper <-> live (PA-005). Field order follows
-    the figure's 24-field enumeration; producer-unsourced fields default to None."""
+    the figure's 25-field enumeration; producer-unsourced fields default to None."""
 
     # (1)-(4) record identity (constant literals per the figure)
     symbol: str                                  # (5)
@@ -106,6 +106,10 @@ class TradeClose:
     actual_rr: Decimal | None = None              # (20) net_PL / risk_exposed
     qty: Decimal | None = None                    # (24) filled position quantity (Form 8949 proceeds/
                                                   #      cost-basis source; 0500000 dv1_252 D1 ruling)
+    side: str | None = None                       # (25) LONG | SHORT - the emitting module's side, so a
+                                                  #      cold-start rebuilds the per-module Long/Short
+                                                  #      CIATS corpus from disk (0500000 dv1_253 TB00762
+                                                  #      ruling A, the co-equal Long/Short paradigm)
     event: str = field(default="TRADE_CLOSE", init=False)   # (2)
     level: str = field(default="INFO", init=False)          # (3)
     component: str = field(default="EXIT_CTRL", init=False)  # (4)
@@ -223,7 +227,7 @@ class ExitController:
         *,
         clear_mirror: bool = True,
     ) -> TradeClose:
-        """sec 12.5 steps 6-9: assemble + emit the 24-field TRADE_CLOSE record, then
+        """sec 12.5 steps 6-9: assemble + emit the 25-field TRADE_CLOSE record, then
         clear the mirror, update Selection Controller state (AR-073), and release the
         semaphore - the mirror + SC writes routed through the WSManager sole writer.
 
@@ -305,6 +309,7 @@ class ExitController:
             signal_params=getattr(position, "signal_params", None),
             actual_rr=actual_rr,
             qty=qty,                              # (24) the filled position quantity (Form 8949)
+            side=_SIDE_LONG.upper() if is_long else _SIDE_SHORT.upper(),  # (25) LONG | SHORT
         )
         # 6. emit TRADE_CLOSE (the canonical Stream-2 record).
         self._emit(record)

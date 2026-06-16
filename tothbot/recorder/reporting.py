@@ -332,7 +332,7 @@ class ParameterEvolutionEntry:
 
 @dataclass(frozen=True)
 class TaxLot:
-    """A C5 Form 8949 / 26 CFR 1.6001-1 lot (the 24-field schema, dv1_252): the acquired + disposed
+    """A C5 Form 8949 / 26 CFR 1.6001-1 lot (the 25-field schema, dv1_253): the acquired + disposed
     instants, the entry/exit prices, the filled qty, the dollar PROCEEDS (exit_price * qty) + COST
     BASIS (entry_fill_price * qty), the realized gain/loss (net_pl_usd), and the fees. proceeds /
     cost_basis are now computed from field (24) qty (the D1 ruling closed the prior gap); they are

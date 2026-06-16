@@ -36,7 +36,7 @@ L3 emergSL touch) over each open position; on_regime_classified + on_htf_ohlc_cl
 layer:L1a regime-reversal detector (regime_exit.py, the EC-L1A-002 daily downgrade + the
 EC-L1A-001 1H HTF reversal, ar:AR-062) with the rule:HR-EC-016(a) pair-status precondition.
 Any fired exit applies the synthetic ledger credit and routes through mod:Exit_Controller
-(execution/exit_controller.py) for the SAME close sequence - the 24-field evt:TRADE_CLOSE
+(execution/exit_controller.py) for the SAME close sequence - the 25-field evt:TRADE_CLOSE
 record, the rule:HR-PM-009 mirror clear (close_position), the ar:AR-073 Selection-Controller
 state update, the semaphore release, and the WS-TKR-003 ticker trades-mode switch. The L1a
 sell is the SAME on_paper_close mechanism (a cleared mirror makes any follow-on detection a
@@ -260,8 +260,9 @@ class WSManager:
         # WSManager detects the exit on the ticker bbo and routes it through on_paper_close (the
         # synthetic close). LIVE: the exit is executions-driven (sec 12.5 LIVE FLOW) - the close fill
         # on the executions channel runs on_live_close, byte-identical emit (rule:HR-EC-013 / PA-005).
-        # ONE controller PER MODULE WALLET (sec 7 - "one per module wallet"; the TRADE_CLOSE record
-        # carries no side field, so the partition IS the emitting wallet). Each side's controller
+        # ONE controller PER MODULE WALLET (sec 7 - "one per module wallet"; the runtime partition IS
+        # the emitting wallet, and the TRADE_CLOSE record self-carries (25) side since dv1_253 so the
+        # partition survives to disk for the per-module restore). Each side's controller
         # routes its close to that side (_exit_controller_for). Constructed with the general on_event
         # (telemetry); set_ciats_exit_sinks rebinds it to the side's CIATS learning sink so a close
         # emits THROUGH the per-module membrane.
