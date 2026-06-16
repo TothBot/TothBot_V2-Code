@@ -424,6 +424,48 @@ def test_live_loop_pump_dispatches_a_detected_exit_end_to_end():
     assert "add_order" in methods                             # (2) the market close, over the bound socket
 
 
+def test_live_loop_pump_places_on_fill_emergsl_end_to_end():
+    # The ENTRY capstone (slices a/b/c): the WIRED private loop drives a live ENTRY end-to-end - the
+    # marketable-IOC add_order transmits over the bound socket, the IOC fills LATER on the executions
+    # channel, and ONE idle _step runs the after_batch pump (drive_after_batch) which places the
+    # AR-054 on-fill emergSL over the same bound socket. NOTHING connects to Kraken for real.
+    m = WSManager(Mode.LIVE)
+    t = _IdleTransport()
+
+    async def _open():
+        return t
+
+    asm = PrivateConnectionAssembler(
+        m, open_socket=_open, acquire_token=_tok, sleep=_noop_sleep, tick_interval=0.01
+    )
+    pc = asyncio.run(asm.build())
+    t.sent.clear()   # drop the startup subscribe frames
+    # (1) the live entry dispatches its marketable-IOC add_order over the bound socket. The RL-MON-003
+    #     gate (bound to the rate counter in build) is quiet - no rate pressure -> the entry proceeds.
+    dispatched = asyncio.run(m.dispatch_entry(
+        PositionSide.LONG, "BTC/USD",
+        order_qty="0.05", entry_limit_price="60000", emergsl_price="54000",
+        atr_14_entry="2000", cl_ord_id="cl-1", deadline="d",
+    ))
+    assert dispatched is True
+    assert [msg.get("method") for msg in t.sent] == ["add_order"]
+    # (2) the IOC fills LATER on the executions channel -> OPENED attaches the D6 snapshot stashed at
+    #     dispatch (no emergsl_price passed here) and enqueues the on-fill emergSL.
+    m.record_execution(
+        {"exec_type": "filled", "symbol": "BTC/USD", "side": "buy", "cum_qty": "0.05",
+         "avg_price": "60000", "cl_ord_id": "cl-1", "fee": "7.8"},
+    )
+    assert len(m._pending_emergsl) == 1
+    t.sent.clear()
+    # (3) ONE idle loop step runs the after_batch pump -> the emergSL batch_add over the bound socket,
+    #     in the same private step as the fill (the position is never left unprotected).
+    asyncio.run(pc.loop._step())
+    assert m._pending_emergsl == []
+    leg = t.sent[-1]["params"]["orders"][0]
+    assert t.sent[-1]["method"] == "batch_add"
+    assert leg["side"] == "sell" and leg["triggers"]["price"] == "54000"   # LONG sell-stop below entry
+
+
 def test_executions_snapshot_emits_gap_close_estimated_on_the_sync_path():
     events: list = []
     m = WSManager(Mode.LIVE, on_event=events.append)
