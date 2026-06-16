@@ -1585,3 +1585,83 @@ def test_dispatch_entry_live_short_is_margin_sell_to_open():
     _, msg = sent[0]
     p = msg["params"]
     assert p["side"] == "sell" and p["margin"] is True   # SHORT sell-to-open on Kraken margin (AR-009)
+
+
+# -- slice b: the AR-054 ON-FILL emergSL (the opening fill enqueues; the after_batch pump places) --
+
+def test_live_opening_fill_enqueues_on_fill_emergsl_from_actual_qty():
+    mgr, sent, events = _live_manager()
+    # the ASYNC opening fill on the executions channel, carrying the entry-time D6 snapshot.
+    mgr.record_execution(
+        {"exec_type": "filled", "symbol": "BTC/USD", "side": "buy",
+         "cum_qty": "0.05", "avg_price": "60000", "cl_ord_id": "cl-L1", "fee": "7.8"},
+        regime_at_entry="TRENDING_POS_NORMAL", atr_14_entry="1000", emergsl_price="57000",
+    )
+    # AR-054: the opening fill enqueued the on-fill emergSL, built from the ACTUAL filled qty + the
+    # entry '-sl' cl_ord_id + the D6 emergsl_price; the Pending Order Registry entry resolved (popped).
+    assert len(mgr._pending_emergsl) == 1
+    intent = mgr._pending_emergsl[0]
+    assert intent.side is PositionSide.LONG and intent.qty == Decimal("0.05")
+    assert intent.emergsl_price == Decimal("57000") and intent.cl_ord_id == "cl-L1-sl"
+    assert "BTC/USD" not in mgr._pending_entries
+    # nothing was transmitted on the fill itself - the emergSL is placed by the pump, not inline.
+    assert sent == []
+
+
+def test_drive_pending_emergsls_places_long_sell_stop_below_entry():
+    mgr, sent, events = _live_manager()
+    mgr.record_execution(
+        {"exec_type": "filled", "symbol": "BTC/USD", "side": "buy",
+         "cum_qty": "0.05", "avg_price": "60000", "cl_ord_id": "cl-L1", "fee": "7.8"},
+        regime_at_entry="TRENDING_POS_NORMAL", atr_14_entry="1000", emergsl_price="57000",
+    )
+    placed = asyncio.run(mgr.drive_pending_emergsls())
+    assert placed == ["cl-L1-sl"] and mgr._pending_emergsl == []
+    op, msg = sent[-1]
+    assert op is OutboundOp.BATCH_ADD
+    leg = msg["params"]["orders"][0]
+    assert leg["side"] == "sell" and leg["order_type"] == "stop-loss"        # LONG sell-stop
+    assert leg["triggers"]["price"] == "57000" and leg["triggers"]["price_type"] == "static"
+    assert "reduce_only" not in leg                                          # spot long carries none
+    assert any(isinstance(e, EmergSlPlaced) and e.cl_ord_id == "cl-L1-sl" for e in events)
+
+
+def test_drive_pending_emergsls_short_buy_to_cover_reduce_only_above_entry():
+    mgr, sent, _ = _live_manager()
+    _open_live_short(mgr)   # BTC/USD short, emergsl 66000 ABOVE entry, cl_ord_id cl-s1
+    asyncio.run(mgr.drive_pending_emergsls())
+    leg = sent[-1][1]["params"]["orders"][0]
+    assert leg["side"] == "buy" and leg["reduce_only"] is True               # buy-to-cover, AR-009
+    assert leg["triggers"]["price"] == "66000"
+
+
+def test_on_fill_emergsl_skipped_without_d6_snapshot():
+    # a restore/degraded open (no emergsl_price) does NOT enqueue a placement - its resting emergSL
+    # was already on Kraken from the original open; the gap-close path owns that case.
+    mgr, sent, _ = _live_manager()
+    mgr.record_execution(
+        {"exec_type": "filled", "symbol": "BTC/USD", "side": "buy",
+         "cum_qty": "0.05", "avg_price": "60000", "cl_ord_id": "cl-L1", "fee": "7.8"},
+    )
+    assert mgr._pending_emergsl == []
+
+
+def test_drive_after_batch_places_emergsl_before_driving_exits():
+    mgr, sent, _ = _live_manager(cancel_ack_wait=_always_ack)
+    # symbol A: an opening fill enqueues its on-fill emergSL (AR-054).
+    mgr.record_execution(
+        {"exec_type": "filled", "symbol": "ETH/USD", "side": "buy",
+         "cum_qty": "1.0", "avg_price": "3000", "cl_ord_id": "cl-A", "fee": "1"},
+        regime_at_entry="TRENDING_POS_NORMAL", atr_14_entry="50", emergsl_price="2850",
+    )
+    # symbol B: an open SHORT (its own on-fill emergSL also queues) with a queued live exit.
+    _open_live_short(mgr)
+    mgr._enqueue_live_exit(LiveExitIntent(
+        "BTC/USD", PositionSide.SHORT, ExitReason.MAE_THRESHOLD_BREACH.value,
+        trigger="L2_MAE", layer="L2_MAE", best_quote="60000",
+    ))
+    asyncio.run(mgr.drive_after_batch())
+    ops = [op for op, _ in sent]
+    # the on-fill emergSL placements (BATCH_ADD) all precede the exit cancel (CANCEL_ORDER).
+    assert ops.index(OutboundOp.BATCH_ADD) < ops.index(OutboundOp.CANCEL_ORDER)
+    assert mgr._pending_emergsl == [] and mgr._live_exit_intents == []

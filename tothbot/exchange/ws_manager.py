@@ -657,9 +657,15 @@ class WSManager:
             # opened) - the defensive no-double-commit marker; the close releases once.
             self._dispatch_sem[outcome.position.side].acquire()
             # LIVE: retain the opening fill's actual taker entry fee (executions fee field, FEE-CALC-
-            # 006) for the close net-P&L - there is no synthetic ledger in live to hold it.
+            # 006) for the close net-P&L - there is no synthetic ledger in live to hold it - and
+            # enqueue the ar:AR-054 ON-FILL emergSL the after_batch pump places this same private
+            # _step (the position is never left unprotected). The entry-time D6 snapshot the opening
+            # fill just attached has resolved, so drop the Pending Order Registry entry (the paper
+            # path pops inline in dispatch_entry's finally; the live fill pops here).
             if self.is_live:
                 self._live_fees_entry[outcome.position.symbol] = _frame_fee(event)
+                self._enqueue_on_fill_emergsl(outcome.position)
+                self._pending_entries.pop(outcome.position.symbol, None)
         elif outcome.action is PositionAction.CLOSED:
             closed_symbol = _opt_str(event.get("symbol"))
             if closed_symbol is not None:
@@ -807,6 +813,58 @@ class WSManager:
                 best_quote=quote, pair_status=pair_status,
             )
         )
+
+    # --- the ar:AR-054 ON-FILL emergSL (the live entry's sync->async seam, mirror of the exit) -----
+    def _enqueue_on_fill_emergsl(self, position: Position) -> None:
+        """LIVE (ar:AR-054): on an opening fill, queue the off-book emergSL placement for the after_
+        batch pump (drive_pending_emergsls) - the SYNC->ASYNC seam mirror of the live exit (the
+        executions handler cannot await the order seam). Built from the just-opened Position's ACTUAL
+        filled qty + side + the D6 emergsl_price the opening fill attached; the cl_ord_id is the
+        entry's + '-sl' (the same id the cancel path resolves via _emergsl_cl_ord_id), the deadline a
+        fresh now+5s. A position with NO emergsl_price (a restore/degraded open, no D6 snapshot) is
+        skipped - its resting emergSL was already placed on Kraken at the original open; the gap-close
+        path owns that case (never an unprotected double-placement)."""
+        if position.emergsl_price is None:
+            return
+        self._pending_emergsl.append(
+            PendingEmergSl(
+                symbol=position.symbol,
+                side=position.side,
+                qty=position.qty,
+                emergsl_price=position.emergsl_price,
+                cl_ord_id=_emergsl_cl_ord_id(position),
+                deadline=self._dispatch_deadline(),
+            )
+        )
+
+    async def drive_pending_emergsls(self) -> list[str]:
+        """Drain the ar:AR-054 on-fill emergSL queue: for each just-opened LIVE position place its
+        off-book layer:L3 emergSL via the shared seam batch_add (LONG sell-stop BELOW entry / SHORT
+        buy-to-cover reduce_only stop ABOVE, ar:AR-009). Run by the after_batch pump in the SAME
+        private _step as the opening fill so the position is never left unprotected. Returns the
+        cl_ord_ids placed (for the driver/tests)."""
+        placed: list[str] = []
+        while self._pending_emergsl:
+            intent = self._pending_emergsl.pop(0)
+            await self.seam.batch_add(
+                build_emergsl_order(
+                    intent.symbol, intent.side,
+                    order_qty=intent.qty, emergsl_price=intent.emergsl_price,
+                    cl_ord_id=intent.cl_ord_id, deadline=intent.deadline,
+                )
+            )
+            self._emit_event(EmergSlPlaced(intent.symbol, intent.cl_ord_id))
+            placed.append(intent.cl_ord_id)
+        return placed
+
+    async def drive_after_batch(self) -> None:
+        """The live private-loop pump the receive loop runs after each inbound batch (and every idle
+        tick): drain BOTH the ar:AR-054 on-fill emergSL placement queue AND the sec-12.5 live-exit
+        intent queue. emergSLs FIRST so a just-opened position is protected before any exit work this
+        tick (loss-prevention: NEVER an open live position with no resting emergSL); then the cancel-
+        then-sell exits. SKIPPED mid-reconnect by the receive loop's own guard."""
+        await self.drive_pending_emergsls()
+        await self.drive_live_exits()
 
     async def drive_live_exits(self) -> list[ExitDispatchOutcome]:
         """Drain the live-exit intent queue, dispatching each through dispatch_live_exit. The async

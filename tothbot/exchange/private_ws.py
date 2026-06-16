@@ -405,14 +405,18 @@ class PrivateConnectionAssembler:
         dispatch.register(PrivateChannel.EXECUTIONS, self._ingest)
         dispatch.register(PrivateChannel.BALANCES, self._balances_handler)
 
-        # The sec-12.5 LIVE FLOW pump: after each inbound batch (and every idle tick), drain the
-        # live-exit driver so a detected exit (enqueued by the public ticker/instrument handlers or
-        # the daily-compute L1a path) dispatches its cancel-then-sell over THIS bound private socket
-        # within one tick_interval. SKIPPED mid-reconnect (the loop's own guard). The C-1 MPP-reject
+        # The sec-12.5 / AR-054 LIVE FLOW pump: after each inbound batch (and every idle tick), drain
+        # BOTH the on-fill emergSL placement queue (a just-opened position's off-book L3 stop) AND the
+        # live-exit driver (a detected exit's cancel-then-sell) over THIS bound private socket within
+        # one tick_interval. SKIPPED mid-reconnect (the loop's own guard). The C-1 MPP-reject
         # feed routes add_order RESPONSE frames -> WSManager.record_order_response. Both are guarded
         # by getattr so a lightweight wm test stand-in (no exit surface) is left unwired (the
         # operational.py set_ciats_exit_sinks pattern).
-        after_batch = getattr(self._wm, "drive_live_exits", None)
+        # Prefer the combined pump (drains the AR-054 on-fill emergSL queue AND the live-exit queue);
+        # fall back to drive_live_exits for a wm stand-in built before the entry path (back-compat).
+        after_batch = getattr(self._wm, "drive_after_batch", None) or getattr(
+            self._wm, "drive_live_exits", None
+        )
         on_order_ack = (
             OrderAckHandler(self._wm, on_event=self._on_event)
             if callable(getattr(self._wm, "record_order_response", None))
