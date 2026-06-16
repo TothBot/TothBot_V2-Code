@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 from .channels import PrivateChannel
 from .dispatch import DispatchTable, Handler
 from .keepalive import ConnectionKeepalive
+from .rate_counter import RateCounter
 from .reconcile import ReconciliationTracker
 from .reconnect import (
     DisconnectReason,
@@ -47,7 +48,7 @@ from .reconnect import (
     build_private_restore_sequence,
 )
 from .reconnect_driver import ReconnectDriver
-from .receive_loop import ShardReceiveLoop
+from .receive_loop import ShardReceiveLoop, SubscriptionAck
 from .transport import Transport
 
 # The private connection is a single connection; it reuses the shard machinery with
@@ -129,13 +130,23 @@ class ExecutionsIngest:
                  (the mirror sole writer; rule:HR-PM-009).
     """
 
-    def __init__(self, ws_manager, *, on_event: EventSink | None = None) -> None:
+    def __init__(
+        self,
+        ws_manager,
+        *,
+        on_event: EventSink | None = None,
+        rate_counter: RateCounter | None = None,
+    ) -> None:
         self._wm = ws_manager
         self._on_event = on_event
+        self._rate_counter = rate_counter
         self.last_snap_orders: list[Mapping[str, object]] | None = None
 
     def __call__(self, message: dict) -> None:
         data = list(message.get("data") or [])
+        # A-1: with ratecounter:true each execution carries the live per-pair rate counter;
+        # feed every value (snapshot or update) to the RateCounter before the mirror routing.
+        self._observe_rate_counter(data)
         if message.get("type") == "snapshot":
             self.last_snap_orders = data
             gap = self._wm.restore_position_mirror(data)
@@ -143,6 +154,20 @@ class ExecutionsIngest:
             return
         for event in data:
             self._wm.record_execution(event)
+
+    def _observe_rate_counter(self, data: Sequence[Mapping[str, object]]) -> None:
+        """ar:AR-030 / A-1: route each ratecounter:true per-pair value to the RateCounter,
+        emitting RATE_COUNTER_UPDATE (+ RATE_COUNTER_WARNING above the warning fraction).
+        An execution without a ratecount field (or symbol) carries no rate-counter info."""
+        if self._rate_counter is None:
+            return
+        for elem in data:
+            rc = elem.get("ratecount")
+            symbol = elem.get("symbol")
+            if rc is None or symbol is None:
+                continue
+            for event in self._rate_counter.observe(str(symbol), int(rc)):
+                self._emit(event)
 
     def _emit(self, event: object) -> None:
         if self._on_event is not None:
@@ -196,6 +221,7 @@ class PrivateConnectionAssembler:
         balances_handler: BalancesHandler | None = None,
         coordinator: ShardReconnectCoordinator | None = None,
         on_event: EventSink | None = None,
+        rate_counter: RateCounter | None = None,
         clock: Clock = time.monotonic,
         sleep: Sleep = asyncio.sleep,
         tick_interval: float = 1.0,
@@ -213,12 +239,21 @@ class PrivateConnectionAssembler:
         self._fetch_snap_orders = fetch_snap_orders
         self._balances_handler = balances_handler or _noop_balances_handler
         self._coordinator = coordinator or ShardReconnectCoordinator()
-        self._on_event = on_event
+        self._external_on_event = on_event
         self._clock = clock
         self._sleep = sleep
         self._tick_interval = tick_interval
 
-        self._ingest = ExecutionsIngest(ws_manager, on_event=on_event)
+        # ar:AR-030: the per-pair rate-counter unit. The sink wraps the external event
+        # sink so every executions ACK (initial + each reconnect resubscribe) flowing
+        # through the loop sets the operative ceiling from maxratecount (never 125).
+        self._rate_counter = rate_counter or RateCounter()
+        self._latest_maxratecount: int | None = None
+        self._on_event = self._make_ceiling_sink(on_event)
+
+        self._ingest = ExecutionsIngest(
+            ws_manager, on_event=self._on_event, rate_counter=self._rate_counter
+        )
         self._keepalive = ConnectionKeepalive(clock=clock)
         self._token: str | None = None
         self._pending: Transport | None = None  # the freshest socket (build + reconnect)
@@ -232,13 +267,38 @@ class PrivateConnectionAssembler:
             open_socket=self._open_socket,
             run_step=self._run_step,
             sleep=sleep,
-            on_event=on_event,
+            on_event=self._on_event,
             restore_sequence=build_private_restore_sequence(),
         )
 
+    def _make_ceiling_sink(self, external: EventSink | None) -> EventSink:
+        """Wrap the external event sink: when an executions SUBSCRIPTION_ACK carrying
+        maxratecount passes through (the initial subscribe + every reconnect resubscribe),
+        set the RateCounter operative ceiling and emit MAXRATECOUNT_SET (AR-030). Every
+        other event passes straight through unchanged."""
+
+        def sink(event: object) -> None:
+            ceiling_event = None
+            if (
+                isinstance(event, SubscriptionAck)
+                and event.channel == "executions"
+                and event.maxratecount is not None
+            ):
+                self._latest_maxratecount = int(event.maxratecount)
+                ceiling_event = self._rate_counter.set_ceiling(self._latest_maxratecount)
+            if external is not None:
+                external(event)
+                if ceiling_event is not None:
+                    external(ceiling_event)
+
+        return sink
+
     def _emit(self, event: object) -> None:
-        if self._on_event is not None:
-            self._on_event(event)
+        self._on_event(event)
+
+    @property
+    def rate_counter(self) -> RateCounter:
+        return self._rate_counter
 
     @property
     def driver(self) -> ReconnectDriver:
@@ -313,9 +373,12 @@ class PrivateConnectionAssembler:
             assert self._pending is not None and self._token is not None
             await self._subscribe(self._pending, self._token)
         elif step is RestoreStep.RESET_RATE_CEILING:
-            # AR-030: reset the maxratecount ceiling from the executions ACK. The
-            # rate-counter unit is a LATER slice; no-op placeholder (carry-forward).
-            pass
+            # AR-030 / WS-REC-004: the engine-side per-pair counters reset/decay across the
+            # disconnect, so drop the stale per-pair values + suppression latches now. The
+            # operative ceiling is re-set from the FRESH executions ACK that the RESUBSCRIBE_
+            # PRIVATE step just issued - it flows back through the loop's ceiling sink and
+            # re-emits MAXRATECOUNT_SET (never the hardcoded 125).
+            self._rate_counter.reset()
         elif step is RestoreStep.RESUME_KEEPALIVE:
             self._keepalive.reset()  # 30s ping + zombie timers (HR-WM-003/004)
         elif step is RestoreStep.RESTORE_POSITION_MIRROR:

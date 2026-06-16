@@ -150,12 +150,16 @@ class ZombieDetected:
 @dataclass(frozen=True)
 class SubscriptionAck:
     """SUBSCRIPTION_ACK [INFO] {channel, warnings} - a subscribe ACK; non-empty
-    warnings[] are surfaced for the rule:HR-WM-019 warnings audit (AR-031)."""
+    warnings[] are surfaced for the rule:HR-WM-019 warnings audit (AR-031). The
+    executions ACK additionally carries maxratecount (AR-030: the operative per-pair
+    rate-counter ceiling - the private connection feeds it to the RateCounter, never
+    the hardcoded 125); maxratecount is None on every non-executions ACK."""
 
     channel: str | None
     symbol: str | None
     success: bool
     warnings: tuple[str, ...]
+    maxratecount: int | None = None
     code: str = field(default="SUBSCRIPTION_ACK", init=False)
 
 
@@ -277,7 +281,10 @@ class ShardReceiveLoop:
         symbol = result.get("symbol")
         warnings = result.get("warnings") or message.get("warnings") or []
         success = bool(message.get("success", True))
-        self._emit(SubscriptionAck(channel, symbol, success, tuple(warnings)))
+        # AR-030: the executions ACK returns maxratecount (the operative per-pair rate
+        # ceiling); carried through so the private connection feeds the RateCounter.
+        maxratecount = result.get("maxratecount")
+        self._emit(SubscriptionAck(channel, symbol, success, tuple(warnings), maxratecount))
         if symbol and symbol in self._silent_pairs:
             self._silent_pairs[symbol].mark_subscribed(now)
 

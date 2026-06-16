@@ -27,6 +27,11 @@ from tothbot.exchange.private_ws import (
     balances_subscribe,
     executions_subscribe,
 )
+from tothbot.exchange.rate_counter import (
+    MaxRateCountSet,
+    RateCounterUpdate,
+    RateCounterWarning,
+)
 from tothbot.exchange.transport import Transport, TransportClosed
 from tothbot.exchange.ws_manager import WSManager
 
@@ -240,6 +245,117 @@ def test_private_restore_sequence_is_private_subset():
     # figure order preserved: token before socket before resubscribe before restore
     assert seq.index(RestoreStep.ACQUIRE_WS_TOKEN) < seq.index(RestoreStep.RECONNECT_SOCKET)
     assert seq.index(RestoreStep.RESUBSCRIBE_PRIVATE) < seq.index(RestoreStep.RESTORE_POSITION_MIRROR)
+
+
+# -- ar:AR-030 rate counter: the executions ACK sets the operative ceiling --
+
+def _exec_ack(maxratecount: int) -> dict:
+    """An executions subscribe ACK carrying maxratecount (AR-030)."""
+    return {"method": "subscribe", "success": True,
+            "result": {"channel": "executions", "maxratecount": maxratecount}}
+
+
+def _rate_fill(symbol: str, ratecount: int) -> dict:
+    """A trade execution carrying the ratecounter:true per-pair counter (A-1)."""
+    return {"exec_type": "trade", "symbol": symbol, "side": "buy",
+            "cum_qty": "0.5", "avg_price": "60000", "ratecount": ratecount}
+
+
+def _build_live(events: list):
+    m = WSManager(Mode.LIVE)
+    t = _FakeTransport()
+
+    async def _open():
+        return t
+
+    async def _acquire():
+        return "t"
+
+    asm = PrivateConnectionAssembler(
+        m, open_socket=_open, acquire_token=_acquire, on_event=events.append
+    )
+    return asm, asyncio.run(asm.build())
+
+
+def test_executions_ack_sets_ceiling_and_emits_maxratecount_set():
+    events: list = []
+    asm, pc = _build_live(events)
+    # the executions ACK (maxratecount=125, NOT the hardcoded literal) flows through the loop
+    pc.loop.handle_message(_exec_ack(125), now=0.0)
+    assert asm.rate_counter.ceiling == 125
+    assert any(isinstance(e, MaxRateCountSet) and e.value == 125 for e in events)
+
+
+def test_non_executions_ack_does_not_set_ceiling():
+    events: list = []
+    asm, pc = _build_live(events)
+    # a balances ACK carries no maxratecount -> the ceiling stays unset (never assume 125)
+    pc.loop.handle_message(
+        {"method": "subscribe", "success": True, "result": {"channel": "balances"}}, now=0.0
+    )
+    assert asm.rate_counter.ceiling is None
+    assert not any(isinstance(e, MaxRateCountSet) for e in events)
+
+
+def test_executions_frame_ratecount_emits_update_and_warning():
+    events: list = []
+    asm, pc = _build_live(events)
+    pc.loop.handle_message(_exec_ack(100), now=0.0)         # ceiling = 100
+    # a fill carrying ratecount=85 (85% > the 80% warning fraction)
+    pc.loop.handle_message(
+        {"channel": "executions", "type": "update", "data": [_rate_fill("BTC/USD", 85)]},
+        now=1.0,
+    )
+    updates = [e for e in events if isinstance(e, RateCounterUpdate)]
+    warns = [e for e in events if isinstance(e, RateCounterWarning)]
+    assert any(u.symbol == "BTC/USD" and u.value == 85 and u.maxratecount == 100 for u in updates)
+    assert any(w.symbol == "BTC/USD" and w.value == 85 for w in warns)
+    # the fill still reached the mirror (rate-counter feeding does not disturb routing)
+    assert m_has(pc, "BTC/USD")
+
+
+def m_has(pc, symbol: str) -> bool:
+    return pc.ingest._wm.has_position(symbol)
+
+
+def test_reconnect_reset_rate_ceiling_clears_stale_counters():
+    m = WSManager(Mode.LIVE)
+    sockets = [_FakeTransport(), _FakeTransport()]
+    opened: list[_FakeTransport] = []
+
+    async def _open():
+        t = sockets[len(opened)]
+        opened.append(t)
+        return t
+
+    async def _acquire():
+        return "TOK"
+
+    async def _snap():
+        return []
+
+    events: list = []
+    asm = PrivateConnectionAssembler(
+        m, open_socket=_open, acquire_token=_acquire, fetch_snap_orders=_snap,
+        sleep=_noop_sleep, on_event=events.append,
+    )
+    pc = asyncio.run(asm.build())
+    # set a ceiling + drive a pair into entry suppression (over the 95% critical fraction)
+    pc.loop.handle_message(_exec_ack(100), now=0.0)
+    pc.loop.handle_message(
+        {"channel": "executions", "type": "update", "data": [_rate_fill("BTC/USD", 99)]},
+        now=1.0,
+    )
+    assert asm.rate_counter.is_entry_suppressed("BTC/USD") is True
+
+    # a reconnect runs RESET_RATE_CEILING -> the stale per-pair counters + latches drop
+    asyncio.run(pc.driver.initiate(0, _random_reason()))
+    assert asm.rate_counter.value("BTC/USD") is None
+    assert asm.rate_counter.is_entry_suppressed("BTC/USD") is False
+    # the ceiling is kept provisional until the fresh executions ACK re-sets it
+    assert asm.rate_counter.ceiling == 100
+    pc.loop.handle_message(_exec_ack(150), now=2.0)  # the fresh ACK after resubscribe
+    assert asm.rate_counter.ceiling == 150
 
 
 # -- the private connection satisfies the Transport protocol at its edge --
