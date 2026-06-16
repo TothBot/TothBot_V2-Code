@@ -423,6 +423,16 @@ class PrivateConnectionAssembler:
             else None
         )
 
+        # RL-MON-003 entry-suppression gate (ar:AR-030): bind THIS private connection's RateCounter
+        # critical-tier predicate as the WSManager entry-dispatch gate, so a live entry add_order is
+        # SUPPRESSED while the pair is armed above rl_critical_threshold_pct (the exit/cancel budget is
+        # preserved - exits are never gated). The predicate lives on the rate counter (it reflects the
+        # per-pair executions-feed counter, A-1); the dispatch gate is WSManager's (the add_order
+        # owner). Guarded by getattr for a wm stand-in built before the entry path (back-compat).
+        bind_suppression = getattr(self._wm, "set_entry_suppression_check", None)
+        if callable(bind_suppression):
+            bind_suppression(self._rate_counter.is_entry_suppressed)
+
         loop = ShardReceiveLoop(
             transport,
             dispatch,

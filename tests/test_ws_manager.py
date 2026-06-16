@@ -1665,3 +1665,49 @@ def test_drive_after_batch_places_emergsl_before_driving_exits():
     # the on-fill emergSL placements (BATCH_ADD) all precede the exit cancel (CANCEL_ORDER).
     assert ops.index(OutboundOp.BATCH_ADD) < ops.index(OutboundOp.CANCEL_ORDER)
     assert mgr._pending_emergsl == [] and mgr._live_exit_intents == []
+
+
+# -- slice c: the RL-MON-003 entry-suppression gate (entry-only; exits/cancels NEVER gated) --------
+
+def test_dispatch_entry_live_suppressed_sends_no_order_emits_event():
+    mgr, sent, events = _live_manager()
+    mgr.set_entry_suppression_check(lambda symbol: True)   # the pair armed above critical
+    dispatched = asyncio.run(mgr.dispatch_entry(
+        PositionSide.LONG, "BTC/USD",
+        order_qty="0.05", entry_limit_price="60000", emergsl_price="57000",
+        cl_ord_id="cl-L1", deadline="2026-06-16T07:30:00Z",
+    ))
+    # RL-MON-003: NO order on the wire, returns not-dispatched, the suppression is surfaced, and the
+    # Pending Order Registry was not touched (nothing to resolve later).
+    assert dispatched is False
+    assert sent == []
+    assert any(isinstance(e, EntrySuppressed) and e.symbol == "BTC/USD" for e in events)
+    assert "BTC/USD" not in mgr._pending_entries
+
+
+def test_dispatch_entry_live_not_suppressed_dispatches():
+    mgr, sent, _ = _live_manager()
+    mgr.set_entry_suppression_check(lambda symbol: False)
+    dispatched = asyncio.run(mgr.dispatch_entry(
+        PositionSide.LONG, "BTC/USD",
+        order_qty="0.05", entry_limit_price="60000", emergsl_price="57000",
+        cl_ord_id="cl-L1", deadline="2026-06-16T07:30:00Z",
+    ))
+    assert dispatched is True and [op for op, _ in sent] == [OutboundOp.ADD_ORDER]
+
+
+def test_entry_suppression_never_gates_the_exit_path():
+    # the loss-prevention invariant: a live exit ALWAYS dispatches even while entry is suppressed
+    # (the suppression preserves the exit rate budget; a gated exit would leave a position unmanaged).
+    mgr, sent, _ = _live_manager(cancel_ack_wait=_always_ack)
+    mgr.set_entry_suppression_check(lambda symbol: True)
+    _open_live_short(mgr)
+    mgr._pending_emergsl.clear()   # isolate the exit path from the on-fill emergSL placement
+    mgr._enqueue_live_exit(LiveExitIntent(
+        "BTC/USD", PositionSide.SHORT, ExitReason.MAE_THRESHOLD_BREACH.value,
+        trigger="L2_MAE", layer="L2_MAE", best_quote="60000",
+    ))
+    outcomes = asyncio.run(mgr.drive_live_exits())
+    assert outcomes == [ExitDispatchOutcome.DISPATCHED]
+    ops = [op for op, _ in sent]
+    assert OutboundOp.CANCEL_ORDER in ops and OutboundOp.DISPATCH_MARKET_SELL in ops

@@ -569,6 +569,42 @@ def test_reconnect_reset_rate_ceiling_clears_stale_counters():
     assert asm.rate_counter.ceiling == 150
 
 
+def test_build_binds_entry_suppression_gate_to_the_rate_counter():
+    # RL-MON-003: build() binds the WSManager entry-dispatch gate to THIS connection's RateCounter
+    # critical-tier predicate, so a live entry on an armed pair is suppressed.
+    m = WSManager(Mode.LIVE)
+    opened: list[_FakeTransport] = []
+
+    async def _open():
+        t = _FakeTransport()
+        opened.append(t)
+        return t
+
+    async def _acquire():
+        return "TOK"
+
+    async def _snap():
+        return []
+
+    asm = PrivateConnectionAssembler(
+        m, open_socket=_open, acquire_token=_acquire, fetch_snap_orders=_snap,
+        sleep=_noop_sleep, on_event=lambda _e: None,
+    )
+    pc = asyncio.run(asm.build())
+    # the gate is wired and, with no rate pressure, does not suppress.
+    assert m._entry_suppression_check is not None
+    assert m._entry_suppression_check("BTC/USD") is False
+    # drive BTC/USD above the 95% critical fraction -> the bound predicate now suppresses ITS entry
+    # (and only its - a quiet pair is untouched).
+    pc.loop.handle_message(_exec_ack(100), now=0.0)
+    pc.loop.handle_message(
+        {"channel": "executions", "type": "update", "data": [_rate_fill("BTC/USD", 99)]},
+        now=1.0,
+    )
+    assert m._entry_suppression_check("BTC/USD") is True
+    assert m._entry_suppression_check("ETH/USD") is False
+
+
 # -- the private connection satisfies the Transport protocol at its edge --
 
 def test_fake_transport_is_transport():
