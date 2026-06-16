@@ -57,10 +57,29 @@ def _keepalive() -> ConnectionKeepalive:
 def test_classify_all_envelopes():
     assert classify({"method": "pong", "req_id": 1}) is MessageClass.PONG
     assert classify({"method": "subscribe", "success": True}) is MessageClass.SUBSCRIBE_ACK
+    assert classify({"method": "add_order", "success": False}) is MessageClass.ORDER_ACK
+    assert classify({"method": "cancel_order", "success": True}) is MessageClass.ORDER_ACK
     assert classify({"channel": "heartbeat"}) is MessageClass.HEARTBEAT
     assert classify({"channel": "status", "data": []}) is MessageClass.STATUS
     assert classify({"channel": "ohlc", "data": []}) is MessageClass.CHANNEL_DATA
     assert classify({"foo": "bar"}) is MessageClass.UNKNOWN
+
+
+def test_order_ack_routed_to_consumer_and_does_not_reset_zombie():
+    ka = _keepalive()
+    ka.reset(T0)
+    seen: list = []
+    loop = ShardReceiveLoop(_FakeTransport(), DispatchTable(), ka, on_order_ack=seen.append)
+    frame = {"method": "add_order", "success": False, "error": "MPP", "result": {"cl_ord_id": "X-1"}}
+    loop.handle_message(frame, T0 + 5)
+    assert seen == [frame]
+    # NOT market data: the zombie timer is unchanged (still measured from T0, like a subscribe ack).
+    assert ka.seconds_since_real_data(T0 + 5) == pytest.approx(5)
+
+
+def test_order_ack_without_consumer_is_a_safe_noop():
+    loop = ShardReceiveLoop(_FakeTransport(), DispatchTable(), _keepalive())
+    loop.handle_message({"method": "cancel_order", "success": True}, T0)  # must not raise
 
 
 # -- handle_message: pong / heartbeat / zombie reset --------------------
@@ -355,3 +374,67 @@ def test_step_drop_after_maintenance_is_scenario_b():
     asyncio.run(loop._step())
     assert reasons == [DisconnectReason.MAINTENANCE]  # WS-REC-003 Scenario B
     assert loop._maintenance_announced is False        # flag consumed
+
+
+# -- the after_batch live-exit pump (sec-12.5 LIVE FLOW) ----------------
+
+def test_step_pumps_after_batch_on_a_received_frame():
+    pumps: list = []
+
+    async def pump():
+        pumps.append(1)
+
+    transport = _FakeTransport(recv_script=[{"channel": "heartbeat"}])
+    loop = ShardReceiveLoop(
+        transport, DispatchTable(), _keepalive(), after_batch=pump, clock=lambda: T0,
+    )
+    asyncio.run(loop._step())
+    assert pumps == [1]  # the driver was pumped after handling the batch
+
+
+def test_step_pumps_after_batch_even_on_idle_timeout():
+    pumps: list = []
+
+    async def pump():
+        pumps.append(1)
+
+    transport = _FakeTransport()  # recv raises TimeoutError -> idle tick, message None
+    loop = ShardReceiveLoop(
+        transport, DispatchTable(), _keepalive(), after_batch=pump, clock=lambda: T0,
+    )
+    asyncio.run(loop._step())
+    assert pumps == [1]  # still pumps within one tick_interval even with no inbound frame
+
+
+def test_step_does_not_pump_while_reconnecting():
+    pumps: list = []
+
+    async def pump():
+        pumps.append(1)
+
+    transport = _FakeTransport(recv_script=[{"channel": "heartbeat"}])
+    loop = ShardReceiveLoop(
+        transport, DispatchTable(), _keepalive(),
+        after_batch=pump, is_reconnecting=lambda: True, clock=lambda: T0,
+    )
+    asyncio.run(loop._step())
+    assert pumps == []  # outbound socket down mid-restore -> the queued intent persists
+
+
+def test_step_does_not_pump_after_a_drop_reconnect():
+    fresh = _FakeTransport()
+    pumps: list = []
+
+    async def pump():
+        pumps.append(1)
+
+    async def fake_initiate(reason):
+        return fresh
+
+    dropped = _FakeTransport(recv_script=[TransportClosed("1006")])
+    loop = ShardReceiveLoop(
+        dropped, DispatchTable(), _keepalive(),
+        after_batch=pump, initiate_reconnect=fake_initiate, clock=lambda: T0,
+    )
+    asyncio.run(loop._step())
+    assert pumps == []  # the drop path returns before the pump

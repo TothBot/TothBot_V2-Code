@@ -64,6 +64,13 @@ Clock = Callable[[], float]
 # reason, perform backoff + WS-REC-004 restore and return the fresh Transport.
 InitiateReconnect = Callable[[DisconnectReason], Awaitable[Transport]]
 EventSink = Callable[[object], None]
+# An order-RPC RESPONSE frame consumer (the private connection wires it to the C-1
+# add_order-reject probe feed); sync, the loop hands it the raw frame.
+OnOrderAck = Callable[[dict], None]
+# The post-batch async pump the live read loop runs after handling a frame batch (the
+# private connection wires it to WSManager.drive_live_exits - the sync detector enqueued
+# the exit intent, this drains + dispatches the cancel-then-sell). No-op when unset.
+AfterBatch = Callable[[], Awaitable[None]]
 
 
 class MessageClass(Enum):
@@ -71,24 +78,36 @@ class MessageClass(Enum):
 
     PONG = "pong"                    # {"method":"pong", ...}             -> keepalive.mark_pong
     SUBSCRIBE_ACK = "subscribe_ack"  # {"method":"subscribe","result":..} -> silent_pair.mark_subscribed
+    ORDER_ACK = "order_ack"          # {"method":"add_order"|"cancel_order",success:..} -> on_order_ack
     HEARTBEAT = "heartbeat"          # {"channel":"heartbeat"}            -> no-op (does NOT reset zombie)
     STATUS = "status"                # {"channel":"status","data":[...]}  -> connection_id + engine state
     CHANNEL_DATA = "channel_data"    # {"channel":<data>,"data":[...]}    -> mark_real_data + route
     UNKNOWN = "unknown"              # anything else                      -> UNKNOWN_MESSAGE_TYPE, never dropped
 
 
+# The outbound order-RPC methods whose Kraken WS v2 RESPONSE frame is an order ACK / reject
+# (container:Private_WS_v2 OUTBOUND add_order/amend/batch/cancel). The add_order reject response
+# (success:false) is the C-1 Max-Price-Protection signal the dispatch driver's reject probe reads.
+_ORDER_RPC_METHODS: frozenset[str] = frozenset(
+    {"add_order", "batch_add", "amend_order", "cancel_order", "batch_cancel", "cancel_all"}
+)
+
+
 def classify(message: dict) -> MessageClass:
     """Sort a raw Kraken WS v2 frame into its envelope category (PURE).
 
     Kraken WS v2 splits request/response frames (carrying ``method``) from channel
-    push frames (carrying ``channel``). pong and subscribe ACKs are method frames;
-    heartbeat, status, and the data channels are push frames. An envelope matching
-    neither shape is UNKNOWN (logged WARN, never silently dropped)."""
+    push frames (carrying ``channel``). pong, subscribe ACKs, and the order-RPC
+    responses are method frames; heartbeat, status, and the data channels are push
+    frames. An envelope matching neither shape is UNKNOWN (logged WARN, never
+    silently dropped)."""
     method = message.get("method")
     if method == "pong":
         return MessageClass.PONG
     if method in ("subscribe", "unsubscribe"):
         return MessageClass.SUBSCRIBE_ACK
+    if method in _ORDER_RPC_METHODS:
+        return MessageClass.ORDER_ACK
     channel = message.get("channel")
     if channel == "heartbeat":
         return MessageClass.HEARTBEAT
@@ -212,6 +231,8 @@ class ShardReceiveLoop:
         is_reconnecting: Callable[[], bool] | None = None,
         initiate_reconnect: InitiateReconnect | None = None,
         on_event: EventSink | None = None,
+        on_order_ack: OnOrderAck | None = None,
+        after_batch: AfterBatch | None = None,
         clock: Clock = time.monotonic,
         tick_interval: float = 1.0,
     ) -> None:
@@ -223,6 +244,8 @@ class ShardReceiveLoop:
         self._is_reconnecting = is_reconnecting or (lambda: False)
         self._initiate_reconnect = initiate_reconnect
         self._on_event = on_event
+        self._on_order_ack = on_order_ack
+        self._after_batch = after_batch
         self._clock = clock
         self._tick_interval = tick_interval
 
@@ -252,6 +275,12 @@ class ShardReceiveLoop:
             self._handle_status(message)
         elif kind is MessageClass.SUBSCRIBE_ACK:
             self._handle_subscribe_ack(message, now)
+        elif kind is MessageClass.ORDER_ACK:
+            # An order-RPC response (add_order/cancel_order/...): NOT market data, so it does
+            # NOT reset the zombie timer (like the subscribe ACK). Hand it to the order-ack
+            # consumer (the C-1 add_order-reject probe feed); a no-op when unwired.
+            if self._on_order_ack is not None:
+                self._on_order_ack(message)
         elif kind is MessageClass.CHANNEL_DATA:
             self._handle_channel_data(message, now)
         else:  # UNKNOWN - never silently dropped (A-12 / HR-WM-006)
@@ -391,6 +420,22 @@ class ShardReceiveLoop:
             return
         if action.send_ping:
             await self._send_ping(now)
+
+        # After the batch: PUMP the live exit driver (WSManager.drive_live_exits) so a sync
+        # detector that enqueued an exit intent (the ticker-bbo L2 MAE / the L1a regime exit /
+        # the AR-040 limit_only) dispatches its cancel-then-sell promptly. Runs once per step -
+        # so even on a recv timeout (message is None) the queue still drains within one
+        # tick_interval. SKIPPED while reconnecting (the outbound socket is down / the
+        # transmitter unbound; HR-WM-012 - the queued intent persists and pumps post-restore).
+        await self._pump_after_batch()
+
+    async def _pump_after_batch(self) -> None:
+        """Drain the live-exit driver after a frame batch (the sec-12.5 LIVE FLOW pump). No-op
+        when no after_batch is wired (a public bring-up loop / a test) or while reconnecting (the
+        outbound private socket is unavailable mid-restore; the intent queue persists)."""
+        if self._after_batch is None or self._is_reconnecting():
+            return
+        await self._after_batch()
 
     async def _send_ping(self, now: float) -> None:
         """Transmit the application ping and arm the 10 s pong deadline (A-7).
