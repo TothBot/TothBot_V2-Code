@@ -29,6 +29,7 @@ from tothbot.pipeline.operational import (
     assemble_operational,
     make_instrument_handler,
     make_public_handler_provider,
+    make_ticker_handler,
 )
 from tothbot.pipeline.providers import WS_STATE_SUBSCRIBED
 from tothbot.regime.taxonomy import Regime
@@ -257,6 +258,35 @@ def test_instrument_handler_is_bare_ingest_without_wm():
     handler = make_instrument_handler(instr)       # no wm -> the bare cache ingest
     out = handler(_instrument_frame("BTC/USD", "online"))
     assert out == ["BTC/USD"] and instr.get("BTC/USD") is not None
+
+
+# --- the ticker channel drives the L2 MAE detector (make_ticker_handler) ----------------
+
+class _TickerRecordingWM:
+    """A wm stand-in recording handle_ticker calls (the sec-12.5 exit detector feed)."""
+
+    def __init__(self) -> None:
+        self.ticker_frames: list = []
+
+    def handle_ticker(self, frame):
+        self.ticker_frames.append(frame)
+
+
+def test_ticker_handler_ingests_bbo_and_drives_handle_ticker():
+    bbo = BboCache()
+    wm = _TickerRecordingWM()
+    handler = make_ticker_handler(bbo, wm=wm)
+    frame = {"data": [{"symbol": "BTC/USD", "bid": "60000", "ask": "60010"}]}
+    handler(frame)
+    assert bbo.bbo("BTC/USD") == (Decimal("60000"), Decimal("60010"))  # cache updated (ar:AR-048)
+    assert wm.ticker_frames == [frame]                                 # exit detector driven
+
+
+def test_ticker_handler_is_bare_ingest_without_wm():
+    bbo = BboCache()
+    handler = make_ticker_handler(bbo)             # no wm -> the bare cache ingest
+    handler({"data": [{"symbol": "BTC/USD", "bid": "1", "ask": "2"}]})
+    assert bbo.bbo("BTC/USD") == (Decimal("1"), Decimal("2"))
 
 
 # --------------------------------------------------------------------------- assemble_operational

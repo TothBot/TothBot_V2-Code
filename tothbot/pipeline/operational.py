@@ -10,7 +10,9 @@ TWO deliverables:
  make_public_handler_provider:  the DataLayerAssembler handler_provider (sec 7 the SOLE dispatch
    gatekeeper). It binds each public channel to its sole consumer:
        INSTRUMENT -> instrument_cache.ingest   (A-17 status/marginable/minimums snapshot+updates)
+                     + wm.on_instrument_status  (ar:AR-040 limit_only active exit, open positions)
        TICKER     -> bbo_cache.ingest          (ar:AR-048 best bid/ask)
+                     + wm.handle_ticker         (the sec-12.5 L2 MAE detector: paper close / live intent)
        OHLC_5M    -> driver.ohlc_5m_handler()  (the system clock: detect close -> step -> sweep)
        OHLC_60M   -> driver.ohlc_60m_handler() (the 1H HTF feed: advance EMAs -> EC-L1A-001)
        STATUS     -> status_handler            (the Kraken engine-state broadcast; default no-op)
@@ -140,6 +142,23 @@ def make_instrument_handler(
     return handler
 
 
+def make_ticker_handler(bbo_cache: BboCache, *, wm=None) -> Handler:
+    """The public ticker-channel handler: ingest the ar:AR-048 best bid/ask into the BboCache AND
+    drive the ticker-bbo exit detector (WSManager.handle_ticker). In PAPER handle_ticker runs the
+    sec-12.5 synthetic close (L2 MAE / the L3 emergSL touch); in LIVE it marks the max-over-life MAE
+    and ENQUEUES the layer:L2 market-sell intent the after_batch pump dispatches. Wrapping is added
+    only when the wm exposes handle_ticker (a lightweight test stand-in keeps the bare cache ingest)."""
+    base = bbo_cache.ingest
+    if wm is None or not callable(getattr(wm, "handle_ticker", None)):
+        return base
+
+    def handler(frame: dict) -> None:
+        base(frame)              # update the bbo cache first (the realizable quote, ar:AR-048)
+        wm.handle_ticker(frame)  # then drive the exit detector (paper close / live L2 intent enqueue)
+
+    return handler
+
+
 def make_public_handler_provider(
     *,
     instrument_cache: InstrumentCache,
@@ -161,7 +180,7 @@ def make_public_handler_provider(
         PublicChannel.INSTRUMENT: make_instrument_handler(
             instrument_cache, wm=wm, bbo_provider=bbo_provider
         ),
-        PublicChannel.TICKER: bbo_cache.ingest,
+        PublicChannel.TICKER: make_ticker_handler(bbo_cache, wm=wm),
         PublicChannel.OHLC_5M: driver.ohlc_5m_handler(),
         PublicChannel.OHLC_60M: driver.ohlc_60m_handler(),
         PublicChannel.STATUS: status_handler or _noop_handler,
