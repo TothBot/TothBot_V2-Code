@@ -43,6 +43,15 @@ from .universe import DEFAULT_ALWAYS_INCLUDE, load_universe
 ConnectFn = Callable[..., Awaitable[Transport]]
 
 
+def console_event_sink(event: object) -> None:
+    """An ADDITIVE stdout telemetry tap (bound as the mod:Logger on_event) so a smoke / first run is
+    observable: each organism event prints one concise line (its code + a truncated repr). The records
+    still flow to the Logger's Stream-1/Stream-2 corpus; this only mirrors them to the console (the
+    nohup log). Low-volume for a small universe (warm-up / regime / subscribe / sweep / close events)."""
+    code = getattr(event, "code", None) or type(event).__name__
+    print(f"[evt] {code}: {event!r}"[:280], flush=True)
+
+
 def _parse_universe_override(environ: Mapping[str, str] | None) -> tuple[str, ...]:
     """The TOTHBOT_UNIVERSE pin (comma-separated WS-v2 symbols) for a smoke / first-run test, or ()
     when unset/blank (-> the full ar:AR-070 load). The BTC/USD anchor (ar:AR-074) is always unioned in
@@ -106,6 +115,7 @@ async def _amain(
         settings,
         rest_client=KrakenRestClient(),   # public-only in paper (no credentials)
         open_socket=open_socket,
+        on_event=console_event_sink,      # mirror organism telemetry to stdout (the nohup log)
         bucket=SubscribeTokenBucket(),
         mpp_store=MppCapStore(),
         reward_store=ExpectedRewardStore(),

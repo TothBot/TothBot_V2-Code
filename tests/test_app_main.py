@@ -13,7 +13,7 @@ import asyncio
 
 import pytest
 
-from tothbot.app.__main__ import _amain, make_public_open_socket
+from tothbot.app.__main__ import _amain, console_event_sink, make_public_open_socket
 from tothbot.ciats.expected_reward import ExpectedRewardStore
 from tothbot.ciats.seed_estimators import MppCapStore
 from tothbot.config.settings import Mode
@@ -84,6 +84,26 @@ def test_amain_loads_universe_and_runs_paper_edges():
     assert isinstance(edges["mpp_store"], MppCapStore)
     assert isinstance(edges["reward_store"], ExpectedRewardStore)
     assert callable(edges["open_socket"])
+
+
+def test_console_event_sink_prints_event_code(capsys):
+    from types import SimpleNamespace
+    console_event_sink(SimpleNamespace(code="PAIR_DATA_READY_RECOVERED", symbol="BTC/USD"))
+    out = capsys.readouterr().out
+    assert "PAIR_DATA_READY_RECOVERED" in out and out.startswith("[evt]")
+
+
+def test_amain_wires_console_event_sink_as_on_event():
+    async def fake_connect(role):
+        return _FakeTransport([_snapshot(["ETH/USD"])])
+
+    captured: dict = {}
+
+    async def fake_run(settings, **edges):
+        captured["edges"] = edges
+
+    asyncio.run(_amain({"TOTHBOT_MODE": "paper"}, connect_fn=fake_connect, run_fn=fake_run))
+    assert captured["edges"]["on_event"] is console_event_sink
 
 
 def test_amain_universe_override_pins_pairs_and_skips_ar070_load():

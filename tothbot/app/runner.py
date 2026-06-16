@@ -138,6 +138,7 @@ async def build_system(
     reward_store: object,
     smtp_send: SmtpSend | None = None,
     wm: object | None = None,
+    on_event: Callable[[object], None] | None = None,
     now_utc: Callable[[], datetime] | None = None,
     now_monotonic: Callable[[], float] = time.monotonic,
     rest_sleep: Callable = asyncio.sleep,
@@ -148,12 +149,27 @@ async def build_system(
     bound (Logger.set_alert_sink), wire the C2-C6 pull transport + the HR-LG-013 records dir from
     settings, and run assemble_operational over the (injected) data-layer edges. Returns the runnable
     OperationalSystem (the caller drives system.run()). The low-level send/socket/file edges are
-    injectable, so the whole composition is testable without I/O."""
+    injectable, so the whole composition is testable without I/O.
+
+    on_event is an ADDITIVE telemetry tap: the WSManager AND the warm-up / regime / liquidity / pacing
+    / sweep components route their events through _record, which always appends to the mod:Logger
+    Stream-1/Stream-2 corpus (the CIATS data source) AND, when on_event is given, mirrors each event to
+    it. The deploy entrypoint passes a console printer so a smoke run is observable (warm-up, pair
+    READY, sweeps, gate decisions, position writes); None leaves the path on the corpus alone (the test
+    default - no console mirror)."""
     logger = Logger(on_event=None)
-    # The C1 alert seam: its evt:ALERT_SENT / evt:ALERT_SMTP_FAILED route back through logger.record,
-    # so build the sender on logger.record THEN bind it as the Logger on_alert (resolves the cycle).
+    console = on_event
+
+    def _record(event: object) -> None:
+        """Tee every organism event to the Logger corpus AND (when wired) the console mirror."""
+        logger.record(event)
+        if console is not None:
+            console(event)
+
+    # The C1 alert seam: its evt:ALERT_SENT / evt:ALERT_SMTP_FAILED route back through _record (corpus
+    # + console), so build the sender on _record THEN bind it as the Logger on_alert (resolves the cycle).
     alert_sink = make_alert_sink(
-        settings, smtp_send=smtp_send, on_event=logger.record, sleep=alert_sleep
+        settings, smtp_send=smtp_send, on_event=_record, sleep=alert_sleep
     )
     if alert_sink is not None:
         logger.set_alert_sink(alert_sink)
@@ -162,7 +178,7 @@ async def build_system(
 
     if wm is None:
         wm = WSManager(
-            settings.mode, on_event=logger.record,
+            settings.mode, on_event=_record,
             now_monotonic=now_monotonic, now_utc=now_utc,
         )
 
@@ -176,6 +192,7 @@ async def build_system(
         mpp_store=mpp_store,
         reward_store=reward_store,
         mode=settings.mode,
+        on_event=_record,
         now_utc=now_utc,
         rest_sleep=rest_sleep,
         pace_sleep=pace_sleep,

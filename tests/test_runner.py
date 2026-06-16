@@ -156,6 +156,36 @@ def test_build_system_binds_alert_report_and_durable_edges(tmp_path):
     assert len(c1) == 1 and "FULL_HALT_TRIGGERED" in c1[0]
 
 
+def test_build_system_on_event_taps_component_telemetry(tmp_path):
+    # the additive on_event tap mirrors organism telemetry to the console: the warm-up / regime /
+    # liquidity phases emit through _record DURING build (they are awaited), so a bound tap receives
+    # those events (a smoke run is observable) - while the same events still land in the corpus.
+    seen: list = []
+    settings = OpsSettings(universe=("BTC/USD",), mode=Mode.PAPER)
+    asyncio.run(build_system(
+        settings,
+        rest_client=_FakeRest(), open_socket=_opener(),
+        bucket=SubscribeTokenBucket(rate_per_sec=1000.0, burst_capacity=100000.0),
+        mpp_store=MppCapStore(), reward_store=ExpectedRewardStore(),
+        on_event=seen.append,
+        now_utc=_now, now_monotonic=lambda: 1.0, rest_sleep=_nosleep, pace_sleep=_nosleep,
+    ))
+    assert seen  # the warm-up / regime / liquidity telemetry was mirrored to the tap
+
+
+def test_build_system_no_tap_when_on_event_absent(tmp_path):
+    # default (no on_event): build succeeds, telemetry flows to the corpus only (no console mirror).
+    settings = OpsSettings(universe=("BTC/USD",), mode=Mode.PAPER)
+    system = asyncio.run(build_system(
+        settings,
+        rest_client=_FakeRest(), open_socket=_opener(),
+        bucket=SubscribeTokenBucket(rate_per_sec=1000.0, burst_capacity=100000.0),
+        mpp_store=MppCapStore(), reward_store=ExpectedRewardStore(),
+        now_utc=_now, now_monotonic=lambda: 1.0, rest_sleep=_nosleep, pace_sleep=_nosleep,
+    ))
+    assert system.driver is not None  # built cleanly with the corpus-only path
+
+
 def test_build_system_without_smtp_leaves_alert_seam_unwired(tmp_path):
     # no SMTP host -> no alert sink, no report transport; the durable sink still wires from records_dir.
     settings = OpsSettings(universe=("BTC/USD",), mode=Mode.PAPER, records_dir=str(tmp_path))
