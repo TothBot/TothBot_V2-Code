@@ -192,20 +192,29 @@ def trade_pnl(entry,spec,side):
     return gross-fee-roll, off
 
 def run_combo(pairs,exits,sig,filt,spec,lo,hi,minn=40):
-    pls=[]; holds=[]; bypair={}
+    pls=[]; holds=[]; bypair={}; bydir={"LONG":[],"SHORT":[]}; thirds=[[],[],[]]
+    span=(hi-lo) or 1.0
     for p in pairs:
         ex=exits[p.sym]; i=int(p.n*lo); end=int(p.n*hi)
         while i<end-1:
             side=sig(p,i)
             if side is None or (i,side) not in ex or not filt(p,i,side): i+=1; continue
             pl,off=trade_pnl(ex[(i,side)],spec,side); pls.append(pl); holds.append(off)
-            bypair.setdefault(p.sym,[]).append(pl); i+=max(1,off)
+            bypair.setdefault(p.sym,[]).append(pl); bydir[side].append(pl)
+            t=min(2,int(((i/p.n)-lo)/span*3)); thirds[t].append(pl)  # sub-window stability (regime check)
+            i+=max(1,off)
     if len(pls)<minn: return None
     w=[x for x in pls if x>0]; ls=[x for x in pls if x<=0]
     avgw=sum(w)/len(w) if w else 0.0; avgl=-sum(ls)/len(ls) if ls else 1e-9
+    def de(v): return (len(v), (sum(v)/len(v)*100 if v else 0.0))
+    ln,le=de(bydir["LONG"]); sn,se=de(bydir["SHORT"])
+    tcounted=[seg for seg in thirds if len(seg)>=8]   # thirds with enough trades to judge
+    tpos=sum(1 for seg in tcounted if sum(seg)>0)
     return {"n":len(pls),"win":100*len(w)/len(pls),"E":sum(pls)/len(pls)*100,
             "Eday":sum(pls)/(sum(holds) or 1)*100,"rr":avgw/avgl if avgl>0 else 0.0,
-            "npairs":len(bypair),"bypair":bypair}
+            "npairs":len(bypair),"bypair":bypair,
+            "longE":le,"longn":ln,"shortE":se,"shortn":sn,
+            "tpos":tpos,"tcount":len(tcounted)}
 
 def boot(bypair,iters=400,seed=7):
     pp=list(bypair); m=len(pp)
@@ -234,13 +243,27 @@ def search(pairs, maxhold, roll_per_bar, label):
                 if isr and oos: rows.append((sn,fn,sp[3],isr,oos))
     isg=[r for r in rows if r[3]["E"]>0 and r[3]["rr"]>=1.5]
     surv=[r for r in isg if r[4]["E"]>0 and r[4]["rr"]>=1.5]
-    out=[f"[{label}] pairs={len(pairs)} combos={len(rows)} | IS-goal-meeters={len(isg)} | OOS-SURVIVORS={len(surv)}"]
+    # A SURVIVOR is REGIME-ROBUST only if profit is NOT one-directional (both sides E>0 when both
+    # sides trade) AND it is stable across OOS sub-windows (<=1 losing third). A one-sided +
+    # front-loaded survivor over a single contiguous window is REGIME persistence, NOT a durable edge
+    # (TB00776: the live 1h "survivors" were all short-only and front-loaded into one sub-period).
+    def robust(o):
+        twoside = o["longn"]>=8 and o["shortn"]>=8
+        dir_ok = (o["longE"]>0 and o["shortE"]>0) if twoside else True
+        time_ok = o["tpos"]>=max(2,o["tcount"]-1) if o["tcount"]>=2 else False
+        return dir_ok and time_ok, dir_ok, time_ok
+    robust_n=sum(1 for r in surv if robust(r[4])[0])
+    out=[f"[{label}] pairs={len(pairs)} combos={len(rows)} | IS-goal-meeters={len(isg)} | "
+         f"OOS-SURVIVORS={len(surv)} | REGIME-ROBUST={robust_n}"]
     for sn,fn,xl,a,o in sorted(surv,key=lambda r:r[4]["E"],reverse=True)[:8]:
         lo,mid,hi,m=boot(o["bypair"])
         sig="SIG" if lo>0 else "ci~0"
+        rob,dok,tok=robust(o)
+        tag="ROBUST" if rob else "REGIME-FRAGILE("+",".join(([] if dok else ["1-sided"])+([] if tok else ["time-unstable"]))+")"
         out.append(f"    SURVIVOR {sn}/{fn}/{xl}: OOS E/trade {o['E']:+.3f}% rr {o['rr']:.2f} win {o['win']:.0f}% "
-                   f"n={o['n']} npairs={o['npairs']} boot[{lo:+.3f}..{hi:+.3f}]% {sig}")
-    return out, len(surv)
+                   f"n={o['n']} npairs={o['npairs']} boot[{lo:+.3f}..{hi:+.3f}]% {sig} | "
+                   f"L:{o['longn']}@{o['longE']:+.2f}% S:{o['shortn']}@{o['shortE']:+.2f}% thirds+{o['tpos']}/{o['tcount']} {tag}")
+    return out, len(surv), robust_n
 
 
 # ---------------- data sources ----------------
@@ -329,25 +352,31 @@ async def main():
         d=await fetch_kraken(iv)
         if d: sources.append((lbl, d, maxhold, ROLL_4H*((iv/60)/4)))
     report=[f"=== TothBot automated strategy search  {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())} ==="]
-    total_surv=0
+    total_surv=0; total_robust=0
     for lbl,data,maxhold,rpb in sources:
         pairs=to_pairs(data)
         if len(pairs)<8:
             report.append(f"[{lbl}] ACCUMULATING - only {len(pairs)} pairs with >=200 bars (need >=8). Waiting for more data.")
             continue
         try:
-            lines,ns=search(pairs,maxhold,rpb,lbl); total_surv+=ns; report.extend(lines)
+            lines,ns,nr=search(pairs,maxhold,rpb,lbl); total_surv+=ns; total_robust+=nr; report.extend(lines)
         except Exception as e:
             report.append(f"[{lbl}] ERROR {type(e).__name__}: {e}")
-    report.append(f"\nGOAL = a config that meets 1:1.5 R:R AND positive expectancy that SURVIVES out-of-sample. "
-                  f"Total OOS survivors this run: {total_surv}.")
+    report.append(f"\nGOAL = a config that meets 1:1.5 R:R AND positive expectancy that SURVIVES out-of-sample "
+                  f"AND is REGIME-ROBUST (profit not one-directional, stable across OOS sub-windows). "
+                  f"This run: {total_surv} OOS survivors, of which {total_robust} REGIME-ROBUST. "
+                  f"A single-window OOS survivor that is one-sided or front-loaded is likely REGIME persistence, "
+                  f"not a durable edge - only REGIME-ROBUST combos (ideally re-confirmed as the corpus grows across "
+                  f"multiple regimes) are real candidates.")
     body="\n".join(report)
     print(body)
     try:
         with open(os.path.join(RECORDS_DIR,"strategy_search_report.txt"),"a") as f: f.write(body+"\n\n")
     except Exception: pass
-    flag="*** OOS SURVIVOR(S) FOUND ***  " if total_surv else ""
-    email_report(f"{flag}TothBot strategy search ({total_surv} OOS survivors)", body)
+    # Shout ONLY for a REGIME-ROBUST survivor - the bar that actually matters; a raw OOS survivor over
+    # one contiguous window is usually regime persistence (the bootstrap-CI + 1-sided/front-load traps).
+    flag="*** REGIME-ROBUST SURVIVOR(S) FOUND ***  " if total_robust else ""
+    email_report(f"{flag}TothBot strategy search ({total_robust} robust / {total_surv} OOS survivors)", body)
 
 
 if __name__=="__main__":
