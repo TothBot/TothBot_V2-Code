@@ -331,6 +331,21 @@ def test_second_roll_steps_indicators():
     assert pw.indicators.atr_14 != atr_before      # the +300 candle (big TR) was stepped in
 
 
+def test_on_committed_5m_persists_only_genuinely_new_closes():
+    # TB00775 #1-B: the durable 5m sink fires once per genuinely-new close, NOT for the re-emitted seed
+    # candle (it shares the indicator-step guard, so it dedups identically).
+    pw = _warm()
+    wm = _FakeWM()
+    persisted = []
+    driver = _driver({"BTC/USD": pw}, wm, on_committed_5m=persisted.append)
+    seed = pw.last_interval_begin
+    asyncio.run(driver.on_ohlc_5m(_frame_5m("BTC/USD", seed + 300)))   # first roll = the SEEDED candle
+    assert persisted == []                                            # not persisted (already counted)
+    asyncio.run(driver.on_ohlc_5m(_frame_5m("BTC/USD", seed + 600)))   # rolls the +300 candle -> persist
+    assert len(persisted) == 1
+    assert persisted[0].symbol == "BTC/USD" and persisted[0].interval_begin == seed + 300
+
+
 def test_hr_wm_012_skips_while_reconnecting():
     pw = _warm()
     wm = _FakeWM()

@@ -159,6 +159,7 @@ class LiveSweepDriver:
         bbo_provider: Callable[[str], "tuple[object, object]"] | None = None,
         on_clock_tick: Callable[[datetime], None] | None = None,
         htf_rest_client=None,
+        on_committed_5m: Callable[[object], None] | None = None,
     ) -> None:
         self._warmups = warmups
         self._regime_cache = regime_cache
@@ -205,6 +206,10 @@ class LiveSweepDriver:
         # that wires no REST client leaves it None and the gap is recorded but not auto-healed (the
         # cache still resumes on the next complete hour, bounded).
         self._htf_rest = htf_rest_client
+        # TB00775 #1-B: the durable 5m-stream sink (PermanentOhlc5mSink). Called once per genuinely-new
+        # closed 5m candle to persist the intraday corpus a DEEP realized backtest needs (Kraken history
+        # is capped ~2.5 days). Optional - a unit/paper assembly with no records_dir leaves it None.
+        self._on_committed_5m = on_committed_5m
 
     # --- the 5m system clock: detect -> step indicators -> sweep -------------------------------
     async def on_ohlc_5m(self, frame: dict):
@@ -230,6 +235,10 @@ class LiveSweepDriver:
                     OhlcCandle(high=closed.high, low=closed.low, close=closed.close, volume=closed.volume)
                 )
                 self._stepped5[candle.symbol] = closed.interval_begin
+                # TB00775 #1-B: persist this genuinely-new closed 5m candle to the durable corpus (the
+                # step guard dedups the re-emitted seed candle, so each real close is written once).
+                if self._on_committed_5m is not None:
+                    self._on_committed_5m(closed)
             # The OHLC_5m close is the system clock: advance the periodic-report cadence with this
             # candle's UTC instant (the interval_begin Unix-second key -> a UTC datetime). A calendar
             # boundary crossed since the last close fires the C2-C6 periodic pull (no manual tick).

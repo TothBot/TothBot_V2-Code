@@ -82,6 +82,7 @@ from ..recorder.report_render import PullReportService, ReportSink
 from ..recorder.report_transport import PullCadenceScheduler
 from ..recorder.reporting import ReportCategory
 from ..recorder.trade_record_file import PermanentTradeRecordSink
+from ..recorder.ohlc_record_file import PermanentOhlc5mSink
 from ..regime.scheduler import DailyRegimeCompute, RegimeCache
 from .equity_reconcile import DEFAULT_RECONCILE_INTERVAL_SEC, PeriodicTradeBalanceReconcile
 from .live_driver import (
@@ -387,10 +388,14 @@ async def assemble_operational(
     # TRADE_RECORD_WRITE_FAILED -> the C1 alert seam). now_utc (the providers' UTC clock) drives the
     # annual <YYYY> segmentation; None -> the sink uses datetime.now(timezone.utc).
     trade_record_sink: PermanentTradeRecordSink | None = None
+    ohlc5m_sink: PermanentOhlc5mSink | None = None
     if records_dir is not None:
         trade_record_sink = PermanentTradeRecordSink(
             records_dir, now_utc=now_utc, on_event=event_sink
         )
+        # TB00775 #1-B: persist the live 5m stream to ohlc5m_<YYYY>.jsonl for the DEEP realized backtest
+        # corpus (Kraken history caps ~2.5 days; the only path to depth is logging our own stream).
+        ohlc5m_sink = PermanentOhlc5mSink(records_dir, on_event=event_sink)
     conductors, ciats_sinks, approval_inboxes = assemble_ciats_modules(
         logger, on_event=event_sink, wallet_balance=getattr(wm, "wallet_balance", None),
         trade_record_sink=trade_record_sink,
@@ -454,6 +459,8 @@ async def assemble_operational(
         # TB00769: the Htf1hGap self-heal refetches the 1H series via this same REST client
         # (GetOHLCData(interval=60)) and re-seeds the gapped pair's HtfCache.
         htf_rest_client=rest_client,
+        # TB00775 #1-B: durably persist each genuinely-new closed 5m candle (None when no records_dir).
+        on_committed_5m=ohlc5m_sink,
     )
 
     # 6. Build + run the public data layer (handlers bound, the SHARED machines/coordinator injected).
