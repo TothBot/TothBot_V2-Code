@@ -214,7 +214,7 @@ def boot(bypair,iters=400,seed=7):
     for _ in range(iters):
         tot=0.0; c=0
         for _ in range(m):
-            s=(1103515245*s+12345)&0x7FFFFFFF; pr=pp[s%m]; tot+=sum(bypair[pr]); c+=len(bypair[pr])
+            s=(1103515245*s+12345)&0x7FFFFFFF; pr=pp[(s*m)>>31]; tot+=sum(bypair[pr]); c+=len(bypair[pr])
         vals.append(tot/(c or 1)*100)
     vals.sort(); return (vals[int(.05*iters)],vals[iters//2],vals[int(.95*iters)],m)
 
