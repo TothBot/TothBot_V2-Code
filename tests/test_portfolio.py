@@ -32,18 +32,22 @@ class _Pos:
 
 
 class _WM:
-    def __init__(self, *, positions=None, wallets=None) -> None:
+    def __init__(self, *, positions=None, wallets=None, short_offset=None) -> None:
         self._positions = positions or {}
         self._wallets = (
             {PositionSide.LONG: Decimal("5000"), PositionSide.SHORT: Decimal("5000")}
             if wallets is None else wallets
         )
+        self._short_offset = short_offset
 
     def open_positions(self):
         return self._positions
 
     def wallet_balance(self, side):
         return self._wallets.get(side)
+
+    def short_equity_reconcile_offset(self):
+        return Decimal("0") if self._short_offset is None else Decimal(self._short_offset)
 
 
 def _fixed_clock(dt):
@@ -139,6 +143,47 @@ def test_long_pays_no_borrow_even_with_a_stamp():
         now_utc=_fixed_clock(_T0),
     )
     assert got == Decimal("11000")  # no borrow subtracted
+
+
+# ------------------------------------------------------------ SHORT reconcile carry-forward offset
+def test_short_adds_reconcile_offset_from_wm():
+    # the periodic TradeBalance reconcile re-anchored the SHORT equity: a +12.50 carry-forward offset
+    # (REST-BAL-008 `e` exceeded the raw reconstruction, e.g. the estimated rollover over-subtracted) is
+    # added back to the numerator. Flat short: 5000 collateral + 12.50 = 5012.50.
+    wm = _WM(short_offset="12.50")
+    got = current_portfolio_usd(wm, PositionSide.SHORT, bbo=lambda s: (Decimal("1"), Decimal("2")))
+    assert got == Decimal("5012.50")
+
+
+def test_short_reconcile_offset_param_overrides_wm():
+    # the reconcile's OWN raw read passes reconcile_offset=0 to read the un-offset reconstruction even
+    # when the wm carries a stale offset (so offset = e - raw is computed against the raw, not raw+offset).
+    wm = _WM(short_offset="999")
+    got = current_portfolio_usd(
+        wm, PositionSide.SHORT, bbo=lambda s: (Decimal("1"), Decimal("2")),
+        reconcile_offset=Decimal("0"),
+    )
+    assert got == Decimal("5000")  # the wm offset is ignored; the explicit 0 wins
+
+
+def test_long_never_adds_the_short_offset():
+    # the carry-forward is SHORT-only; a long numerator never reads it even if the wm carries one.
+    wm = _WM(short_offset="999")
+    got = current_portfolio_usd(wm, PositionSide.LONG, bbo=lambda s: (Decimal("60000"), Decimal("60010")))
+    assert got == Decimal("5000")  # flat long, no offset
+
+
+def test_short_offset_back_compat_wm_without_accessor():
+    # a lightweight wm lacking the accessor (getattr None) leaves the reconstruction un-offset (0).
+    class _Bare:
+        def open_positions(self):
+            return {}
+
+        def wallet_balance(self, side):
+            return Decimal("5000")
+
+    got = current_portfolio_usd(_Bare(), PositionSide.SHORT, bbo=lambda s: (Decimal("1"), Decimal("2")))
+    assert got == Decimal("5000")
 
 
 # --------------------------------------------------------------------------- pure helpers

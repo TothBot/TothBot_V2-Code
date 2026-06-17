@@ -83,6 +83,7 @@ from ..recorder.report_transport import PullCadenceScheduler
 from ..recorder.reporting import ReportCategory
 from ..recorder.trade_record_file import PermanentTradeRecordSink
 from ..regime.scheduler import DailyRegimeCompute, RegimeCache
+from .equity_reconcile import DEFAULT_RECONCILE_INTERVAL_SEC, PeriodicTradeBalanceReconcile
 from .live_driver import (
     LiveSweepDriver,
     make_approval_alert_sink,
@@ -282,18 +283,24 @@ class OperationalSystem:
     private_connection: PrivateConnection | None = None
     pull_scheduler: PullCadenceScheduler | None = None
     trade_record_sink: PermanentTradeRecordSink | None = None
+    equity_reconcile: PeriodicTradeBalanceReconcile | None = None
 
     async def run(self) -> None:
-        """Drive the public data layer (and the live private connection, if present) concurrently."""
+        """Drive the public data layer (and, in live, the private connection + the periodic SHORT-equity
+        TradeBalance reconcile) concurrently."""
         runners = [self.data_layer.run()]
         if self.private_connection is not None:
             runners.append(self.private_connection.run())
+        if self.equity_reconcile is not None:
+            runners.append(self.equity_reconcile.run())
         await asyncio.gather(*runners)
 
     def stop(self) -> None:
         self.data_layer.stop()
         if self.private_connection is not None:
             self.private_connection.stop()
+        if self.equity_reconcile is not None:
+            self.equity_reconcile.stop()
 
 
 async def assemble_operational(
@@ -320,7 +327,10 @@ async def assemble_operational(
     open_private_socket: "Callable | None" = None,
     acquire_token: "Callable | None" = None,
     fetch_snap_orders: "Callable | None" = None,
+    fetch_account_balance: "Callable | None" = None,
+    fetch_trade_balance: "Callable | None" = None,
     balances_handler: Handler | None = None,
+    reconcile_interval_sec: float | None = None,
     report_emit: "ReportSink | None" = None,
     report_categories: "Sequence[ReportCategory] | None" = None,
     records_dir: "str | None" = None,
@@ -477,6 +487,7 @@ async def assemble_operational(
     #    Paper keeps it None (never connects the private WS). The live fill -> mirror loop is the
     #    already-built PrivateConnectionAssembler; this is the startup-sequencing tie-in.
     private_connection: PrivateConnection | None = None
+    equity_reconcile: PeriodicTradeBalanceReconcile | None = None
     if mode is Mode.LIVE:
         if open_private_socket is None or acquire_token is None:
             raise ValueError(
@@ -490,11 +501,34 @@ async def assemble_operational(
             # ar:AR-056 gap-close ACTUAL-fill source (REST QueryOrders, FEE-CALC-006); the rest_client
             # exposes query_orders (a stand-in without it -> the degraded entry-time estimate path).
             query_orders=getattr(rest_client, "query_orders", None),
+            # ar:AR-052 startup drawdown baselines (REST-BAL-004 long spot USD / REST-BAL-008 short
+            # margin equity `e`), captured ONCE in build() (HR-WM-011 / AR-056); None -> the side stays
+            # gated off until its baseline lands.
+            fetch_account_balance=fetch_account_balance,
+            fetch_trade_balance=fetch_trade_balance,
             balances_handler=balances_handler,
             on_event=event_sink,
             clock=mono_clock,
             sleep=pace_sleep,
         ).build()
+        # 7b. The periodic SHORT-equity TradeBalance reconcile carry-forward (ar:AR-052 / REST-BAL-008):
+        #     re-anchor the reconstructed SHORT current_portfolio to the true margin equity `e` every
+        #     interval, bounding the rollover-accrual drift. Live only (paper has no margin account) and
+        #     only when the TradeBalance fetch edge is wired; OperationalSystem.run() drives its loop.
+        if fetch_trade_balance is not None:
+            equity_reconcile = PeriodicTradeBalanceReconcile(
+                wm,
+                fetch_trade_balance=fetch_trade_balance,
+                bbo=providers.bbo,
+                interval_seconds=(
+                    reconcile_interval_sec
+                    if reconcile_interval_sec is not None
+                    else DEFAULT_RECONCILE_INTERVAL_SEC
+                ),
+                now_utc=now_utc,  # the class coerces None -> its own UTC clock
+                sleep=rest_sleep,
+                on_event=event_sink,
+            )
 
     return OperationalSystem(
         data_layer=data_layer,
@@ -512,4 +546,5 @@ async def assemble_operational(
         private_connection=private_connection,
         pull_scheduler=pull_scheduler,
         trade_record_sink=trade_record_sink,
+        equity_reconcile=equity_reconcile,
     )

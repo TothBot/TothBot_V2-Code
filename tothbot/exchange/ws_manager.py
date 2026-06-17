@@ -439,6 +439,17 @@ class WSManager:
         # portfolio_baseline(side) accessor (paper reads the module ledger's captured baseline). Empty
         # until set_live_portfolio_baseline records it - the sweep skips the side until then.
         self._live_portfolio_baseline: dict[PositionSide, Decimal] = {}
+        # The LIVE SHORT-equity reconcile offset (sec 12.4 / ar:AR-052 / REST-BAL-008, the periodic
+        # TradeBalance carry-forward): the running reconstructed SHORT current_portfolio (margin
+        # collateral + open-short MTM at the ask - the ESTIMATED borrow rollover) DRIFTS from the true
+        # margin equity `e` (the rollover accrual is an estimate; the cash/MTM marks drift). The periodic
+        # reconcile (equity_reconcile.py) re-anchors it: offset = e_true - raw_reconstruction at each
+        # poll, added back into current_portfolio_usd so the SHORT drawdown numerator lands on the true
+        # TradeBalance `e` at the reconcile instant and tracks MTM between polls. 0 until the first
+        # reconcile (the un-reconciled reconstruction OVER-subtracts rollover, firing the breaker SOONER -
+        # FN-safe); UPDATED each poll (NOT once-only like the baseline - it is the carry-forward). LIVE
+        # only (paper has no margin account; the reconcile never runs in paper, so it stays 0).
+        self._short_equity_reconcile_offset: Decimal = Decimal("0")
         # LIVE exit bookkeeping (sec 12.5 LIVE FLOW). _pending_exit_reason: the exit_reason stamped
         # by a TothBot-dispatched live exit (L1a/L2 market sell) at dispatch, read when the executions
         # close fill confirms (an un-stamped close IS the off-book emergSL backstop firing - mod:Exit_
@@ -1657,6 +1668,23 @@ class WSManager:
         if side in self._live_portfolio_baseline:
             return  # HR-WM-011 / AR-056: captured once at startup, never overwritten on reconnect
         self._live_portfolio_baseline[side] = _dec(portfolio_usd)
+
+    def short_equity_reconcile_offset(self) -> Decimal:
+        """The ar:AR-052 / REST-BAL-008 SHORT-equity reconcile carry-forward offset (the periodic
+        TradeBalance re-anchor): added into the SHORT current_portfolio_usd reconstruction so the
+        gate:G7 CHECK-1 drawdown numerator lands on the true margin equity `e` at the last reconcile
+        instant (bounding the rollover-accrual drift between polls). 0 before the first reconcile - and
+        always in paper (no margin account; the reconcile is live-only); the periodic reconcile updates
+        it each poll."""
+        return self._short_equity_reconcile_offset
+
+    def set_short_equity_reconcile_offset(self, offset: object) -> None:
+        """Re-seed the SHORT-equity reconcile carry-forward offset to the periodic TradeBalance `e`
+        re-anchor (ar:AR-052 / REST-BAL-008). UNLIKE the once-only startup baseline (HR-WM-011), this is
+        UPDATED on every reconcile poll - it is the running carry-forward that bounds the rollover-accrual
+        estimate drift between polls (re-seeding the reconstructed short equity to the true margin
+        equity). LIVE only (the reconcile never runs in paper)."""
+        self._short_equity_reconcile_offset = _dec(offset)
 
     # --- the LIVE wallet cache (sec 12.4 / WS-BAL-002/003 - real Kraken balances authoritative) -----
     def ingest_balances(self, frame: Mapping[str, object]) -> object:

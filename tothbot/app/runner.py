@@ -147,6 +147,8 @@ async def build_system(
     open_private_socket: Callable | None = None,
     acquire_token: Callable | None = None,
     fetch_snap_orders: Callable | None = None,
+    fetch_account_balance: Callable | None = None,
+    fetch_trade_balance: Callable | None = None,
     balances_handler: Callable | None = None,
 ) -> OperationalSystem:
     """The ar:AR-049 cold-start composition: construct mod:Logger with the HR-LG-009 C1 alert SMTP seam
@@ -162,11 +164,13 @@ async def build_system(
     READY, sweeps, gate decisions, position writes); None leaves the path on the corpus alone (the test
     default - no console mirror).
 
-    The private-WS edges (open_private_socket / acquire_token / fetch_snap_orders / balances_handler)
-    are the LIVE-only seam (PA-004 div #1 / rule:HR-WM-022: the separate authenticated executions/
-    balances connection). They are passed straight through to assemble_operational, which connects the
-    private socket ONLY in Mode.LIVE (and raises if live is requested without them). PAPER leaves them
-    None (never connects the private WS); the deploy entrypoint binds the real edges for live."""
+    The private-WS edges (open_private_socket / acquire_token / fetch_snap_orders / balances_handler +
+    the REST drawdown-baseline edges fetch_account_balance (REST-BAL-004) / fetch_trade_balance
+    (REST-BAL-008, also the periodic SHORT-equity reconcile source)) are the LIVE-only seam (PA-004 div #1
+    / rule:HR-WM-022: the separate authenticated executions/balances connection). They are passed straight
+    through to assemble_operational, which connects the private socket ONLY in Mode.LIVE (and raises if
+    live is requested without them). PAPER leaves them None (never connects the private WS); the deploy
+    entrypoint binds the real edges for live."""
     logger = Logger(on_event=None)
     console = on_event
 
@@ -211,6 +215,8 @@ async def build_system(
         open_private_socket=open_private_socket,
         acquire_token=acquire_token,
         fetch_snap_orders=fetch_snap_orders,
+        fetch_account_balance=fetch_account_balance,
+        fetch_trade_balance=fetch_trade_balance,
         balances_handler=balances_handler,
     )
 

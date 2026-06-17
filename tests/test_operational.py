@@ -141,12 +141,26 @@ class _LiveWM(_FakeWM):
     def __init__(self) -> None:
         super().__init__()
         self.transmitter = SimpleNamespace(bind=lambda _t: None)
+        self.baselines: dict = {}          # ar:AR-052 startup captures (REST-BAL-004 / REST-BAL-008)
+        self.short_offset = None           # the periodic reconcile carry-forward (REST-BAL-008)
 
     def restore_position_mirror(self, _snap):  # pragma: no cover - not driven in the build test
         return []
 
     def record_execution(self, _event):  # pragma: no cover - not driven in the build test
         pass
+
+    def set_live_portfolio_baseline(self, side, usd) -> None:
+        self.baselines.setdefault(side, usd)  # once-only, mirrors the real surface
+
+    def open_positions(self):
+        return {}
+
+    def short_equity_reconcile_offset(self):
+        return self.short_offset
+
+    def set_short_equity_reconcile_offset(self, offset) -> None:
+        self.short_offset = offset
 
 
 def _private_opener():
@@ -382,6 +396,77 @@ def test_live_mode_builds_private_connection():
     first = priv_sockets[0].sent[0]
     assert first["params"]["channel"] == "executions"
     assert first["params"]["token"] == "tok-abc"
+
+
+def test_live_mode_wires_baselines_and_equity_reconcile():
+    # ar:AR-052: the threaded REST drawdown-baseline edges reach _capture_startup_baseline (LONG
+    # REST-BAL-004 / SHORT REST-BAL-008), and the SHORT TradeBalance edge ALSO builds the periodic
+    # equity reconcile (REST-BAL-008 carry-forward). OperationalSystem.run() would drive its loop.
+    rest = _FakeRest()
+    open_socket, _opened = _opener()
+    open_private, _priv = _private_opener()
+    wm, logger = _LiveWM(), _FakeLogger()
+    mpp, reward = _stores()
+
+    async def no_sleep(_s):
+        return None
+
+    async def acquire_token():
+        return "tok-abc"
+
+    async def fetch_account_balance():
+        return Decimal("5000")     # REST-BAL-004 long spot USD
+
+    async def fetch_trade_balance():
+        return Decimal("4800")     # REST-BAL-008 short margin equity `e`
+
+    system = asyncio.run(assemble_operational(
+        universe=["BTC/USD"], rest_client=rest, open_socket=open_socket,
+        bucket=SubscribeTokenBucket(rate_per_sec=1000.0, burst_capacity=100000.0),
+        wm=wm, logger=logger, mpp_store=mpp, reward_store=reward,
+        mode=Mode.LIVE, open_private_socket=open_private, acquire_token=acquire_token,
+        fetch_account_balance=fetch_account_balance, fetch_trade_balance=fetch_trade_balance,
+        now_utc=lambda: datetime(2026, 6, 15, 7, 30, tzinfo=timezone.utc),
+        rest_sleep=no_sleep, pace_sleep=no_sleep,
+    ))
+    # Both startup baselines captured (the previously-dead edges now reach the capture).
+    assert wm.baselines[PositionSide.LONG] == Decimal("5000")
+    assert wm.baselines[PositionSide.SHORT] == Decimal("4800")
+    # The periodic SHORT-equity reconcile is built (the SHORT TradeBalance edge is wired).
+    assert system.equity_reconcile is not None
+    # And a poll re-seeds the carry-forward offset (flat short: raw 0-collateral wallet None -> skip;
+    # here _LiveWM.wallet_balance is None so the poll cleanly SKIPS, leaving the offset unset).
+    assert asyncio.run(system.equity_reconcile.reconcile_once()) is None
+    assert wm.short_offset is None  # skipped (wallet not fed) - never a bogus offset
+
+
+def test_live_mode_without_trade_balance_edge_has_no_reconcile():
+    # The reconcile is built ONLY when the SHORT TradeBalance edge is wired (no edge -> no reconcile).
+    rest = _FakeRest()
+    open_socket, _opened = _opener()
+    open_private, _priv = _private_opener()
+    mpp, reward = _stores()
+
+    async def no_sleep(_s):
+        return None
+
+    async def acquire_token():
+        return "tok-abc"
+
+    system = asyncio.run(assemble_operational(
+        universe=["BTC/USD"], rest_client=rest, open_socket=open_socket,
+        bucket=SubscribeTokenBucket(rate_per_sec=1000.0, burst_capacity=100000.0),
+        wm=_LiveWM(), logger=_FakeLogger(), mpp_store=mpp, reward_store=reward,
+        mode=Mode.LIVE, open_private_socket=open_private, acquire_token=acquire_token,
+        now_utc=lambda: datetime(2026, 6, 15, 7, 30, tzinfo=timezone.utc),
+        rest_sleep=no_sleep, pace_sleep=no_sleep,
+    ))
+    assert system.equity_reconcile is None
+
+
+def test_paper_mode_has_no_equity_reconcile():
+    system, *_ = _assemble()
+    assert system.equity_reconcile is None
 
 
 def test_live_mode_requires_private_edges():

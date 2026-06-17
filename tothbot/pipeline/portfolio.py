@@ -26,9 +26,11 @@ short MTM - the breaker would sleep while a short bleeds) and only the EQUITY ba
 is the full market value (bid * qty) because the long cash already paid out the entry notional.
 
 PURE save the injected now_utc clock (the short rollover accrual needs the hold so far). Decimal-only
-(ar:AR-047). The periodic TradeBalance `e` reconcile that re-seeds the reconstructed short equity to bound
-the rollover-accrual estimate is a follow-on wiring (it needs the REST poll scheduler); the reconstruction
-here is conservative (an un-reconciled rollover OVER-subtracts, firing the breaker SOONER - FN-safe).
+(ar:AR-047). The periodic TradeBalance `e` reconcile (pipeline/equity_reconcile.py, REST-BAL-008) re-seeds
+the reconstructed short equity to bound the rollover-accrual estimate: it re-anchors a carry-forward offset
+(wm.short_equity_reconcile_offset, added back here for the SHORT) so the numerator lands on the true margin
+equity at the last poll. Before the first poll (and always in paper) the offset is 0 and the reconstruction
+is conservative (an un-reconciled rollover OVER-subtracts, firing the breaker SOONER - FN-safe).
 """
 
 from __future__ import annotations
@@ -96,6 +98,7 @@ def current_portfolio_usd(
     bbo: Callable[[str], "tuple[object, object]"],
     now_utc: UtcClock = _utc_now,
     rollover_fee_pct: object = _ROLLOVER_FEE,
+    reconcile_offset: object | None = None,
 ) -> Decimal | None:
     """THIS side's ar:AR-052 current_portfolio - the MARK-TO-MARKET drawdown numerator for gate:G7
     CHECK 1 (DISTINCT from the realized-cash SIZING read wallet_balance(side) that feeds CHECK 2/3 + G8).
@@ -132,4 +135,17 @@ def current_portfolio_usd(
             total -= short_rollover_accrued_usd(
                 entry * qty, blocks, rollover_fee_pct=rollover_fee_pct
             )
+    if side is PositionSide.SHORT:
+        # ar:AR-052 / REST-BAL-008: add the periodic TradeBalance `e` reconcile carry-forward offset so
+        # the SHORT drawdown numerator re-anchors to the true margin equity at the last poll (bounding
+        # the rollover-accrual drift). reconcile_offset OVERRIDES (the reconcile's own RAW read passes 0
+        # to read the un-offset reconstruction); None -> the wm's running offset (getattr keeps a
+        # lightweight test wm working, and paper / a pre-first-poll live run leaves it 0 - the
+        # conservative un-reconciled reconstruction, FN-safe).
+        if reconcile_offset is not None:
+            total += _dec(reconcile_offset)
+        else:
+            offset = getattr(wm, "short_equity_reconcile_offset", None)
+            if callable(offset):
+                total += _dec(offset())
     return total
