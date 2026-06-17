@@ -44,6 +44,7 @@ from ..rest.client import KrakenRestClient
 from .prescreen import screen_universe
 from .runner import OpsSettings, run
 from .universe import DEFAULT_ALWAYS_INCLUDE, load_universe
+from .viability_screen import screen_viable_universe
 
 ConnectFn = Callable[..., Awaitable[Transport]]
 
@@ -81,6 +82,24 @@ def _parse_top_n(environ: Mapping[str, str] | None) -> int:
 
     env = environ if environ is not None else os.environ
     raw = (env.get("TOTHBOT_TOP_N") or "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def _parse_viability_n(environ: Mapping[str, str] | None) -> int:
+    """The TOTHBOT_VIABILITY_N phase-3 capacity budget (an int) - the monitored cardinality CIATS picks
+    the top-N viable pairs up to, from a forward historical re-sim of the phase-2 liquidity candidates.
+    0 / unset / unparseable -> 0 (NO viability screen; the phase-2 / full set stands). Ignored when
+    TOTHBOT_UNIVERSE pins an explicit set. The capacity budget is an ENGINEERING constant (VPS + per-IP
+    data-layer capacity), NOT a strategy seed - CIATS picks WHICH pairs, the operator sizes the budget."""
+    import os
+
+    env = environ if environ is not None else os.environ
+    raw = (env.get("TOTHBOT_VIABILITY_N") or "").strip()
     if not raw:
         return 0
     try:
@@ -147,6 +166,15 @@ async def _amain(
         if top_n:
             universe = await screen_universe(rest_client, universe, top_n=top_n)
             print(f"tothbot.app: pre-screened to top-{top_n} by liquidity ({len(universe)} pairs)")
+        # Phase-3 CIATS-owned viability cut (TOTHBOT_VIABILITY_N): a forward historical re-sim per
+        # candidate (one governed daily-OHLC call each) -> CIATS picks the top-N viable by run-to-
+        # reversal expectancy under the capacity budget. Runs over the phase-2 candidates so the daily
+        # re-sim is bounded. 0 / unset -> no viability screen (the phase-2 / full set stands).
+        viability_n = _parse_viability_n(environ)
+        if viability_n:
+            universe = await screen_viable_universe(rest_client, universe, capacity_n=viability_n)
+            print(f"tothbot.app: viability-screened to top-{viability_n} by expectancy "
+                  f"({len(universe)} pairs)")
     settings = replace(settings, universe=universe)
     print(f"tothbot.app: starting {settings.mode.value} organism")
 

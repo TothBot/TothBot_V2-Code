@@ -186,6 +186,45 @@ def test_amain_universe_override_is_not_prescreened():
     assert captured["settings"].universe == ("BTC/USD", "ETH/USD", "SOL/USD")
 
 
+def test_amain_viability_n_invokes_the_screen_and_threads_its_result():
+    # TOTHBOT_VIABILITY_N runs the phase-3 forward re-sim over the derived candidates and threads the
+    # CIATS-picked viable set into settings.universe. The fake REST serves a flat daily series per
+    # candidate (a flat series never reverses -> non-viable), so the screen deterministically reduces
+    # the derived set {AAA/USD, BBB/USD, BTC/USD} to the anchor only - proving the screen ran + its
+    # output was threaded in. (Positive-viability selection is unit-tested in test_viability.py, where
+    # the per-pair expectancy is supplied explicitly rather than depending on synthetic bar shapes.)
+    from decimal import Decimal
+
+    from tothbot.regime.engine import DailyBar
+
+    def _flat(n):
+        b = DailyBar.of(Decimal("100"), Decimal("100.5"), Decimal("99.5"), Decimal("100"), 1)
+        return [b] * n
+
+    class _Resp:
+        def __init__(self, bars):
+            self.committed = tuple(bars)
+
+    class _ViabilityRest:
+        async def get_ohlc_data(self, pair, interval):
+            return _Resp(_flat(80))
+
+    async def fake_connect(role):
+        return _FakeTransport([_snapshot(["AAA/USD", "BBB/USD"])])
+
+    captured: dict = {}
+
+    async def fake_run(settings, **edges):
+        captured["settings"] = settings
+
+    asyncio.run(_amain(
+        {"TOTHBOT_MODE": "paper", "TOTHBOT_VIABILITY_N": "10"},
+        connect_fn=fake_connect, run_fn=fake_run, rest_client=_ViabilityRest(),
+    ))
+    # all 3 derived pairs are flat (non-viable) -> only the ar:AR-074 anchor survives the screen.
+    assert captured["settings"].universe == ("BTC/USD",)
+
+
 def test_amain_live_mode_halts_with_clear_message():
     async def fake_connect(role):  # pragma: no cover - never reached (the guard fires first)
         raise AssertionError("live must not connect")
