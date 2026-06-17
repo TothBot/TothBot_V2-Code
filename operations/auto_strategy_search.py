@@ -248,8 +248,15 @@ def search(pairs, maxhold, roll_per_bar, label):
     # front-loaded survivor over a single contiguous window is REGIME persistence, NOT a durable edge
     # (TB00776: the live 1h "survivors" were all short-only and front-loaded into one sub-period).
     def robust(o):
+        # dir_ok: when BOTH sides trade, each must be MATERIALLY positive - the weaker side's E at
+        # least 20% of the stronger's. A near-flat side (e.g. long +0.03% vs short +2.34%) means the
+        # profit rode one direction = regime, even though both nominally clear zero.
         twoside = o["longn"]>=8 and o["shortn"]>=8
-        dir_ok = (o["longE"]>0 and o["shortE"]>0) if twoside else True
+        if twoside:
+            lo_e,hi_e=sorted((o["longE"],o["shortE"]))
+            dir_ok = lo_e>0 and lo_e>=0.20*hi_e
+        else:
+            dir_ok = True
         time_ok = o["tpos"]>=max(2,o["tcount"]-1) if o["tcount"]>=2 else False
         return dir_ok and time_ok, dir_ok, time_ok
     robust_n=sum(1 for r in surv if robust(r[4])[0])
