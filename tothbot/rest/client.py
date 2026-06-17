@@ -33,6 +33,7 @@ from .rate_limiter import RestRateLimiter
 PATH_WS_TOKEN = "/0/private/GetWebSocketsToken"   # channel:kraken_rest_GetWebSocketsToken
 PATH_OHLC = "/0/public/OHLC"                      # channel:kraken_rest_GetOHLCData
 PATH_TICKER = "/0/public/Ticker"                  # channel:kraken_rest_Ticker (liquidity probe)
+PATH_ASSET_PAIRS = "/0/public/AssetPairs"         # channel:kraken_rest_AssetPairs (REST-key<->wsname map)
 PATH_OPEN_ORDERS = "/0/private/OpenOrders"        # channel:kraken_rest_GetOpenOrders
 PATH_BALANCE = "/0/private/Balance"               # channel:kraken_rest_GetAccountBalance
 PATH_TRADE_BALANCE = "/0/private/TradeBalance"    # channel:kraken_rest_TradeBalance (REST-BAL-008, short equity)
@@ -172,6 +173,24 @@ def parse_ticker_liquidity(payload: Mapping[str, object]) -> dict[str, Decimal]:
         if not (isinstance(v, Sequence) and isinstance(p, Sequence) and len(v) > 1 and len(p) > 1):
             continue
         out[str(key)] = _dec(v[1]) * _dec(p[1])
+    return out
+
+
+def parse_asset_pairs(payload: Mapping[str, object]) -> dict[str, str]:
+    """AssetPairs -> {rest_key: wsname} - the REST-pair-key <-> WS-v2-symbol map (the bulk pre-screen
+    needs it because GetTicker keys by the REST altname/key like 'XXBTZUSD' while the universe + the
+    data layer speak WS v2 symbols like 'BTC/USD'). Kraken returns result = {<rest_key>: {altname,
+    wsname, base, quote, status, ...}}; wsname is the WS v2 'BASE/QUOTE' form. A key WITHOUT a wsname
+    (a fiat/illiquid pair Kraken does not stream over WS v2) is skipped - it can never be in the WS
+    universe anyway."""
+    result = raise_for_error(payload)
+    out: dict[str, str] = {}
+    for rest_key, info in result.items():
+        if not isinstance(info, Mapping):
+            continue
+        wsname = info.get("wsname")
+        if wsname:
+            out[str(rest_key)] = str(wsname)
     return out
 
 
@@ -403,6 +422,22 @@ class KrakenRestClient:
         for vol in liquidity.values():
             return vol
         raise KrakenRestError([f"GetTicker returned no ticker for {pair}"])
+
+    async def get_all_ticker_liquidity(self) -> dict[str, Decimal]:
+        """GetTicker (public) with NO pair arg -> {rest_key: vol_24h_usd} for EVERY tradeable pair in
+        ONE call (the bulk pre-screen probe). Kraken returns the full ticker map when `pair` is omitted;
+        parse_ticker_liquidity already iterates a multi-pair result. One bulk call (O(1) REST) screens
+        the whole AR-070 set, so a large universe costs ONE governed call, not one-per-pair (the whole
+        point of the pre-screen). Keyed by the REST pair key - map to WS v2 symbols via get_asset_pairs."""
+        payload = await self._public(PATH_TICKER, {})
+        return parse_ticker_liquidity(payload)
+
+    async def get_asset_pairs(self) -> dict[str, str]:
+        """AssetPairs (public) -> {rest_key: wsname} in ONE call. The bulk pre-screen joins this with
+        get_all_ticker_liquidity (REST-keyed) to express per-pair liquidity in WS v2 symbols ('BTC/USD')
+        so it can rank the AR-070 derived set (which speaks WS v2 symbols)."""
+        payload = await self._public(PATH_ASSET_PAIRS, {})
+        return parse_asset_pairs(payload)
 
     async def get_open_orders(self) -> list[dict]:
         """GetOpenOrders (private). The AR-021 reconcile fallback / snap_orders source."""

@@ -41,6 +41,7 @@ from ..exchange.connection import ConnectionRole
 from ..exchange.pacing import SubscribeTokenBucket
 from ..exchange.transport import Transport, connect
 from ..rest.client import KrakenRestClient
+from .prescreen import screen_universe
 from .runner import OpsSettings, run
 from .universe import DEFAULT_ALWAYS_INCLUDE, load_universe
 
@@ -71,6 +72,23 @@ def _parse_universe_override(environ: Mapping[str, str] | None) -> tuple[str, ..
     return tuple(sorted(pinned | set(DEFAULT_ALWAYS_INCLUDE)))
 
 
+def _parse_top_n(environ: Mapping[str, str] | None) -> int:
+    """The TOTHBOT_TOP_N phase-2 pre-screen cut (an int) - trim the ar:AR-070 derived universe to the
+    top-N most liquid pairs before the data layer subscribes/warms. 0 / unset / unparseable -> 0 (NO
+    screen, the full AR-070 set). Ignored when TOTHBOT_UNIVERSE pins an explicit set (the pin wins).
+    PHASE 2 = the operator picks N for data gathering; PHASE 3 hands N to CIATS (a viability seed)."""
+    import os
+
+    env = environ if environ is not None else os.environ
+    raw = (env.get("TOTHBOT_TOP_N") or "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
 def make_public_open_socket(connect_fn: ConnectFn = connect) -> Callable[[int], Awaitable[Transport]]:
     """The data layer's open_socket(shard_index) -> Transport over the PUBLIC Kraken WS v2 endpoint
     (wss://ws.kraken.com/v2). Every public shard opens the same public endpoint, so the shard index is
@@ -88,8 +106,11 @@ async def _amain(
     *,
     connect_fn: ConnectFn = connect,
     run_fn: Callable[..., Awaitable[None]] = run,
+    rest_client: object | None = None,
 ) -> None:
-    """The cold-start body: read settings, build the real edges, load the ar:AR-070 universe, run."""
+    """The cold-start body: read settings, build the real edges, load the ar:AR-070 universe, run.
+    rest_client is injected in tests (it drives the phase-2 pre-screen + the warm-up/regime/liquidity
+    REST phases); the default constructs the real public-only KrakenRestClient."""
     settings = OpsSettings.from_env(environ, universe=())
     if settings.mode is Mode.LIVE:
         raise SystemExit(
@@ -101,6 +122,9 @@ async def _amain(
         )
 
     open_socket = make_public_open_socket(connect_fn)
+    # public-only in paper (no credentials); also drives the phase-2 pre-screen. Injected in tests.
+    if rest_client is None:
+        rest_client = KrakenRestClient()
     # TOTHBOT_UNIVERSE override (a comma-separated pin, e.g. "BTC/USD,ETH/USD,SOL/USD") - a small fixed
     # universe for a smoke / first-run test: it SKIPS the AR-070 instrument-snapshot load and uses the
     # pinned pairs directly (the BTC/USD anchor is always unioned in, ar:AR-074, so the daily market_
@@ -115,12 +139,20 @@ async def _amain(
         # process exits (never trade against an unknown universe; mirrors REST-WST-006 HALT-on-no-token).
         universe = await load_universe(open_socket)
         print(f"tothbot.app: AR-070 universe loaded ({len(universe)} pairs)")
+        # Phase-2 bulk pre-screen: trim the derived AR-070 set to the top-N most liquid pairs (TOTHBOT_
+        # TOP_N) BEFORE the data layer subscribes/warms, so a large universe does not firehose the data
+        # layer + REST budget. 0 / unset -> no screen (the full set). The two screening REST calls go
+        # through the global governor. A TOTHBOT_UNIVERSE pin is NOT screened (the explicit pin wins).
+        top_n = _parse_top_n(environ)
+        if top_n:
+            universe = await screen_universe(rest_client, universe, top_n=top_n)
+            print(f"tothbot.app: pre-screened to top-{top_n} by liquidity ({len(universe)} pairs)")
     settings = replace(settings, universe=universe)
     print(f"tothbot.app: starting {settings.mode.value} organism")
 
     await run_fn(
         settings,
-        rest_client=KrakenRestClient(),   # public-only in paper (no credentials)
+        rest_client=rest_client,
         open_socket=open_socket,
         on_event=console_event_sink,      # mirror organism telemetry to stdout (the nohup log)
         bucket=SubscribeTokenBucket(),

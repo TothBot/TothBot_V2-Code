@@ -25,14 +25,17 @@ from tothbot.rest.client import (
     KrakenRestClient,
     KrakenRestError,
     OhlcResponse,
+    PATH_ASSET_PAIRS,
     PATH_OHLC,
     PATH_OPEN_ORDERS,
     PATH_QUERY_ORDERS,
+    PATH_TICKER,
     PATH_TRADE_BALANCE,
     PATH_WS_TOKEN,
     RestOhlcBar,
     gap_close_fill,
     parse_account_balance,
+    parse_asset_pairs,
     parse_trade_balance,
     parse_ohlc,
     parse_open_orders,
@@ -380,4 +383,42 @@ def test_client_query_orders_empty_short_circuits_without_call():
     client = KrakenRestClient(_CREDS, transport=fake, rate_limiter=_FAST)
     out = asyncio.run(client.query_orders([]))
     assert out == {}
+    assert not fake.post_calls
+
+
+# --- phase-2 bulk pre-screen surface (bulk Ticker + AssetPairs) ---------------
+
+def test_parse_asset_pairs_maps_rest_key_to_wsname():
+    payload = {"error": [], "result": {
+        "XXBTZUSD": {"altname": "XBTUSD", "wsname": "BTC/USD", "base": "XXBT", "quote": "ZUSD"},
+        "XETHZUSD": {"altname": "ETHUSD", "wsname": "ETH/USD"},
+        "FIATPAIR": {"altname": "EURUSD"},   # no wsname -> not WS-streamable -> dropped
+    }}
+    out = parse_asset_pairs(payload)
+    assert out == {"XXBTZUSD": "BTC/USD", "XETHZUSD": "ETH/USD"}
+
+
+def test_client_get_all_ticker_liquidity_is_bulk_public_no_pair():
+    # bulk Ticker: NO pair arg -> Kraken returns every pair; parse_ticker_liquidity iterates them.
+    result = {
+        "XXBTZUSD": {"v": ["10", "100"], "p": ["50000", "50000"]},   # 100 * 50000 = 5,000,000
+        "XETHZUSD": {"v": ["5", "200"], "p": ["3000", "3000"]},      # 200 * 3000 = 600,000
+    }
+    fake = _FakeRestTransport(get_result={"error": [], "result": result})
+    client = KrakenRestClient(transport=fake, rate_limiter=_FAST)
+    liq = asyncio.run(client.get_all_ticker_liquidity())
+    assert liq == {"XXBTZUSD": Decimal("5000000"), "XETHZUSD": Decimal("600000")}
+    url, params = fake.get_calls[0]
+    assert url == REST_BASE_URL + PATH_TICKER
+    assert params == {}                  # bulk: no pair arg
+    assert not fake.post_calls           # public: never signed
+
+
+def test_client_get_asset_pairs_is_public():
+    result = {"XXBTZUSD": {"wsname": "BTC/USD"}}
+    fake = _FakeRestTransport(get_result={"error": [], "result": result})
+    client = KrakenRestClient(transport=fake, rate_limiter=_FAST)
+    out = asyncio.run(client.get_asset_pairs())
+    assert out == {"XXBTZUSD": "BTC/USD"}
+    assert fake.get_calls[0][0] == REST_BASE_URL + PATH_ASSET_PAIRS
     assert not fake.post_calls

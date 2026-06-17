@@ -129,6 +129,63 @@ def test_amain_universe_override_pins_pairs_and_skips_ar070_load():
     assert connected == []  # the AR-070 snapshot load was skipped
 
 
+class _FakeScreenRest:
+    """A REST client that serves the bulk pre-screen calls (bulk Ticker + AssetPairs) over fakes."""
+
+    def __init__(self, liquidity_by_key, keymap) -> None:
+        self._liq = liquidity_by_key
+        self._keymap = keymap
+
+    async def get_all_ticker_liquidity(self):
+        return self._liq
+
+    async def get_asset_pairs(self):
+        return self._keymap
+
+
+def test_amain_top_n_prescreens_the_ar070_universe():
+    # TOTHBOT_TOP_N=1 trims the derived AR-070 set to the single most-liquid pair, with the BTC/USD
+    # anchor always kept (ar:AR-074). Derived = BTC/USD, ETH/USD, SOL/USD; ETH is the most liquid
+    # non-anchor -> the screened universe is {BTC/USD (anchor), ETH/USD}.
+    from decimal import Decimal
+
+    async def fake_connect(role):
+        return _FakeTransport([_snapshot(["ETH/USD", "SOL/USD"])])
+
+    rest = _FakeScreenRest(
+        liquidity_by_key={"XXBTZUSD": Decimal("1"), "XETHZUSD": Decimal("90"), "SOLUSD": Decimal("50")},
+        keymap={"XXBTZUSD": "BTC/USD", "XETHZUSD": "ETH/USD", "SOLUSD": "SOL/USD"},
+    )
+    captured: dict = {}
+
+    async def fake_run(settings, **edges):
+        captured["settings"] = settings
+
+    asyncio.run(_amain(
+        {"TOTHBOT_MODE": "paper", "TOTHBOT_TOP_N": "1"},
+        connect_fn=fake_connect, run_fn=fake_run, rest_client=rest,
+    ))
+    assert captured["settings"].universe == ("BTC/USD", "ETH/USD")  # anchor + top-1 by liquidity
+
+
+def test_amain_universe_override_is_not_prescreened():
+    # An explicit TOTHBOT_UNIVERSE pin wins: TOTHBOT_TOP_N is ignored on the pinned path (no screen).
+    async def fake_connect(role):  # pragma: no cover - pinned path opens no socket
+        raise AssertionError("pinned universe must not open a socket")
+
+    captured: dict = {}
+
+    async def fake_run(settings, **edges):
+        captured["settings"] = settings
+
+    asyncio.run(_amain(
+        {"TOTHBOT_MODE": "paper", "TOTHBOT_UNIVERSE": "ETH/USD,SOL/USD", "TOTHBOT_TOP_N": "1"},
+        connect_fn=fake_connect, run_fn=fake_run,
+    ))
+    # all pinned pairs survive (anchor unioned) - the top-N screen did NOT run.
+    assert captured["settings"].universe == ("BTC/USD", "ETH/USD", "SOL/USD")
+
+
 def test_amain_live_mode_halts_with_clear_message():
     async def fake_connect(role):  # pragma: no cover - never reached (the guard fires first)
         raise AssertionError("live must not connect")
