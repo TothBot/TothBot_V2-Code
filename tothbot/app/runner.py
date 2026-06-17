@@ -144,6 +144,10 @@ async def build_system(
     rest_sleep: Callable = asyncio.sleep,
     pace_sleep: Callable = asyncio.sleep,
     alert_sleep: Callable[[float], None] | None = None,
+    open_private_socket: Callable | None = None,
+    acquire_token: Callable | None = None,
+    fetch_snap_orders: Callable | None = None,
+    balances_handler: Callable | None = None,
 ) -> OperationalSystem:
     """The ar:AR-049 cold-start composition: construct mod:Logger with the HR-LG-009 C1 alert SMTP seam
     bound (Logger.set_alert_sink), wire the C2-C6 pull transport + the HR-LG-013 records dir from
@@ -156,7 +160,13 @@ async def build_system(
     Stream-1/Stream-2 corpus (the CIATS data source) AND, when on_event is given, mirrors each event to
     it. The deploy entrypoint passes a console printer so a smoke run is observable (warm-up, pair
     READY, sweeps, gate decisions, position writes); None leaves the path on the corpus alone (the test
-    default - no console mirror)."""
+    default - no console mirror).
+
+    The private-WS edges (open_private_socket / acquire_token / fetch_snap_orders / balances_handler)
+    are the LIVE-only seam (PA-004 div #1 / rule:HR-WM-022: the separate authenticated executions/
+    balances connection). They are passed straight through to assemble_operational, which connects the
+    private socket ONLY in Mode.LIVE (and raises if live is requested without them). PAPER leaves them
+    None (never connects the private WS); the deploy entrypoint binds the real edges for live."""
     logger = Logger(on_event=None)
     console = on_event
 
@@ -198,6 +208,10 @@ async def build_system(
         pace_sleep=pace_sleep,
         report_emit=report_emit,
         records_dir=settings.records_dir,
+        open_private_socket=open_private_socket,
+        acquire_token=acquire_token,
+        fetch_snap_orders=fetch_snap_orders,
+        balances_handler=balances_handler,
     )
 
 

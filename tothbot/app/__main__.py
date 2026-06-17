@@ -16,9 +16,13 @@ INJECTED edges (so it is driven over fakes in test); THIS module constructs the 
 
 PAPER needs NO API keys + NO SMTP (the C1/C2-C6 email seams stay unwired without TOTHBOT_SMTP_*; the
 organism runs and the reports simply do not emit). LIVE additionally needs the private-WS edges
-(open_private_socket / acquire_token) which build_system does not yet pass through - that wiring is the
-remaining live-deploy slice, so this entrypoint HALTs on TOTHBOT_MODE=live with a clear message rather
-than silently running a half-wired live path.
+(open_private_socket / acquire_token / fetch_snap_orders / balances_handler). TB00769 wired those
+straight THROUGH build_system to assemble_operational (the plumbing seam is done + tested), so the only
+remaining live-deploy slice is THIS entrypoint constructing the REAL private edges - the authenticated
+PRIVATE socket over wss://ws-auth.kraken.com/v2 + a token from REST GetWebSocketsToken, both needing real
+Kraken API credentials from the environment (rule:HR-LG-009 / REST-KEY-004, NEVER hardcoded). Until those
+creds + an explicit operator go are in place, this entrypoint still HALTs on TOTHBOT_MODE=live rather than
+silently running a half-wired live path.
 
 The seams (connect_fn / run_fn) are injected so the composition is unit-tested without a socket; main()
 binds the real edges and blocks in run() until the organism stops.
@@ -89,8 +93,11 @@ async def _amain(
     settings = OpsSettings.from_env(environ, universe=())
     if settings.mode is Mode.LIVE:
         raise SystemExit(
-            "tothbot.app: live mode is not yet wired here (the private-WS edges - open_private_socket "
-            "+ acquire_token - are the remaining live-deploy slice). Set TOTHBOT_MODE=paper to run."
+            "tothbot.app: live mode is not yet enabled here. build_system now forwards the private-WS "
+            "edges (TB00769), so the only remaining slice is constructing the REAL private socket "
+            "(wss://ws-auth.kraken.com/v2) + a REST GetWebSocketsToken, which need real Kraken API "
+            "credentials from the environment (HR-LG-009 / REST-KEY-004) and an explicit operator go. "
+            "Set TOTHBOT_MODE=paper to run."
         )
 
     open_socket = make_public_open_socket(connect_fn)

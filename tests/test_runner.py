@@ -199,3 +199,100 @@ def test_build_system_without_smtp_leaves_alert_seam_unwired(tmp_path):
     assert system.driver._logger._on_alert is None            # no SMTP -> alert seam unwired
     assert system.pull_scheduler is None                      # no report transport -> no cadence
     assert system.trade_record_sink is not None               # the durable sink still built
+
+
+# --------------------------------------------------- TB00769: the LIVE private-WS edges flow through
+class _LiveWM:
+    """A minimal live WSManager stand-in: is_live + the mirror sole-writer surface the private
+    executions/balances connection binds (PA-004 div #1). Enough for assemble_operational to build
+    the PrivateConnection during the cold-start (the receive loop is not run here)."""
+
+    is_live = True
+
+    def __init__(self) -> None:
+        self.transmitter = SimpleNamespace(bind=lambda _t: None)
+
+    def on_regime_classified(self, *a, **k) -> None:
+        pass
+
+    def on_htf_ohlc_close(self, *a, **k) -> None:  # pragma: no cover - not driven in the build test
+        pass
+
+    def wallet_balance(self, _side):
+        return None  # no module wired -> sweep skips each side
+
+    def restore_position_mirror(self, _snap):  # pragma: no cover - not driven in the build test
+        return []
+
+    def record_execution(self, _event):  # pragma: no cover - not driven in the build test
+        pass
+
+
+class _RecordingTransport:
+    """A private-socket fake that records the subscribe frames the connection sends at build."""
+
+    def __init__(self) -> None:
+        self.sent: list = []
+
+    async def send(self, message: dict) -> None:
+        self.sent.append(message)
+
+    async def recv(self):  # pragma: no cover - the receive loop is not run in the build test
+        raise AssertionError
+
+    async def close(self):  # pragma: no cover
+        pass
+
+
+def _private_opener():
+    sockets: list = []
+
+    async def open_private():
+        t = _RecordingTransport()
+        sockets.append(t)
+        return t
+
+    return open_private, sockets
+
+
+def test_build_system_forwards_the_live_private_ws_edges():
+    # TB00769: build_system now passes open_private_socket / acquire_token (+ snap_orders / balances)
+    # straight through to assemble_operational, so a LIVE cold-start builds the private connection.
+    open_private, priv_sockets = _private_opener()
+
+    async def acquire_token():
+        return "tok-xyz"
+
+    settings = OpsSettings(universe=("BTC/USD",), mode=Mode.LIVE)
+    system = asyncio.run(build_system(
+        settings,
+        rest_client=_FakeRest(), open_socket=_opener(),
+        bucket=SubscribeTokenBucket(rate_per_sec=1000.0, burst_capacity=100000.0),
+        mpp_store=MppCapStore(), reward_store=ExpectedRewardStore(),
+        wm=_LiveWM(),
+        open_private_socket=open_private, acquire_token=acquire_token,
+        now_utc=_now, now_monotonic=lambda: 1.0, rest_sleep=_nosleep, pace_sleep=_nosleep,
+    ))
+    # the edges reached assemble_operational: the private executions/balances connection was built.
+    assert system.private_connection is not None
+    assert len(priv_sockets) == 1
+    first = priv_sockets[0].sent[0]
+    assert first["params"]["channel"] == "executions" and first["params"]["token"] == "tok-xyz"
+
+
+def test_build_system_live_without_private_edges_raises():
+    # Without the edges forwarded, the LIVE path reaches assemble_operational's wiring guard.
+    settings = OpsSettings(universe=("BTC/USD",), mode=Mode.LIVE)
+    try:
+        asyncio.run(build_system(
+            settings,
+            rest_client=_FakeRest(), open_socket=_opener(),
+            bucket=SubscribeTokenBucket(rate_per_sec=1000.0, burst_capacity=100000.0),
+            mpp_store=MppCapStore(), reward_store=ExpectedRewardStore(),
+            wm=_LiveWM(),
+            now_utc=_now, now_monotonic=lambda: 1.0, rest_sleep=_nosleep, pace_sleep=_nosleep,
+        ))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("live build without the private edges must raise")
