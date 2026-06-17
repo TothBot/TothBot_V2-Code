@@ -32,6 +32,7 @@ from tothbot.exchange.receive_loop import (
     PongReceived,
     ShardReceiveLoop,
     SubscriptionAck,
+    SubscriptionRejected,
     UnknownMessage,
     WsConnected,
     ZombieDetected,
@@ -163,6 +164,31 @@ def test_subscribe_ack_marks_subscribed_and_surfaces_warnings():
     assert machine.state is PairDataState.SUBSCRIBED
     assert events == [SubscriptionAck("ohlc", "BTC/USD", True,
                                       ("timestamp is deprecated, use interval_begin",))]
+
+
+def test_refused_subscribe_emits_rejected_not_ack_and_arms_nothing():
+    # Kraken refuses a duplicate ohlc interval / an explicit status subscribe with a
+    # success:false frame carrying ONLY an error string (no result). It must surface as
+    # a distinct SUBSCRIPTION_REJECTED - never a phantom channel=None/success=False ack -
+    # and must NOT arm any pair's first-data timer.
+    machine = SilentPairMachine(clock=lambda: T0)
+    events: list = []
+    loop = ShardReceiveLoop(
+        _FakeTransport(), DispatchTable(), _keepalive(),
+        silent_pairs={"BTC/USD": machine}, on_event=events.append,
+    )
+    for frame in (
+        {"method": "subscribe", "success": False,
+         "error": "Already subscribed to one ohlc interval on this symbol"},
+        {"method": "subscribe", "success": False, "error": "Symbol(s) not found"},
+    ):
+        loop.handle_message(frame, T0)
+    assert events == [
+        SubscriptionRejected("Already subscribed to one ohlc interval on this symbol"),
+        SubscriptionRejected("Symbol(s) not found"),
+    ]
+    # A refusal never arms the silent-pair timer (the pair was never actually subscribed).
+    assert machine.state is PairDataState.INITIAL
 
 
 # -- handle_message: silent-pair first-data + recovery ------------------

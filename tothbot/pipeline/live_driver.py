@@ -38,6 +38,7 @@ from ..exchange.candle_close import (
     committed_candle_from_bar,
     committed_candle_from_frame,
 )
+from ..exchange.ohlc_aggregate import Closed1H, Htf1hGap, OhlcAggregator
 from ..exchange.position_mirror import PositionSide
 from ..exchange.warmup import HTF_EMA_LONG, HTF_EMA_SHORT, HtfCache
 from ..regime.live_indicators import OhlcCandle
@@ -191,6 +192,11 @@ class LiveSweepDriver:
         # Step only for a candle strictly newer than the seed boundary.
         self._stepped5 = {s: w.last_interval_begin for s, w in warmups.items()}
         self._stepped60 = {s: w.last_interval_begin_60 for s, w in warmups.items()}
+        # TB00768 Opt 5: Kraken WS v2 refuses a 2nd ohlc interval per symbol per connection, so the
+        # 1H (ohlc_60m) feed is DERIVED by folding the 5m close stream (lossless: twelve 5m candles
+        # partition the hour). on_ohlc_5m drives this; a complete hour advances the same HtfCache +
+        # EC-L1A-001 path the (refused) WS 60m frame used to. The HtfCache no longer freezes.
+        self._agg = OhlcAggregator()
 
     # --- the 5m system clock: detect -> step indicators -> sweep -------------------------------
     async def on_ohlc_5m(self, frame: dict):
@@ -221,18 +227,53 @@ class LiveSweepDriver:
             # boundary crossed since the last close fires the C2-C6 periodic pull (no manual tick).
             if self._on_clock_tick is not None:
                 self._on_clock_tick(datetime.fromtimestamp(closed.interval_begin, tz=timezone.utc))
+            # TB00768 Opt 5: fold this closed 5m candle into the DERIVED 1H feed. A complete hour
+            # (its twelfth contiguous close) advances the HtfCache + drives the EC-L1A-001 1H reversal
+            # on the same boundary the WS 60m frame used to - BEFORE this candle's sweep reads the
+            # HtfCache (G4). An hour-aligned shortfall (a reconnect dropped 5m closes) surfaces as a
+            # gap to self-heal; an expected mid-hour partial is discarded.
+            folded = self._agg.fold(closed)
+            if isinstance(folded, Closed1H):
+                self._step_htf(folded.candle.symbol, folded.candle)
+            elif isinstance(folded, Htf1hGap):
+                self._logger.record(folded, module="WS_Manager")
             results.extend(await sweep_pair(
                 self._wm, self._logger, candle=closed, warmup=warmup,
                 regime_cache=self._regime_cache, providers=self._providers, now_monotonic=self._now,
             ))
         return results
 
-    # --- the 1H feed: detect -> advance the HTF EMAs -> drive the L1a 1H reversal --------------
+    # --- the 1H feed: advance the HTF EMAs -> drive the L1a 1H reversal ------------------------
+    def _step_htf(self, symbol: str, closed) -> None:
+        """Advance a pair's HtfCache EMA(20)/EMA(50) on a CLOSED 1H candle (standard EMA step,
+        ar:AR-044, guarded against re-stepping the warm-up seed boundary), then drive
+        wm.on_htf_ohlc_close (the EC-L1A-001 1H reversal exit for an open position). The closed 1H
+        candle comes from the DERIVED feed (OhlcAggregator folding the 5m stream, TB00768 Opt 5);
+        on_ohlc_60m feeds the same path from a WS 60m frame (retained for the unit contract)."""
+        warmup = self._warmups.get(symbol)
+        if warmup is None:
+            return
+        htf = warmup.htf
+        if closed.interval_begin > self._stepped60[symbol]:  # not the already-seeded 1H candle
+            close_1h = closed.close
+            htf = HtfCache(
+                close_1h=close_1h,
+                ema20_1h=(close_1h - htf.ema20_1h) * self._alpha_short + htf.ema20_1h,
+                ema50_1h=(close_1h - htf.ema50_1h) * self._alpha_long + htf.ema50_1h,
+            )
+            warmup.htf = htf
+            self._stepped60[symbol] = closed.interval_begin
+        bid, ask = self._bbo(symbol)
+        # EC-L1A-001 1H reversal: drive the Layer-1a check with the current 1H EMA(20)/EMA(50).
+        self._wm.on_htf_ohlc_close(symbol, htf.ema20_1h, htf.ema50_1h, bid=bid, ask=ask)
+
     def on_ohlc_60m(self, frame: dict) -> None:
-        """Process one ohlc(60m) frame: detect the 1H close (ar:AR-045, separate tracker), advance
-        the pair's HtfCache EMA(20)/EMA(50) incrementally (standard EMA step, ar:AR-044), and drive
-        wm.on_htf_ohlc_close (EC-L1A-001 1H reversal exit for an open position). rule:HR-WM-012
-        skips while reconnecting. The 1H feed is DATA, not a pipeline clock tick (it never sweeps)."""
+        """Process one ohlc(60m) WS frame: detect the 1H close (ar:AR-045, separate tracker) and
+        advance the HtfCache + EC-L1A-001 via _step_htf. NOTE (TB00768 Opt 5): Kraken WS v2 refuses
+        a 2nd ohlc interval per symbol per connection, so the live 1H feed is now DERIVED from the 5m
+        stream (on_ohlc_5m -> OhlcAggregator -> _step_htf) and this WS-frame entry is not wired to
+        dispatch in production; it is retained as the equivalent frame-driven path (the unit
+        contract + any single-interval connection). rule:HR-WM-012 skips while reconnecting."""
         if self._is_reconnecting():
             return
         for elem in frame.get("data") or []:
@@ -244,19 +285,7 @@ class LiveSweepDriver:
             closed = detector.observe(candle)
             if closed is None:
                 continue
-            htf = warmup.htf
-            if closed.interval_begin > self._stepped60[candle.symbol]:  # not the already-seeded 1H candle
-                close_1h = closed.close
-                htf = HtfCache(
-                    close_1h=close_1h,
-                    ema20_1h=(close_1h - htf.ema20_1h) * self._alpha_short + htf.ema20_1h,
-                    ema50_1h=(close_1h - htf.ema50_1h) * self._alpha_long + htf.ema50_1h,
-                )
-                warmup.htf = htf
-                self._stepped60[candle.symbol] = closed.interval_begin
-            bid, ask = self._bbo(candle.symbol)
-            # EC-L1A-001 1H reversal: drive the Layer-1a check with the current 1H EMA(20)/EMA(50).
-            self._wm.on_htf_ohlc_close(candle.symbol, htf.ema20_1h, htf.ema50_1h, bid=bid, ask=ask)
+            self._step_htf(candle.symbol, closed)
 
     # --- the sync DispatchTable adapters (Handler is sync; the 5m sweep is async) --------------
     def ohlc_5m_handler(self):

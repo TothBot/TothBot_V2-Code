@@ -183,6 +183,23 @@ class SubscriptionAck:
 
 
 @dataclass(frozen=True)
+class SubscriptionRejected:
+    """SUBSCRIPTION_REJECTED [WARNING] {error} - a subscribe RPC Kraken REFUSED
+    (a method:"subscribe" frame with success:false). Kraken's refusal frame carries
+    only an ``error`` string and NO ``result``, so the channel/symbol it refused
+    cannot be recovered from the frame - the error text is the sole signal (observed
+    live: "Already subscribed to one ohlc interval on this symbol" for a duplicate
+    ohlc interval; "Symbol(s) not found" for an explicit status subscribe). Surfaced
+    DISTINCTLY from a successful SUBSCRIPTION_ACK so (a) the logs stay clean (no
+    phantom channel=None/success=False "ack") and (b) nothing downstream treats a
+    refusal as an ack - a rejected subscribe never arms a pair's first-data
+    (silent-pair) timer. Never silently dropped (A-12 / rule:HR-WM-006)."""
+
+    error: str | None
+    code: str = field(default="SUBSCRIPTION_REJECTED", init=False)
+
+
+@dataclass(frozen=True)
 class UnknownMessage:
     """UNKNOWN_MESSAGE_TYPE [WARNING] {raw_channel} - an unclassifiable frame; the
     A-12 / rule:HR-WM-006 never-silently-drop guarantee at the loop level."""
@@ -303,17 +320,23 @@ class ShardReceiveLoop:
             self._dispatch.dispatch(PublicChannel.STATUS, message)
 
     def _handle_subscribe_ack(self, message: dict, now: float) -> None:
-        """A subscribe/unsubscribe ACK: surface warnings[] (HR-WM-019) and, for a
-        per-pair channel, arm the silent-pair first-data timer (mark_subscribed)."""
+        """A subscribe/unsubscribe method response. A GENUINE ack (success:true)
+        surfaces warnings[] (HR-WM-019) and, for a per-pair channel, arms the
+        silent-pair first-data timer (mark_subscribed). A REFUSAL (success:false,
+        no result) is NOT an ack: it is surfaced as a distinct SUBSCRIPTION_REJECTED
+        carrying Kraken's error string and arms nothing downstream (the refused
+        frame has no symbol, so no pair's first-data timer is touched)."""
+        if not bool(message.get("success", True)):
+            self._emit(SubscriptionRejected(message.get("error")))
+            return
         result = message.get("result") or {}
         channel = result.get("channel")
         symbol = result.get("symbol")
         warnings = result.get("warnings") or message.get("warnings") or []
-        success = bool(message.get("success", True))
         # AR-030: the executions ACK returns maxratecount (the operative per-pair rate
         # ceiling); carried through so the private connection feeds the RateCounter.
         maxratecount = result.get("maxratecount")
-        self._emit(SubscriptionAck(channel, symbol, success, tuple(warnings), maxratecount))
+        self._emit(SubscriptionAck(channel, symbol, True, tuple(warnings), maxratecount))
         if symbol and symbol in self._silent_pairs:
             self._silent_pairs[symbol].mark_subscribed(now)
 

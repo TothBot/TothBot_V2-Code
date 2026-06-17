@@ -699,8 +699,12 @@ def test_live_clock_fires_the_monthly_pull_over_the_smtp_transport():
     assert "REPORTED theories" in msg and "CHECK failed" in msg
     # the periodic-pull track marker, DISTINCT from the C1 immediate push.
     assert "X-TothBot-Track: periodic-pull" in msg
-    # NO new capture by the clock-driven pull, and NO C1 alert raised.
-    assert len(logger.operational) == captured_before
+    # NO new pipeline capture by the clock-driven pull, and NO C1 alert raised. (The deliberately
+    # day-spaced clock stream makes the TB00768 derived-1H aggregator flag each sparse hour as a
+    # feed gap; that WS observability is orthogonal to the monthly-pull capture under test.)
+    new_records = [r for r in logger.operational[captured_before:]
+                   if getattr(r, "code", None) != "HTF_1H_GAP"]
+    assert new_records == []
     assert not _mae_alert(logger)
 
 

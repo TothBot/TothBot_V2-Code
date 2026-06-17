@@ -366,3 +366,42 @@ def test_60m_drives_htf_close_and_advances_emas():
     assert wm.htf_calls[0][0] == "BTC/USD"
     assert wm.htf_calls[-1][3] == Decimal("59990") and wm.htf_calls[-1][4] == Decimal("60000")  # bbo
     assert pw.htf.ema20_1h != ema20_seed           # EMA advanced on the genuine 1H close
+
+
+# ----------------------------------------------------- TB00768 Opt 5: 1H DERIVED from the 5m stream
+def test_derived_1h_from_5m_advances_htf_and_drives_reversal():
+    # Kraken refuses the WS ohlc_60m subscription, so the 1H feed is folded from the 5m stream: a
+    # complete hour of 5m closes must advance the HtfCache + drive EC-L1A-001, NOT freeze the cache.
+    pw = _warm()
+    wm = _FakeWM()
+    driver = _driver({"BTC/USD": pw}, wm)
+    ema20_seed = pw.htf.ema20_1h
+    base = max(pw.last_interval_begin, pw.last_interval_begin_60)
+    hour = (base // 3600 + 2) * 3600           # a round hour well past both warm-up seeds
+    # Feed hour .. hour+3600: the closed-candle lag means the 12th contiguous close (hour+3300)
+    # folds on the hour+3600 frame and EAGER-emits the derived 1H candle.
+    for k in range(13):
+        asyncio.run(driver.on_ohlc_5m(_frame_5m("BTC/USD", hour + k * 300, close=str(150 + k))))
+    assert any(c[0] == "BTC/USD" for c in wm.htf_calls)   # the derived 1H close drove EC-L1A-001
+    assert pw.htf.ema20_1h != ema20_seed                  # HtfCache advanced (no longer frozen)
+    assert pw.htf.close_1h == Decimal(161)                # close of the [:55,:00) slot (k=11) - lossless
+
+
+def test_derived_1h_hour_aligned_gap_is_surfaced_not_a_corrupt_candle():
+    # A reconnect drops a 5m close mid-hour: the hour-aligned bucket rolls over short of twelve ->
+    # an HTF_1H_GAP is recorded (self-heal signal) and the corrupt hour is NOT folded into a candle.
+    pw = _warm()
+    wm = _FakeWM()
+    logger = _FakeLogger()
+    driver = LiveSweepDriver(
+        warmups={"BTC/USD": pw}, regime_cache=_cache(), providers=_providers(), wm=wm, logger=logger,
+    )
+    base = max(pw.last_interval_begin, pw.last_interval_begin_60)
+    hour = (base // 3600 + 2) * 3600
+    # Frames hour, hour+300, ... but SKIP one slot (hour+1500); the closed-candle lag means we must
+    # feed two next-hour frames to roll the (short, hour-aligned) bucket over -> the gap fires.
+    begins = [hour + k * 300 for k in range(12) if k != 5] + [hour + 3600, hour + 3900]
+    for b in begins:
+        asyncio.run(driver.on_ohlc_5m(_frame_5m("BTC/USD", b)))
+    gaps = [r for _, r in logger.records if getattr(r, "code", None) == "HTF_1H_GAP"]
+    assert any(g.symbol == "BTC/USD" and g.hour_begin == hour for g in gaps)
