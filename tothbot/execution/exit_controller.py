@@ -55,6 +55,7 @@ from decimal import Decimal
 from enum import Enum
 
 from ..config import registry
+from ..config.fees import FEE_TAKER_PCT
 
 EventSink = Callable[[object], None]
 Clock = Callable[[], datetime]
@@ -103,7 +104,8 @@ class TradeClose:
     vol_regime: str | None = None                 # (17) NORMAL_VOL | ELEVATED_VOL
     market_regime: str | None = None              # (18) BTC/USD anchor regime
     signal_params: dict | None = None             # (19)
-    actual_rr: Decimal | None = None              # (20) net_PL / risk_exposed
+    actual_rr: Decimal | None = None              # (20) net_PL / net_loss (fee-inclusive risk,
+                                                  #      same basis as the G8 entry-gate expected_rr)
     qty: Decimal | None = None                    # (24) filled position quantity (Form 8949 proceeds/
                                                   #      cost-basis source; 0500000 dv1_252 D1 ruling)
     side: str | None = None                       # (25) LONG | SHORT - the emitting module's side, so a
@@ -131,10 +133,17 @@ def _dec(value: object) -> Decimal:
     return Decimal(str(value))
 
 
-# param:mae_mult (CIATS-owned, 1.5x starting) - the L2 risk-leg multiplier; the close
-# uses it to express actual_RR's risk_exposed = atr_14_entry * mae_mult * qty (the MAE
-# dollar risk). Converted to Decimal once (ar:AR-047).
+# param:mae_mult (CIATS-owned, 1.5x starting) - the L2 risk-leg multiplier (the MAE stop
+# distance = atr_14_entry * mae_mult). Converted to Decimal once (ar:AR-047).
 _MAE_MULT = _dec(registry.value("mae_mult"))
+
+# actual_RR's risk basis MUST match gate:G8_Position_Sizer's net_loss EXACTLY so the realized
+# actual_rr (this close) is directly comparable to the entry-gate expected_rr - both on the
+# canonical R:R basis, which is NET OF ALL FEES (config/fees.py): net_loss = the MAE stop
+# distance + two taker legs (entry + exit) + a SHORT's margin OPEN fee. These mirror
+# position_sizer.py's _FEE_TAKER / _MARGIN_OPEN_FEE so the two gates cannot drift apart.
+_FEE_TAKER = _dec(FEE_TAKER_PCT)
+_MARGIN_OPEN_FEE = _dec(registry.value("margin_open_fee_pct"))
 
 # The position-side tokens (mirrors position_mirror.PositionSide.value) used to apply the
 # direction-symmetric net-P&L leg without importing the enum (keeps this a pure close
@@ -267,11 +276,24 @@ class ExitController:
         if tracked_high is not None:
             mae_pct = max(mae_pct, _dec(tracked_high))
 
-        # actual_RR = net_PL / risk_exposed, risk_exposed = the MAE dollar risk leg
-        # (atr_14_entry * mae_mult * qty); None when no entry-time ATR snapshot is on the
-        # position (the entry-side sizing producer has not run).
+        # actual_RR = net_PL / risk_exposed, on the SAME fee-inclusive basis as gate:G8_Position_
+        # Sizer's net_loss so it is directly comparable to the entry-gate expected_rr (and CIATS
+        # learns on a correctly-scaled reward, not a fee-distorted one). The canonical 1:1.5 R:R is
+        # net of ALL fees, so risk_exposed = the entry-gate net_loss expressed in dollars:
+        #   net_loss_frac = atr_14_entry*mae_mult/entry + FEE_TAKER + FEE_TAKER (+ SHORT open fee)
+        #   risk_exposed  = net_loss_frac * entry * qty   (= the dollar 1R the trade was admitted on)
+        # A SHORT carries the margin OPEN fee (the at-admission borrow component, matching the gate's
+        # default); a LONG pays no borrow. None when no entry-time ATR snapshot is on the position
+        # (the entry-side sizing producer has not run). NOTE: the PRIOR basis divided by the stop leg
+        # ALONE (fees excluded) while net_pl included fees - an apples/oranges ratio that inflated a
+        # normal ~1R loss to ~3R; this aligns the denominator to the numerator (TB00774 fix).
         atr = position.atr_14_entry
-        risk_exposed = (_dec(atr) * self._mae_mult * qty) if atr is not None else None
+        if atr is not None and entry != 0:
+            borrow = Decimal("0") if is_long else _MARGIN_OPEN_FEE
+            net_loss_frac = (_dec(atr) * self._mae_mult / entry) + _FEE_TAKER + _FEE_TAKER + borrow
+            risk_exposed = net_loss_frac * entry * qty
+        else:
+            risk_exposed = None
         actual_rr = (net_pl / risk_exposed) if risk_exposed not in (None, Decimal("0")) else None
 
         # vol_regime derived from the entry regime token (NORMAL_VOL | ELEVATED_VOL);

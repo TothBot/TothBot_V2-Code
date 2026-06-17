@@ -97,8 +97,11 @@ def test_long_win_net_pnl_and_trade_close_record():
     assert rec.vol_regime == "NORMAL_VOL"
     assert rec.asset_regime == "TRENDING_POS_NORMAL"
     assert rec.ts == "2026-06-15T00:45:00+00:00"
-    # actual_RR = net_pl / (atr_14_entry * mae_mult(1.5) * qty) = 283.62 / (2000*1.5*0.05=150)
-    assert rec.actual_rr == Decimal("283.62") / Decimal("150")
+    # actual_RR = net_pl / net_loss, FEE-INCLUSIVE risk basis matching gate:G8_Position_Sizer
+    # (TB00774 fix - was the stop leg ALONE). net_loss(frac) = atr*mae_mult/entry + 2*FEE_TAKER:
+    # stop = 2000*1.5*0.05 = 150 dollars; fees = 2*0.0026*60000*0.05 = 15.6; risk_exposed = 165.6.
+    _net_loss_frac = Decimal("2000") * Decimal("1.5") / Decimal("60000") + Decimal("0.0026") + Decimal("0.0026")
+    assert rec.actual_rr == Decimal("283.62") / (_net_loss_frac * Decimal("60000") * Decimal("0.05"))
     # a favorable-side exit reached no adverse excursion at exit
     assert rec.mae_pct_reached == Decimal("0")
     # the record is emitted to the sink
@@ -152,6 +155,23 @@ def test_short_win_direction_symmetric_net_pnl():
     # short: (60000-54000)*0.05 - 7.8 - 7.02 = 285.18
     assert rec.net_pl_usd == Decimal("285.18")
     assert rec.net_gain_usd == Decimal("285.18")
+
+
+def test_short_actual_rr_includes_margin_open_fee_in_risk_basis():
+    # TB00774: a SHORT's risk basis carries the margin OPEN fee (0.0002) on TOP of the stop +
+    # two taker legs, matching gate:G8_Position_Sizer's net_loss exactly (a LONG pays no borrow).
+    wm = _FakeWM(_pos(side=PositionSide.SHORT), fees_entry=Decimal("7.8"))
+    rec = _ec([]).on_paper_close(
+        "BTC/USD", "54000", ExitReason.MAE_THRESHOLD_BREACH, "7.02", wm
+    )
+    # short net_pl: (60000-54000)*0.05 - 7.8 - 7.02 = 285.18
+    assert rec.net_pl_usd == Decimal("285.18")
+    # net_loss(frac) = atr*mae_mult/entry + 2*FEE_TAKER + margin_open_fee = 0.05 + 0.0052 + 0.0002
+    _net_loss_frac = (
+        Decimal("2000") * Decimal("1.5") / Decimal("60000")
+        + Decimal("0.0026") + Decimal("0.0026") + Decimal("0.0002")
+    )
+    assert rec.actual_rr == Decimal("285.18") / (_net_loss_frac * Decimal("60000") * Decimal("0.05"))
 
 
 def test_no_atr_snapshot_yields_no_actual_rr():
