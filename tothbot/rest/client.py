@@ -27,6 +27,7 @@ from typing import Protocol, runtime_checkable
 
 from ..exchange.connection import REST_BASE_URL
 from .auth import Credentials, NonceGenerator, auth_headers, sign
+from .rate_limiter import RestRateLimiter
 
 # --- Kraken Spot REST endpoint paths (wire facts) ----------------------------
 PATH_WS_TOKEN = "/0/private/GetWebSocketsToken"   # channel:kraken_rest_GetWebSocketsToken
@@ -330,26 +331,48 @@ class KrakenRestClient:
         transport: RestTransport | None = None,
         nonce: NonceGenerator | None = None,
         base_url: str = REST_BASE_URL,
+        rate_limiter: RestRateLimiter | None = None,
     ) -> None:
         self._creds = credentials
         self._http = transport or AiohttpRestTransport()
         self._nonce = nonce or NonceGenerator()
         self._base_url = base_url
+        # The GLOBAL per-IP REST governor (ar:AR-036): EVERY call funnels through _public/_private and
+        # awaits this ONE shared pacer, so the cold-start warm-up gather + regime + liquidity + the
+        # periodic reconcile cannot collectively flood Kraken no matter how many run concurrently.
+        self._rate_limiter = rate_limiter or RestRateLimiter()
 
     async def close(self) -> None:
         await self._http.close()
 
     # --- request primitives ---------------------------------------------------
+    def _maybe_penalize(self, payload: object) -> None:
+        """Back the global governor off (AIMD multiplicative-decrease) when Kraken returns a rate-limit
+        error, so the next call eases off on the exchange's own throttle signal."""
+        if not isinstance(payload, Mapping):
+            return
+        errors = payload.get("error")
+        if errors and any(
+            ("rate limit" in str(e).lower()) or ("too many" in str(e).lower()) for e in errors
+        ):
+            self._rate_limiter.penalize()
+
     async def _public(self, path: str, params: Mapping[str, object]) -> dict:
-        return await self._http.get(self._base_url + path, params)
+        await self._rate_limiter.acquire()  # global per-IP REST budget (ar:AR-036)
+        payload = await self._http.get(self._base_url + path, params)
+        self._maybe_penalize(payload)
+        return payload
 
     async def _private(self, path: str, data: Mapping[str, object]) -> dict:
         if self._creds is None:
             raise KrakenRestError([f"{path} requires credentials (none configured)"])
+        await self._rate_limiter.acquire()  # global per-IP REST budget (ar:AR-036)
         body = {**data, "nonce": self._nonce.next()}
         signature = sign(path, body, self._creds.api_secret)
         headers = auth_headers(self._creds.api_key, signature)
-        return await self._http.post(self._base_url + path, body, headers)
+        payload = await self._http.post(self._base_url + path, body, headers)
+        self._maybe_penalize(payload)
+        return payload
 
     # --- endpoints ------------------------------------------------------------
     async def get_websockets_token(self) -> str:

@@ -40,6 +40,11 @@ from tothbot.rest.client import (
     parse_websockets_token,
     raise_for_error,
 )
+from tothbot.rest.rate_limiter import RestRateLimiter
+
+# The global REST governor is wired into _public/_private; a zero-interval limiter keeps these unit
+# tests instant (the pacer itself is tested separately in test_rate_limiter.py).
+_FAST = RestRateLimiter(min_interval_sec=0.0)
 
 
 # --- signing: Kraken's published test vector ---------------------------------
@@ -231,7 +236,7 @@ _CREDS = Credentials(api_key="KEY", api_secret=_VECTOR_SECRET)
 
 def test_client_get_websockets_token_signs_private_request():
     fake = _FakeRestTransport(post_result={"error": [], "result": {"token": "tok-1"}})
-    client = KrakenRestClient(_CREDS, transport=fake, nonce=NonceGenerator(clock=lambda: 1.0))
+    client = KrakenRestClient(_CREDS, transport=fake, nonce=NonceGenerator(clock=lambda: 1.0), rate_limiter=_FAST)
     token = asyncio.run(client.get_websockets_token())
     assert token == "tok-1"
     url, data, headers = fake.post_calls[0]
@@ -243,7 +248,7 @@ def test_client_get_websockets_token_signs_private_request():
 
 def test_client_get_ohlc_data_is_public_and_excludes_last():
     fake = _FakeRestTransport(get_result=_ohlc_payload())
-    client = KrakenRestClient(_CREDS, transport=fake)
+    client = KrakenRestClient(_CREDS, transport=fake, rate_limiter=_FAST)
     resp = asyncio.run(client.get_ohlc_data("XBTUSD", 1440))
     assert len(resp.committed) == 2  # AR-017
     url, params = fake.get_calls[0]
@@ -254,7 +259,7 @@ def test_client_get_ohlc_data_is_public_and_excludes_last():
 
 def test_client_get_ohlc_data_passes_since_cursor():
     fake = _FakeRestTransport(get_result=_ohlc_payload())
-    client = KrakenRestClient(_CREDS, transport=fake)
+    client = KrakenRestClient(_CREDS, transport=fake, rate_limiter=_FAST)
     asyncio.run(client.get_ohlc_data("XBTUSD", 5, since=1700000000))
     _, params = fake.get_calls[0]
     assert params["since"] == 1700000000
@@ -264,7 +269,7 @@ def test_client_get_open_orders_signs_and_parses():
     fake = _FakeRestTransport(
         post_result={"error": [], "result": {"open": {"O1": {"status": "open"}}}}
     )
-    client = KrakenRestClient(_CREDS, transport=fake)
+    client = KrakenRestClient(_CREDS, transport=fake, rate_limiter=_FAST)
     orders = asyncio.run(client.get_open_orders())
     assert orders == [{"txid": "O1", "status": "open"}]
     assert fake.post_calls[0][0] == REST_BASE_URL + PATH_OPEN_ORDERS
@@ -272,7 +277,7 @@ def test_client_get_open_orders_signs_and_parses():
 
 def test_client_get_account_balance():
     fake = _FakeRestTransport(post_result={"error": [], "result": {"ZUSD": "10.0"}})
-    client = KrakenRestClient(_CREDS, transport=fake)
+    client = KrakenRestClient(_CREDS, transport=fake, rate_limiter=_FAST)
     bal = asyncio.run(client.get_account_balance())
     assert bal == {"ZUSD": Decimal("10.0")}
 
@@ -280,7 +285,7 @@ def test_client_get_account_balance():
 def test_client_get_trade_balance_signs_and_carries_asset():
     # REST-BAL-008 TradeBalance: signed private call, asset=ZUSD in the body, result['e'] the equity.
     fake = _FakeRestTransport(post_result={"error": [], "result": {"e": "4980.50", "tb": "5000.0"}})
-    client = KrakenRestClient(_CREDS, transport=fake)
+    client = KrakenRestClient(_CREDS, transport=fake, rate_limiter=_FAST)
     tb = asyncio.run(client.get_trade_balance())
     assert tb["e"] == Decimal("4980.50")
     url, data, headers = fake.post_calls[0]
@@ -291,7 +296,7 @@ def test_client_get_trade_balance_signs_and_carries_asset():
 
 def test_client_nonce_increases_across_private_calls():
     fake = _FakeRestTransport(post_result={"error": [], "result": {"token": "t"}})
-    client = KrakenRestClient(_CREDS, transport=fake, nonce=NonceGenerator(clock=lambda: 1.0))
+    client = KrakenRestClient(_CREDS, transport=fake, nonce=NonceGenerator(clock=lambda: 1.0), rate_limiter=_FAST)
     asyncio.run(client.get_websockets_token())
     asyncio.run(client.get_websockets_token())
     n1 = int(fake.post_calls[0][1]["nonce"])
@@ -301,21 +306,21 @@ def test_client_nonce_increases_across_private_calls():
 
 def test_client_private_without_credentials_raises():
     fake = _FakeRestTransport()
-    client = KrakenRestClient(None, transport=fake)
+    client = KrakenRestClient(None, transport=fake, rate_limiter=_FAST)
     with pytest.raises(KrakenRestError):
         asyncio.run(client.get_websockets_token())
 
 
 def test_client_propagates_kraken_error():
     fake = _FakeRestTransport(get_result={"error": ["EGeneral:Invalid arguments"], "result": {}})
-    client = KrakenRestClient(_CREDS, transport=fake)
+    client = KrakenRestClient(_CREDS, transport=fake, rate_limiter=_FAST)
     with pytest.raises(KrakenRestError):
         asyncio.run(client.get_ohlc_data("XBTUSD", 5))
 
 
 def test_client_close_delegates_to_transport():
     fake = _FakeRestTransport()
-    client = KrakenRestClient(_CREDS, transport=fake)
+    client = KrakenRestClient(_CREDS, transport=fake, rate_limiter=_FAST)
     asyncio.run(client.close())
     assert fake.closed
 
@@ -361,7 +366,7 @@ def test_client_query_orders_signs_and_parses():
         post_result={"error": [], "result": {"O9": {"status": "closed", "vol_exec": "1",
                                                     "price": "100", "fee": "0.5"}}}
     )
-    client = KrakenRestClient(_CREDS, transport=fake)
+    client = KrakenRestClient(_CREDS, transport=fake, rate_limiter=_FAST)
     out = asyncio.run(client.query_orders(["O9"]))
     assert out["O9"]["price"] == Decimal("100")
     url, data, _ = fake.post_calls[0]
@@ -372,7 +377,7 @@ def test_client_query_orders_signs_and_parses():
 
 def test_client_query_orders_empty_short_circuits_without_call():
     fake = _FakeRestTransport()
-    client = KrakenRestClient(_CREDS, transport=fake)
+    client = KrakenRestClient(_CREDS, transport=fake, rate_limiter=_FAST)
     out = asyncio.run(client.query_orders([]))
     assert out == {}
     assert not fake.post_calls
