@@ -441,6 +441,9 @@ async def assemble_operational(
         now_monotonic=mono_clock,
         bbo_provider=bbo_pair,
         on_clock_tick=on_clock_tick,
+        # TB00769: the Htf1hGap self-heal refetches the 1H series via this same REST client
+        # (GetOHLCData(interval=60)) and re-seeds the gapped pair's HtfCache.
+        htf_rest_client=rest_client,
     )
 
     # 6. Build + run the public data layer (handlers bound, the SHARED machines/coordinator injected).

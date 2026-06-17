@@ -33,14 +33,17 @@ def test_symbols_per_conn_safe_matches_diagram():
     assert SYMBOLS_PER_CONN_SAFE == 500  # WM-SHARD-001 fixed engineering constant
 
 
-def test_global_channels_are_instrument_and_status():
-    assert GLOBAL_CHANNELS == (PublicChannel.INSTRUMENT, PublicChannel.STATUS)
+def test_global_channels_are_instrument_only():
+    # status is NOT subscribed (Kraken auto-pushes it; an explicit subscribe is
+    # refused "Symbol(s) not found") - TB00768 Opt 5 cleanup.
+    assert GLOBAL_CHANNELS == (PublicChannel.INSTRUMENT,)
 
 
-def test_per_pair_channels_are_ohlc5m_ohlc60m_and_ticker():
+def test_per_pair_channels_are_ohlc5m_and_ticker():
+    # ohlc(60) is NOT subscribed (Kraken refuses a 2nd ohlc interval per symbol);
+    # the 1H HTF feed is derived locally from ohlc_5m - TB00768 Opt 5 cleanup.
     assert PER_PAIR_CHANNELS == (
         PublicChannel.OHLC_5M,
-        PublicChannel.OHLC_60M,
         PublicChannel.TICKER,
     )
 
@@ -107,7 +110,7 @@ def test_shard_sizes_balanced_within_one():
 def test_shard0_carries_global_channels_only():
     plan = ShardPlan(_universe(600))
     s0, s1 = plan.shards
-    assert s0.global_channels == (PublicChannel.INSTRUMENT, PublicChannel.STATUS)
+    assert s0.global_channels == (PublicChannel.INSTRUMENT,)
     assert s1.global_channels == ()  # shards 1..N-1 carry no global channels
 
 
@@ -116,7 +119,6 @@ def test_every_shard_carries_per_pair_channels():
     for s in plan.shards:
         assert s.per_pair_channels == (
             PublicChannel.OHLC_5M,
-            PublicChannel.OHLC_60M,
             PublicChannel.TICKER,
         )
 
@@ -150,11 +152,12 @@ def test_every_universe_pair_assigned_exactly_once():
 
 def test_subscribe_count_decoupled_from_connection_count():
     # rule:HR-WM-031: subscribe-count = globals + pairs*per_pair_channels,
-    # independent of N_conns. Shard 0 has the 2 globals; total subscribes are
-    # 2 (globals) + 600 pairs * 3 per-pair channels (ohlc_5m/ohlc_60/ticker).
+    # independent of N_conns. Shard 0 has the 1 global (instrument); total
+    # subscribes are 1 (global) + 600 pairs * 2 per-pair channels (ohlc_5m/ticker)
+    # - ohlc(60) + status are NOT subscribed (TB00768 Opt 5 cleanup).
     plan = ShardPlan(_universe(600))
     total = sum(s.subscribe_count for s in plan.shards)
-    assert total == 2 + 600 * 3
+    assert total == 1 + 600 * 2
 
 
 # -- single-shard universe (<= 500 pairs) -------------------------------
@@ -164,7 +167,7 @@ def test_single_shard_carries_everything():
     assert plan.n_conns == 1
     (s0,) = plan.shards
     assert len(s0.pairs) == 500
-    assert s0.global_channels == (PublicChannel.INSTRUMENT, PublicChannel.STATUS)
+    assert s0.global_channels == (PublicChannel.INSTRUMENT,)
     assert s0.is_clock_shard is True
 
 
@@ -173,4 +176,4 @@ def test_empty_universe_still_has_clock_shard_with_globals():
     assert plan.n_conns == 1
     (s0,) = plan.shards
     assert s0.pairs == ()
-    assert s0.global_channels == (PublicChannel.INSTRUMENT, PublicChannel.STATUS)
+    assert s0.global_channels == (PublicChannel.INSTRUMENT,)

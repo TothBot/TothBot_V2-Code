@@ -68,11 +68,11 @@ def test_subscribe_requests_count_matches_shard_subscribe_count():
     plan = ShardPlan(["BTC/USD", "ETH/USD", "SOL/USD"])
     assignment = plan.shards[0]
     reqs = subscribe_requests(assignment)
-    assert len(reqs) == assignment.subscribe_count == 2 + 3 * 3  # globals + pairs x 3 channels
-    # Global channels (instrument, status) come first, on shard 0 only.
+    assert len(reqs) == assignment.subscribe_count == 1 + 3 * 2  # global + pairs x 2 channels
+    # The single global channel (instrument) comes first, on shard 0 only;
+    # status + ohlc(60) are NOT subscribed (TB00768 Opt 5 cleanup).
     assert reqs[0] == SubscribeRequest(PublicChannel.INSTRUMENT)
-    assert reqs[1] == SubscribeRequest(PublicChannel.STATUS)
-    assert all(r.symbol is not None for r in reqs[2:])
+    assert all(r.symbol is not None for r in reqs[1:])
 
 
 def test_to_wire_frames():
@@ -107,7 +107,7 @@ def test_build_opens_one_socket_per_shard_and_wires_globals_on_shard0():
     assert set(opened) == {0, 1} and all(len(v) == 1 for v in opened.values())
     s0, s1 = data.shards
     assert s0.assignment.is_clock_shard and not s1.assignment.is_clock_shard
-    assert s0.assignment.global_channels == (PublicChannel.INSTRUMENT, PublicChannel.STATUS)
+    assert s0.assignment.global_channels == (PublicChannel.INSTRUMENT,)
     assert s1.assignment.global_channels == ()
     # one silent-pair machine per pair on each shard
     assert len(s0.silent_pairs) == len(s0.assignment.pairs)
@@ -134,7 +134,7 @@ def test_initial_paced_subscribe_sends_every_request():
 # -- WM-PACE-001: the shared token bucket paces the subscribe storm ------
 
 def test_subscribe_blocks_on_empty_bucket_and_paces():
-    plan = ShardPlan(["BTC/USD", "ETH/USD", "SOL/USD"])  # 11 subscribe RPCs on 1 shard
+    plan = ShardPlan(["BTC/USD", "ETH/USD", "SOL/USD"])  # 7 subscribe RPCs on 1 shard
     open_socket, opened = _opener()
     events: list = []
     clk = {"t": 0.0}
@@ -152,11 +152,11 @@ def test_subscribe_blocks_on_empty_bucket_and_paces():
                              on_event=events.append, sleep=sleep)
     data = asyncio.run(asm.build())
 
-    # All 11 RPCs still get sent (no bypass, no drop) ...
-    assert len(opened[0][0].sent) == data.shards[0].assignment.subscribe_count == 11
+    # All 7 RPCs still get sent (no bypass, no drop) ...
+    assert len(opened[0][0].sent) == data.shards[0].assignment.subscribe_count == 7
     # ... but the bucket forced pace-waits after the initial burst of 2.
     waits = [e for e in events if isinstance(e, SubscribePaceWait)]
-    assert len(waits) == 11 - 2  # 9 requests had to wait for a token
+    assert len(waits) == 7 - 2  # 5 requests had to wait for a token
     assert all(w.wait_seconds > 0 for w in waits)
 
 
@@ -171,7 +171,7 @@ def test_one_bucket_shared_across_shards():
     data = asyncio.run(asm.build())
     assert data.bucket is bucket
     total = sum(s.assignment.subscribe_count for s in data.shards)
-    assert total == 1505  # 755 (shard0: 2 globals + 251x3) + 750 (shard1: 250x3)
+    assert total == 1003  # 503 (shard0: 1 global + 251x2) + 500 (shard1: 250x2)
     assert bucket.available(now=0.0) == 100000.0 - total  # one bucket drained by both
 
 

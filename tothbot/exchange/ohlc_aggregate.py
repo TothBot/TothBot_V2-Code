@@ -74,6 +74,21 @@ class Htf1hGap:
     code: str = field(default="HTF_1H_GAP", init=False)
 
 
+@dataclass(frozen=True)
+class Htf1hHealed:
+    """evt:HTF_1H_HEAL [INFO] {symbol, hour_begin} - a gapped pair's 1H HtfCache was RE-SEEDED from
+    one targeted REST GetOHLCData(interval=60) after a Htf1hGap (the auto-refetch that closes the
+    self-heal). The REST 1H series is authoritative (it already folds in the dropped hour), so the
+    re-seed restores the exact EMA(20)/EMA(50) the frozen cache would have missed - and the caller
+    drives the EC-L1A-001 1H reversal once on the fresh EMAs (a reversal hidden by the gap still
+    fires). A REST failure leaves the cache untouched (it resumes on the next complete hour, bounded
+    - the Htf1hGap already surfaced the miss), so HTF_1H_HEAL marks only a SUCCESSFUL refetch."""
+
+    symbol: str
+    hour_begin: int
+    code: str = field(default="HTF_1H_HEAL", init=False)
+
+
 @dataclass
 class _Bucket:
     """The accumulating 5m candles of one in-progress hour for one symbol."""

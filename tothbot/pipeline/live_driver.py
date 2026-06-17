@@ -38,11 +38,13 @@ from ..exchange.candle_close import (
     committed_candle_from_bar,
     committed_candle_from_frame,
 )
-from ..exchange.ohlc_aggregate import Closed1H, Htf1hGap, OhlcAggregator
+from ..exchange.ohlc_aggregate import Closed1H, Htf1hGap, Htf1hHealed, OhlcAggregator
 from ..exchange.position_mirror import PositionSide
-from ..exchange.warmup import HTF_EMA_LONG, HTF_EMA_SHORT, HtfCache
+from ..exchange.warmup import HTF_EMA_LONG, HTF_EMA_SHORT, INTERVAL_60_MIN, HtfCache
+from ..regime.indicators import ema
 from ..regime.live_indicators import OhlcCandle
 from ..regime.taxonomy import Regime
+from ..rest.client import KrakenRestError
 from .sweep import LiveProviders, sweep_pair
 
 
@@ -156,6 +158,7 @@ class LiveSweepDriver:
         htf_ema_long: int = HTF_EMA_LONG,
         bbo_provider: Callable[[str], "tuple[object, object]"] | None = None,
         on_clock_tick: Callable[[datetime], None] | None = None,
+        htf_rest_client=None,
     ) -> None:
         self._warmups = warmups
         self._regime_cache = regime_cache
@@ -197,6 +200,11 @@ class LiveSweepDriver:
         # partition the hour). on_ohlc_5m drives this; a complete hour advances the same HtfCache +
         # EC-L1A-001 path the (refused) WS 60m frame used to. The HtfCache no longer freezes.
         self._agg = OhlcAggregator()
+        # TB00769: the REST handle the Htf1hGap self-heal refetches the 1H series with (one targeted
+        # GetOHLCData(interval=60), reusing the warm-up seed math). Optional - a unit/bring-up assembly
+        # that wires no REST client leaves it None and the gap is recorded but not auto-healed (the
+        # cache still resumes on the next complete hour, bounded).
+        self._htf_rest = htf_rest_client
 
     # --- the 5m system clock: detect -> step indicators -> sweep -------------------------------
     async def on_ohlc_5m(self, frame: dict):
@@ -237,11 +245,47 @@ class LiveSweepDriver:
                 self._step_htf(folded.candle.symbol, folded.candle)
             elif isinstance(folded, Htf1hGap):
                 self._logger.record(folded, module="WS_Manager")
+                await self._heal_htf(folded.symbol, folded.hour_begin)
             results.extend(await sweep_pair(
                 self._wm, self._logger, candle=closed, warmup=warmup,
                 regime_cache=self._regime_cache, providers=self._providers, now_monotonic=self._now,
             ))
         return results
+
+    # --- the Htf1hGap self-heal: refetch the 1H series from REST and re-seed the HtfCache --------
+    async def _heal_htf(self, symbol: str, hour_begin: int) -> None:
+        """Self-heal a gapped pair's HtfCache from ONE targeted REST GetOHLCData(interval=60)
+        (TB00769). A reconnect dropped 5m closes so the derived 1H fold was suppressed (Htf1hGap);
+        the REST 1H series is authoritative (it already folds in the missed hour), so re-seed
+        close_1h/EMA(20)/EMA(50) exactly as warm-up did (reuse ema()) and advance the 1H step guard
+        past the refetched candle. Then drive the EC-L1A-001 1H reversal once on the fresh EMAs - a
+        reversal the gap would have hidden still fires (the whole point: drive FN to zero). A REST
+        failure leaves the cache untouched (it resumes on the next complete hour, bounded); no
+        rest_client wired (a unit/bring-up assembly) -> the gap is recorded only."""
+        if self._htf_rest is None:
+            return
+        warmup = self._warmups.get(symbol)
+        if warmup is None:
+            return
+        try:
+            resp60 = await self._htf_rest.get_ohlc_data(symbol, INTERVAL_60_MIN)
+        except (KrakenRestError, ValueError, IndexError):
+            return  # bounded miss: the cache resumes on the next complete hour (Htf1hGap already logged)
+        committed = resp60.committed
+        if not committed:
+            return
+        closes60 = [b.close for b in committed]
+        last60 = committed[-1]
+        warmup.htf = HtfCache(
+            close_1h=last60.close,
+            ema20_1h=ema(closes60, int(HTF_EMA_SHORT)),
+            ema50_1h=ema(closes60, int(HTF_EMA_LONG)),
+        )
+        self._stepped60[symbol] = last60.time  # do not re-step the just-seeded boundary
+        self._logger.record(Htf1hHealed(symbol, hour_begin), module="WS_Manager")
+        bid, ask = self._bbo(symbol)
+        # EC-L1A-001 1H reversal on the healed EMAs (a reversal hidden by the gap still fires).
+        self._wm.on_htf_ohlc_close(symbol, warmup.htf.ema20_1h, warmup.htf.ema50_1h, bid=bid, ask=ask)
 
     # --- the 1H feed: advance the HTF EMAs -> drive the L1a 1H reversal ------------------------
     def _step_htf(self, symbol: str, closed) -> None:

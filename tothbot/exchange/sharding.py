@@ -14,11 +14,23 @@ pairs) is fanned out across N shards. The split is a PURE partition function:
   shard_index  = i % N_conns    pair i's shard (alternating-index, balanced +/-1)
 
 Channel placement (Image1 shard block):
-  - GLOBAL channels (instrument, status) subscribe ONCE, on shard 0 only.
+  - GLOBAL channels (instrument) subscribe ONCE, on shard 0 only.
   - PER-PAIR channels (ohlc_5m, ticker) follow each pair to its shard: shard k
     carries the per-pair channels for every pair whose universe index i has
     i % N_conns == k. Shard 0 additionally carries the global channels and so
     is the SYSTEM-CLOCK shard (the ohlc_5m partition that fires the pipeline).
+
+Two channels Kraken WS v2 REFUSES are NOT subscribed (TB00768, confirmed live):
+  - ohlc(60): Kraken permits only ONE ohlc interval per symbol per connection,
+    so a 2nd subscribe after ohlc(5m) is rejected "Already subscribed to one
+    ohlc interval on this symbol". The 1H HTF feed is instead DERIVED locally by
+    folding twelve contiguous 5m candles (mod:OhlcAggregator on the ohlc_5m
+    handler) - the exact lossless 1H candle, zero extra connection.
+  - status: Kraken AUTO-pushes the status frame (connection_id + engine state)
+    with NO subscribe; an explicit status subscribe is refused "Symbol(s) not
+    found". The receive loop adopts connection_id + maintenance from the auto-
+    pushed frame BEFORE any dispatch-registered check (receive_loop._handle_status),
+    so status needs no subscription and no dispatch handler.
 
 Assigning pair i to shard (i % N_conns) over an ordered universe distributes
 the pairs round-robin, so shard sizes differ by at most 1 (balanced +/-1).
@@ -48,23 +60,23 @@ from .channels import PublicChannel
 SYMBOLS_PER_CONN_SAFE = 500  # max symbols one shard safely carries (WM-SHARD-001)
 
 # Global channels: a single subscription serves the whole universe, so they live
-# on shard 0 only (Image1: instrument "global, shard 0 only"; status "global,
-# AR-038 startup"). instrument feeds Pre-Gate-1 per-pair status; status carries
-# the Kraken engine state.
+# on shard 0 only (Image1: instrument "global, shard 0 only"). instrument feeds
+# Pre-Gate-1 per-pair status. status is NOT subscribed (Kraken auto-pushes it and
+# refuses an explicit subscribe; see the module docstring) - the receive loop
+# still consumes the auto-pushed frame for connection_id + engine state.
 GLOBAL_CHANNELS: tuple[PublicChannel, ...] = (
     PublicChannel.INSTRUMENT,
-    PublicChannel.STATUS,
 )
 
-# Per-pair channels: each pair's subscriptions live on that pair's shard
-# (Image1 partitions ohlc(5m) + ohlc(60) + ticker by i%N). ohlc_5m on shard 0's
-# partition is the system clock; ohlc(60) is the 1H HTF feed that maintains the
-# EMA(20)/EMA(50) cache + drives the EC-L1A-001 1H reversal exit (Image1 "ohlc_5m
-# + ohlc_60"; "1H candle close ohlc(60) WS event"); ticker feeds the drawdown
-# monitor + sizing.
+# Per-pair channels: each pair's subscriptions live on that pair's shard. ohlc_5m
+# on shard 0's partition is the system clock AND, via the local twelve-candle fold
+# (mod:OhlcAggregator), the source of the DERIVED 1H HTF feed that maintains the
+# EMA(20)/EMA(50) cache + drives the EC-L1A-001 1H reversal exit; ticker feeds the
+# drawdown monitor + sizing. ohlc(60) is NOT subscribed (Kraken refuses a 2nd ohlc
+# interval per symbol/connection; the 1H feed is derived from ohlc_5m instead - see
+# the module docstring).
 PER_PAIR_CHANNELS: tuple[PublicChannel, ...] = (
     PublicChannel.OHLC_5M,
-    PublicChannel.OHLC_60M,
     PublicChannel.TICKER,
 )
 
@@ -73,8 +85,8 @@ def n_conns(universe_size: int) -> int:
     """N_conns = ceil(universe_size / SYMBOLS_PER_CONN_SAFE), floored at 1.
 
     Integer-only ceil (no float). At least one shard always exists so the
-    global channels (instrument, status) have a home even before any pair is
-    assigned (AR-038 startup needs the status channel regardless).
+    global channel (instrument) has a home even before any pair is assigned
+    (and so shard 0's auto-pushed status frame has a connection regardless).
     """
     if universe_size < 0:
         raise ValueError(f"universe_size must be >= 0, got {universe_size}")
@@ -96,8 +108,8 @@ class ShardAssignment:
 
     shard_index: int
     pairs: tuple[str, ...]                     # pairs whose per-pair channels this shard owns
-    global_channels: tuple[PublicChannel, ...]  # instrument+status on shard 0, else empty
-    per_pair_channels: tuple[PublicChannel, ...]  # ohlc_5m + ohlc_60 + ticker (every shard)
+    global_channels: tuple[PublicChannel, ...]  # instrument on shard 0, else empty
+    per_pair_channels: tuple[PublicChannel, ...]  # ohlc_5m + ticker (every shard)
 
     @property
     def is_clock_shard(self) -> bool:

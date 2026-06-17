@@ -405,3 +405,43 @@ def test_derived_1h_hour_aligned_gap_is_surfaced_not_a_corrupt_candle():
         asyncio.run(driver.on_ohlc_5m(_frame_5m("BTC/USD", b)))
     gaps = [r for _, r in logger.records if getattr(r, "code", None) == "HTF_1H_GAP"]
     assert any(g.symbol == "BTC/USD" and g.hour_begin == hour for g in gaps)
+
+
+def test_htf_1h_gap_self_heals_from_rest_when_a_client_is_wired():
+    # TB00769: with an htf_rest_client wired, a Htf1hGap auto-refetches GetOHLCData(60) and RE-SEEDS
+    # the HtfCache (HTF_1H_HEAL), then drives EC-L1A-001 once on the healed EMAs (a reversal the gap
+    # would have hidden still fires). The _FakeRest 60m series ends at close 159 (start 100 + 59).
+    pw = _warm()
+    wm = _FakeWM()
+    logger = _FakeLogger()
+    driver = LiveSweepDriver(
+        warmups={"BTC/USD": pw}, regime_cache=_cache(), providers=_providers(), wm=wm, logger=logger,
+        htf_rest_client=_FakeRest(),
+    )
+    base = max(pw.last_interval_begin, pw.last_interval_begin_60)
+    hour = (base // 3600 + 2) * 3600
+    begins = [hour + k * 300 for k in range(12) if k != 5] + [hour + 3600, hour + 3900]
+    for b in begins:
+        asyncio.run(driver.on_ohlc_5m(_frame_5m("BTC/USD", b)))
+    heals = [r for _, r in logger.records if getattr(r, "code", None) == "HTF_1H_HEAL"]
+    assert any(h.symbol == "BTC/USD" and h.hour_begin == hour for h in heals)
+    assert pw.htf.close_1h == Decimal(159)            # HtfCache RE-SEEDED from the REST 1H series
+    assert any(c[0] == "BTC/USD" for c in wm.htf_calls)  # EC-L1A-001 driven on the healed EMAs
+
+
+def test_htf_1h_gap_without_a_rest_client_records_gap_but_does_not_heal():
+    # No htf_rest_client wired (a bring-up/unit assembly): the gap is recorded but NOT auto-healed
+    # (the cache resumes on the next complete hour, bounded) - no HTF_1H_HEAL, no reversal drive.
+    pw = _warm()
+    wm = _FakeWM()
+    logger = _FakeLogger()
+    driver = LiveSweepDriver(
+        warmups={"BTC/USD": pw}, regime_cache=_cache(), providers=_providers(), wm=wm, logger=logger,
+    )
+    base = max(pw.last_interval_begin, pw.last_interval_begin_60)
+    hour = (base // 3600 + 2) * 3600
+    begins = [hour + k * 300 for k in range(12) if k != 5] + [hour + 3600, hour + 3900]
+    for b in begins:
+        asyncio.run(driver.on_ohlc_5m(_frame_5m("BTC/USD", b)))
+    assert not any(getattr(r, "code", None) == "HTF_1H_HEAL" for _, r in logger.records)
+    assert wm.htf_calls == []
