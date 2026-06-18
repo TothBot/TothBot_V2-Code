@@ -121,3 +121,50 @@ class DailyDecisionCache:
             ema_slow_24h=(candle.close - self.ema_slow_24h) * alpha_slow + self.ema_slow_24h,
             atr_14_24h=(self.atr_14_24h * (atr_period - 1) + true_range) / atr_period,
         )
+
+
+class DailyDecisionStore:
+    """The per-pair DailyDecisionCache home + the live-wire maintenance seam (TB00789).
+
+    A SECOND consumer of the per-pair GetOHLCData(interval=1440) daily series mod:Regime_Engine ALREADY
+    fetches (the TB00788 ruling - NOT a third per-pair warm-up call, so ar:AR-049 step 8 STANDS):
+    ``seed_from_bars`` is wired alongside the DEC-124 reward store on the DailyRegimeCompute
+    ``on_daily_bars`` callback, so every pair's decision cache is seeded at the daily 00:00-UTC regime
+    compute from bars already fetched - zero added REST.
+
+    ``advance`` steps a pair's cache on each live Closed24H the OhlcAggregator second fold stage
+    (TB00787 fold_hour) emits; the Htf24hGap self-heal re-seeds via ``seed_from_bars`` over one REST
+    GetOHLCData(1440) (the exact mirror of the 1H heal one timeframe up, landing on the value the live
+    cache would hold per the TB00788 incrementality invariant). A pair with too few daily bars to seed
+    the slow EMA is simply ABSENT (no decision until the series is long enough, exactly as a WARM_UP
+    pair is skipped, ar:AR-068). The forthcoming long-only entry/exit consumer reads ``get`` for the
+    pre-advance cache and ``advance``'s return for the post-advance cache (the bullish-cross compare)."""
+
+    def __init__(self) -> None:
+        self._by_symbol: dict[str, DailyDecisionCache] = {}
+
+    def get(self, symbol: str) -> "DailyDecisionCache | None":
+        """The pair's current decision cache, or None if never seeded (too few daily bars / not yet
+        computed) - the consumer treats None as no-decision (no entry), bounded."""
+        return self._by_symbol.get(symbol)
+
+    def seed_from_bars(self, symbol: str, bars: Sequence[object]) -> None:
+        """Seed (or re-seed) one pair's decision cache from the authoritative 1440 daily series
+        (newest-last bars carrying .high/.low/.close). Too few bars to seed the slow EMA leaves the
+        pair UNSEEDED (popped) - bounded: no decision until the daily series grows / the next regime
+        re-seed. The seam for BOTH the daily regime-compute seed AND the Htf24hGap REST re-seed."""
+        try:
+            self._by_symbol[symbol] = DailyDecisionCache.seed(bars)
+        except DailyDecisionSeedError:
+            self._by_symbol.pop(symbol, None)
+
+    def advance(self, symbol: str, candle: CommittedCandle) -> "DailyDecisionCache | None":
+        """Step a pair's cache on a live Closed24H decision candle; returns the new cache, or None if
+        the pair was never seeded (the advance is skipped - bounded, the next daily regime compute or
+        the Htf24hGap heal re-seeds)."""
+        cache = self._by_symbol.get(symbol)
+        if cache is None:
+            return None
+        cache = cache.advance(candle)
+        self._by_symbol[symbol] = cache
+        return cache

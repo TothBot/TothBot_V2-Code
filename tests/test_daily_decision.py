@@ -17,6 +17,7 @@ from tothbot.exchange.daily_decision import (
     DECISION_EMA_SLOW,
     DailyDecisionCache,
     DailyDecisionSeedError,
+    DailyDecisionStore,
 )
 from tothbot.regime.indicators import atr_14_series, ema
 
@@ -107,3 +108,50 @@ def test_advance_atr_uses_the_prior_close_for_true_range():
     # TR = max(130-119, |130-100|, |119-100|) = max(11, 30, 19) = 30; atr' = (10*13 + 30)/14.
     assert nxt.atr_14_24h == (Decimal(10) * 13 + Decimal(30)) / 14
     assert nxt.close_24h == Decimal(125)
+
+
+# --------------------------------------------------------------- the per-pair DailyDecisionStore (TB00789)
+def test_store_seeds_per_pair_from_the_daily_series_and_gets_it_back():
+    store = DailyDecisionStore()
+    bars = _daily_bars(40)
+    store.seed_from_bars("BTC/USD", bars)
+    cache = store.get("BTC/USD")
+    assert cache is not None
+    assert cache.close_24h == bars[-1].close
+    assert cache.ema_fast_24h == DailyDecisionCache.seed(bars).ema_fast_24h
+
+
+def test_store_too_few_bars_leaves_the_pair_unseeded():
+    # Bounded, like a WARM_UP skip: a pair without enough daily bars to seed EMA(26) is simply absent.
+    store = DailyDecisionStore()
+    store.seed_from_bars("ETH/USD", _daily_bars(DECISION_EMA_SLOW - 1))
+    assert store.get("ETH/USD") is None
+
+
+def test_store_reseed_replaces_an_existing_cache_and_can_clear_it():
+    # The Htf24hGap heal re-seeds via seed_from_bars; a later too-short series clears the stale entry.
+    store = DailyDecisionStore()
+    store.seed_from_bars("BTC/USD", _daily_bars(40))
+    assert store.get("BTC/USD") is not None
+    store.seed_from_bars("BTC/USD", _daily_bars(DECISION_EMA_SLOW - 1))
+    assert store.get("BTC/USD") is None
+
+
+def test_store_advance_steps_the_cache_and_matches_a_full_reseed():
+    # The live Closed24H advance through the store is the incrementality invariant end to end: the
+    # stepped cache equals re-seeding over the extended series (so it never drifts from a REST re-seed).
+    store = DailyDecisionStore()
+    bars = _daily_bars(40)
+    store.seed_from_bars("BTC/USD", bars[:-1])
+    returned = store.advance("BTC/USD", bars[-1])
+    reseeded = DailyDecisionCache.seed(bars)
+    assert returned is store.get("BTC/USD")
+    assert returned.ema_fast_24h == reseeded.ema_fast_24h
+    assert returned.ema_slow_24h == reseeded.ema_slow_24h
+    assert returned.atr_14_24h == reseeded.atr_14_24h
+
+
+def test_store_advance_on_an_unseeded_pair_is_a_bounded_noop():
+    store = DailyDecisionStore()
+    assert store.advance("DOGE/USD", _c(DAY, 100, 104, 96, 101)) is None
+    assert store.get("DOGE/USD") is None

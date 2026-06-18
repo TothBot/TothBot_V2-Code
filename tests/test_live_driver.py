@@ -19,6 +19,8 @@ from tothbot.ciats.conductor import ApprovalInbox, CiatsConductor
 from tothbot.ciats.parameter_store import ParameterStore
 from tothbot.ciats.pool import CiatsPool
 from tothbot.ciats.regime_library import RegimeLibrary
+from tothbot.exchange.candle_close import CommittedCandle
+from tothbot.exchange.daily_decision import DailyDecisionCache, DailyDecisionStore
 from tothbot.exchange.position_mirror import PositionSide
 from tothbot.exchange.warmup import WarmupOrchestrator
 from tothbot.pipeline.live_driver import (
@@ -460,3 +462,112 @@ def test_htf_1h_gap_without_a_rest_client_records_gap_but_does_not_heal():
         asyncio.run(driver.on_ohlc_5m(_frame_5m("BTC/USD", b)))
     assert not any(getattr(r, "code", None) == "HTF_1H_HEAL" for _, r in logger.records)
     assert wm.htf_calls == []
+
+
+# ------------------------------------------- TB00789: the 24h DECISION feed (fold_hour -> DailyDecisionCache)
+DAY = 86400
+
+
+def _daily_bars(n, symbol="BTC/USD", start=100):
+    """n daily bars (newest-last) with a gently rising close so EMA(12) seeds above EMA(26)."""
+    out = []
+    for i in range(n):
+        close = Decimal(start + i)
+        out.append(CommittedCandle(symbol=symbol, interval_begin=i * DAY, open=close - 1,
+                                   high=close + 4, low=close - 5, close=close, volume=Decimal(1)))
+    return out
+
+
+def _h1(symbol, begin, close):
+    """A folded 1H CommittedCandle (the input fold_hour folds one timeframe up into the 24h decision)."""
+    c = Decimal(close)
+    return CommittedCandle(symbol=symbol, interval_begin=begin, open=c - 1, high=c + 2, low=c - 2,
+                           close=c, volume=Decimal(5))
+
+
+def _seeded_store(symbol="BTC/USD", n=30):
+    store = DailyDecisionStore()
+    store.seed_from_bars(symbol, _daily_bars(n, symbol))
+    return store
+
+
+def test_advance_decision_steps_the_daily_cache_on_a_complete_day():
+    # Feed twenty-four contiguous day-aligned 1H closes: the OhlcAggregator second fold stage eager-
+    # emits a Closed24H on the twenty-fourth, which advances the pair's DailyDecisionCache.
+    pw = _warm()
+    store = _seeded_store()
+    seed_close = store.get("BTC/USD").close_24h
+    driver = _driver({"BTC/USD": pw}, _FakeWM(), decision_store=store)
+    day = (max(pw.last_interval_begin, pw.last_interval_begin_60) // DAY + 2) * DAY
+    for h in range(24):
+        asyncio.run(driver._advance_decision(_h1("BTC/USD", day + h * 3600, 5000 + h)))
+    cache = store.get("BTC/USD")
+    assert cache.close_24h == Decimal(5023)        # the 24h close = the last (hour-23) 1H close - lossless
+    assert cache.close_24h != seed_close           # the cache advanced off the seed
+
+
+def test_advance_decision_no_store_is_a_noop():
+    # A unit assembly that wires no decision_store: the second fold stage is simply not driven.
+    pw = _warm()
+    driver = _driver({"BTC/USD": pw}, _FakeWM())   # decision_store defaults to None
+    day = (max(pw.last_interval_begin, pw.last_interval_begin_60) // DAY + 2) * DAY
+    for h in range(24):
+        asyncio.run(driver._advance_decision(_h1("BTC/USD", day + h * 3600, 5000 + h)))  # no crash
+
+
+def test_24h_day_aligned_gap_self_heals_from_rest_1440_when_a_client_is_wired():
+    # A 1H step the TB00769 heal could not recover leaves the day short of twenty-four -> Htf24hGap;
+    # with htf_rest_client wired, the decision cache re-seeds from one REST GetOHLCData(1440)
+    # (HTF_24H_HEAL), the exact mirror of the 1H heal one timeframe up.
+    pw = _warm()
+    store = _seeded_store()
+    logger = _FakeLogger()
+    driver = LiveSweepDriver(
+        warmups={"BTC/USD": pw}, regime_cache=_cache(), providers=_providers(), wm=_FakeWM(),
+        logger=logger, decision_store=store, htf_rest_client=_FakeRest(),
+    )
+    day = (max(pw.last_interval_begin, pw.last_interval_begin_60) // DAY + 2) * DAY
+    hours = [day + h * 3600 for h in range(24) if h != 5] + [day + DAY]   # skip hour 5, then next day
+    for b in hours:
+        asyncio.run(driver._advance_decision(_h1("BTC/USD", b, 7000)))
+    gaps = [r for _, r in logger.records if getattr(r, "code", None) == "HTF_24H_GAP"]
+    heals = [r for _, r in logger.records if getattr(r, "code", None) == "HTF_24H_HEAL"]
+    assert any(g.symbol == "BTC/USD" and g.day_begin == day for g in gaps)
+    assert any(h.symbol == "BTC/USD" and h.day_begin == day for h in heals)
+    assert store.get("BTC/USD") is not None         # cache re-seeded from the REST 1440 series
+
+
+def test_24h_gap_without_a_rest_client_records_gap_but_does_not_heal():
+    pw = _warm()
+    store = _seeded_store()
+    logger = _FakeLogger()
+    driver = LiveSweepDriver(
+        warmups={"BTC/USD": pw}, regime_cache=_cache(), providers=_providers(), wm=_FakeWM(),
+        logger=logger, decision_store=store,                       # no htf_rest_client
+    )
+    day = (max(pw.last_interval_begin, pw.last_interval_begin_60) // DAY + 2) * DAY
+    hours = [day + h * 3600 for h in range(24) if h != 5] + [day + DAY]
+    for b in hours:
+        asyncio.run(driver._advance_decision(_h1("BTC/USD", b, 7000)))
+    assert any(getattr(r, "code", None) == "HTF_24H_GAP" for _, r in logger.records)
+    assert not any(getattr(r, "code", None) == "HTF_24H_HEAL" for _, r in logger.records)
+
+
+def test_derived_24h_from_the_5m_stream_advances_the_daily_cache_end_to_end():
+    # The full chain through on_ohlc_5m: a clean UTC day of 5m closes folds to twenty-four 1H candles
+    # (fold) which fold one timeframe up (fold_hour) into one Closed24H that advances the cache. One
+    # frame carries the whole day + the rollover candle (the closed-candle lag fires the 23:55 close).
+    pw = _warm()
+    store = _seeded_store()
+    seed_close = store.get("BTC/USD").close_24h
+    driver = _driver({"BTC/USD": pw}, _FakeWM(), decision_store=store)
+    day = (max(pw.last_interval_begin, pw.last_interval_begin_60) // DAY + 2) * DAY
+    # 289 contiguous 5m candles: day .. day+DAY inclusive (the last fires the 23:55 close).
+    data = [{"symbol": "BTC/USD", "interval_begin": day + k * 300, "open": "199500",
+             "high": str(200000 + k), "low": "199000", "close": str(200000 + k), "volume": "9000"}
+            for k in range(289)]
+    asyncio.run(driver.on_ohlc_5m({"data": data}))
+    cache = store.get("BTC/USD")
+    # 24h close = close of the [23:00,00:00) hour = close of its 23:55 5m slot = candle k=287.
+    assert cache.close_24h == Decimal(200000 + 287)
+    assert cache.close_24h != seed_close

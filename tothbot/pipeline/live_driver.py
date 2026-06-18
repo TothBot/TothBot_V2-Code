@@ -38,7 +38,16 @@ from ..exchange.candle_close import (
     committed_candle_from_bar,
     committed_candle_from_frame,
 )
-from ..exchange.ohlc_aggregate import Closed1H, Htf1hGap, Htf1hHealed, OhlcAggregator
+from ..exchange.daily_decision import INTERVAL_1440_MIN, DailyDecisionStore
+from ..exchange.ohlc_aggregate import (
+    Closed1H,
+    Closed24H,
+    Htf1hGap,
+    Htf1hHealed,
+    Htf24hGap,
+    Htf24hHealed,
+    OhlcAggregator,
+)
 from ..exchange.position_mirror import PositionSide
 from ..exchange.warmup import HTF_EMA_LONG, HTF_EMA_SHORT, INTERVAL_60_MIN, HtfCache
 from ..regime.indicators import ema
@@ -160,6 +169,7 @@ class LiveSweepDriver:
         on_clock_tick: Callable[[datetime], None] | None = None,
         htf_rest_client=None,
         on_committed_5m: Callable[[object], None] | None = None,
+        decision_store: DailyDecisionStore | None = None,
     ) -> None:
         self._warmups = warmups
         self._regime_cache = regime_cache
@@ -210,6 +220,14 @@ class LiveSweepDriver:
         # closed 5m candle to persist the intraday corpus a DEEP realized backtest needs (Kraken history
         # is capped ~2.5 days). Optional - a unit/paper assembly with no records_dir leaves it None.
         self._on_committed_5m = on_committed_5m
+        # TB00789: the per-pair DailyDecisionStore (the validated long-only 24h decision series). Each
+        # Closed1H the OhlcAggregator emits is folded ONE TIMEFRAME UP (fold_hour -> the 24h decision
+        # candle); a complete UTC day advances the pair's DailyDecisionCache on the same 00:00-UTC
+        # boundary Kraken's native 1440 candle uses, and a day-aligned Htf24hGap self-heals from one
+        # REST GetOHLCData(1440) re-seed (the mirror of _heal_htf). Seeded at the daily regime compute
+        # (a SECOND consumer of the regime 1440 series, no third warm-up call). Optional - a unit
+        # assembly that wires no store leaves it None and the second fold stage is not driven.
+        self._decision = decision_store
 
     # --- the 5m system clock: detect -> step indicators -> sweep -------------------------------
     async def on_ohlc_5m(self, frame: dict):
@@ -252,6 +270,9 @@ class LiveSweepDriver:
             folded = self._agg.fold(closed)
             if isinstance(folded, Closed1H):
                 self._step_htf(folded.candle.symbol, folded.candle)
+                # TB00789: fold this closed 1H ONE TIMEFRAME UP into the 24h DECISION series and
+                # advance the pair's DailyDecisionCache on a complete UTC day (or self-heal a gap).
+                await self._advance_decision(folded.candle)
             elif isinstance(folded, Htf1hGap):
                 self._logger.record(folded, module="WS_Manager")
                 await self._heal_htf(folded.symbol, folded.hour_begin)
@@ -295,6 +316,48 @@ class LiveSweepDriver:
         bid, ask = self._bbo(symbol)
         # EC-L1A-001 1H reversal on the healed EMAs (a reversal hidden by the gap still fires).
         self._wm.on_htf_ohlc_close(symbol, warmup.htf.ema20_1h, warmup.htf.ema50_1h, bid=bid, ask=ask)
+
+    # --- the 24h DECISION feed: fold each 1H one timeframe up -> advance the DailyDecisionCache ---
+    async def _advance_decision(self, closed_1h) -> None:
+        """TB00789: feed each CLOSED 1H candle into the OhlcAggregator SECOND fold stage (fold_hour,
+        TB00787) and maintain the pair's DailyDecisionCache. A complete UTC day (its twenty-fourth
+        contiguous 1H close) EAGER-emits a Closed24H, which advances the cache incrementally on the
+        same 00:00-UTC boundary Kraken's native 1440 candle uses (the TB00788 advance). A day-aligned
+        Htf24hGap (a 1H step the TB00769 heal could not recover) is recorded and self-healed from one
+        REST GetOHLCData(1440) re-seed (the exact mirror of _heal_htf one timeframe up). MAINTENANCE
+        only this slice - the long-only entry/exit consumer of the cache lands next; no store wired
+        (a unit assembly) -> the second fold stage is not driven."""
+        if self._decision is None:
+            return
+        folded = self._agg.fold_hour(closed_1h)
+        if isinstance(folded, Closed24H):
+            self._decision.advance(folded.candle.symbol, folded.candle)
+        elif isinstance(folded, Htf24hGap):
+            self._logger.record(folded, module="Regime_Engine")
+            await self._heal_decision(folded.symbol, folded.day_begin)
+
+    # --- the Htf24hGap self-heal: refetch the 1440 series from REST and re-seed the decision cache --
+    async def _heal_decision(self, symbol: str, day_begin: int) -> None:
+        """Self-heal a gapped pair's DailyDecisionCache from ONE targeted REST GetOHLCData(interval=
+        1440) (TB00789, the exact mirror of _heal_htf one timeframe up). A 1H step the TB00769 heal
+        could not recover left the 24h fold short of twenty-four, so the decision candle was suppressed
+        (Htf24hGap); the REST 1440 daily series is authoritative (it already folds in the missed
+        hours), so re-seed the cache to the exact value the live cache would hold (the TB00788
+        incrementality invariant). A REST failure / no client / too-few-bars leaves the cache to
+        resume on the next complete day or the next daily regime re-seed (bounded - the Htf24hGap
+        already surfaced the miss), so HTF_24H_HEAL marks only a SUCCESSFUL re-seed."""
+        if self._htf_rest is None or self._decision is None:
+            return
+        try:
+            resp = await self._htf_rest.get_ohlc_data(symbol, INTERVAL_1440_MIN)
+        except (KrakenRestError, ValueError, IndexError):
+            return  # bounded miss: the cache resumes on the next complete day (Htf24hGap already logged)
+        committed = resp.committed
+        if not committed:
+            return
+        self._decision.seed_from_bars(symbol, committed)
+        if self._decision.get(symbol) is not None:
+            self._logger.record(Htf24hHealed(symbol, day_begin), module="Regime_Engine")
 
     # --- the 1H feed: advance the HTF EMAs -> drive the L1a 1H reversal ------------------------
     def _step_htf(self, symbol: str, closed) -> None:

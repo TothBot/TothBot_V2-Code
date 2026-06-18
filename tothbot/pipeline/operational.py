@@ -66,6 +66,7 @@ from ..config.settings import Mode
 from ..exchange.assembler import DataLayer, DataLayerAssembler
 from ..exchange.bbo_cache import BboCache
 from ..exchange.channels import PublicChannel
+from ..exchange.daily_decision import DailyDecisionStore
 from ..exchange.dispatch import Channel, Handler
 from ..exchange.instrument_cache import InstrumentCache
 from ..exchange.liquidity_cache import LiquidityCache, LiquidityProbe
@@ -285,6 +286,7 @@ class OperationalSystem:
     pull_scheduler: PullCadenceScheduler | None = None
     trade_record_sink: PermanentTradeRecordSink | None = None
     equity_reconcile: PeriodicTradeBalanceReconcile | None = None
+    decision_store: DailyDecisionStore | None = None
 
     async def run(self) -> None:
         """Drive the public data layer (and, in live, the private connection + the periodic SHORT-equity
@@ -368,10 +370,19 @@ async def assemble_operational(
     ).warm_all(universe)
     # 2. REST DAILY REGIME (ar:AR-074 anchor): fill the RegimeCache (+ EC-L1A-002 for open positions).
     #    OPS-1: the daily series also seeds the DEC-124 expected_reward store (the run-to-reversal
-    #    median per pair/regime) - again from the bars already fetched, no extra REST.
+    #    median per pair/regime) AND (TB00789) the per-pair DailyDecisionStore (the validated long-only
+    #    24h decision cache - a SECOND consumer of the SAME 1440 series, NOT a third per-pair warm-up
+    #    call, so ar:AR-049 step 8 STANDS) - both from the bars already fetched, no extra REST. The
+    #    on_daily_bars fan-out seeds both stores per pair at the daily 00:00-UTC compute.
+    decision_store = DailyDecisionStore()
+
+    def _seed_daily_consumers(symbol, bars):
+        reward_store.seed_from_bars(symbol, bars)
+        decision_store.seed_from_bars(symbol, bars)
+
     regime_cache = await DailyRegimeCompute(
         rest_client, sleep=rest_sleep, on_event=event_sink, ws_manager=wm, bbo_provider=bbo_pair,
-        on_daily_bars=reward_store.seed_from_bars,
+        on_daily_bars=_seed_daily_consumers,
     ).compute_all(universe)
     # 3. REST LIQUIDITY PROBE (Gate-2 vol_24h_usd): fill the LiquidityCache.
     await LiquidityProbe(
@@ -461,6 +472,10 @@ async def assemble_operational(
         htf_rest_client=rest_client,
         # TB00775 #1-B: durably persist each genuinely-new closed 5m candle (None when no records_dir).
         on_committed_5m=ohlc5m_sink,
+        # TB00789: the per-pair 24h DECISION store (seeded above from the regime 1440 series). The driver
+        # folds each Closed1H one timeframe up and advances the cache on each Closed24H (the heal reuses
+        # htf_rest_client for the GetOHLCData(1440) re-seed).
+        decision_store=decision_store,
     )
 
     # 6. Build + run the public data layer (handlers bound, the SHARED machines/coordinator injected).
@@ -554,4 +569,5 @@ async def assemble_operational(
         pull_scheduler=pull_scheduler,
         trade_record_sink=trade_record_sink,
         equity_reconcile=equity_reconcile,
+        decision_store=decision_store,
     )
