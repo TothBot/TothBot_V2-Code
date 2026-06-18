@@ -35,6 +35,13 @@ bucket is NOT folded into a (corrupt) candle:
 PURE: no I/O, no clock, Decimal-only (ar:AR-047). The caller (live_driver) folds each
 closed 5m CommittedCandle and routes a Closed1H to the same HtfCache-advance + EC-L1A-001
 path the WS 60m frame used to drive.
+
+TB00787 (the validated long-only strategy) adds a SECOND fold stage one timeframe up:
+``fold_hour`` folds the twenty-four contiguous hour-aligned 1H closes that partition a UTC
+day into one exact 24h DECISION candle (the same lossless open/close/high/low/volume fold,
+the same completeness gate, the same gap-or-discard rollover and self-heal, all at day
+granularity). The 24h close is the decision bar the forthcoming long-only entry/exit compute
+on. Each Closed1H ``fold`` emits is the input to ``fold_hour``; the 1H path is untouched.
 """
 
 from __future__ import annotations
@@ -48,10 +55,21 @@ _HOUR_SECONDS = 3600
 _FIVE_MIN_SECONDS = 300
 _CANDLES_PER_HOUR = _HOUR_SECONDS // _FIVE_MIN_SECONDS  # 12
 
+# Seconds per UTC day; twenty-four contiguous 1H candles compose one complete day. The
+# Unix epoch is itself 00:00 UTC, so floor-dividing by _DAY_SECONDS lands the day boundary
+# exactly on midnight UTC - the same boundary Kraken's native 1440 daily candle uses.
+_DAY_SECONDS = 86400
+_HOURS_PER_DAY = _DAY_SECONDS // _HOUR_SECONDS  # 24
+
 
 def hour_begin_of(interval_begin: int) -> int:
     """The Unix-second start of the 1H bucket a 5m candle's interval_begin falls in."""
     return (interval_begin // _HOUR_SECONDS) * _HOUR_SECONDS
+
+
+def day_begin_of(interval_begin: int) -> int:
+    """The Unix-second start of the UTC day a 1H candle's interval_begin falls in (00:00 UTC)."""
+    return (interval_begin // _DAY_SECONDS) * _DAY_SECONDS
 
 
 @dataclass(frozen=True)
@@ -87,6 +105,45 @@ class Htf1hHealed:
     symbol: str
     hour_begin: int
     code: str = field(default="HTF_1H_HEAL", init=False)
+
+
+@dataclass(frozen=True)
+class Closed24H:
+    """A complete, exact 24h DECISION candle folded from twenty-four contiguous hour-aligned
+    1H candles (TB00787, the validated long-only strategy). The 24h close is the DECISION bar:
+    the forthcoming long-only entry (EMA12/26 bullish cross) and exit (EMA12/26 reversal OR a
+    wide ATR disaster stop) compute on this series. EAGER-emitted the instant the 00:00-UTC 1H
+    close completes the UTC day, so the daily decision fires on the same boundary as Kraken's
+    native 1440 candle, zero rollover lag."""
+
+    candle: CommittedCandle
+
+
+@dataclass(frozen=True)
+class Htf24hGap:
+    """evt:HTF_24H_GAP [WARNING] {symbol, day_begin} - a day-aligned 24h bucket closed with
+    fewer than twenty-four 1H candles (a 1H step the TB00769 self-heal could not recover). The
+    24h fold is suppressed (never emit a corrupt decision candle); the caller self-heals from one
+    targeted REST GetOHLCData(interval=1440) (the exact mirror of the 1H heal). Surfaced, never
+    silently dropped."""
+
+    symbol: str
+    day_begin: int
+    code: str = field(default="HTF_24H_GAP", init=False)
+
+
+@dataclass(frozen=True)
+class Htf24hHealed:
+    """evt:HTF_24H_HEAL [INFO] {symbol, day_begin} - a gapped pair's 24h decision series was
+    RE-SEEDED from one targeted REST GetOHLCData(interval=1440) after a Htf24hGap. The REST 1440
+    daily series is authoritative (it already folds in the missed hours), so the re-seed restores
+    the exact decision bar + indicators the gapped fold would have missed. A REST failure leaves
+    the series to resume on the next complete day (bounded), so HTF_24H_HEAL marks only a
+    SUCCESSFUL refetch."""
+
+    symbol: str
+    day_begin: int
+    code: str = field(default="HTF_24H_HEAL", init=False)
 
 
 @dataclass
@@ -136,6 +193,59 @@ class _Bucket:
         return Htf1hGap(self.symbol, self.hour_begin) if self._began_hour_aligned() else None
 
 
+@dataclass
+class _DayBucket:
+    """The accumulating 1H candles of one in-progress UTC day for one symbol (TB00787).
+
+    Structural mirror of _Bucket one timeframe up: twenty-four hour-aligned 1H closes partition a
+    UTC day exactly as twelve 5m closes partition an hour, so the completeness gate, the
+    began-day-aligned test, the lossless fold, and the gap-or-discard rollover are identical with
+    day-level constants. Twenty-four contiguous 1H candles is information-theoretically lossless -
+    it equals Kraken's own 1440 daily candle whenever all twenty-four are present."""
+
+    symbol: str
+    day_begin: int
+    candles: list[CommittedCandle] = field(default_factory=list)
+    emitted: bool = False  # the complete 24h candle was already eager-emitted
+
+    def add(self, candle: CommittedCandle) -> None:
+        self.candles.append(candle)
+
+    def is_complete(self) -> bool:
+        """All twenty-four interval_begin-contiguous 1H slots present: day-aligned, count 24,
+        spanning exactly [day, day+23h]. Distinct begins + that span => every slot."""
+        begins = {c.interval_begin for c in self.candles}
+        return (
+            len(begins) == _HOURS_PER_DAY
+            and min(begins) == self.day_begin
+            and max(begins) == self.day_begin + (_HOURS_PER_DAY - 1) * _HOUR_SECONDS
+        )
+
+    def _began_day_aligned(self) -> bool:
+        """The bucket's earliest 1H candle sits on the 00:00-UTC day boundary (so a shortfall is a
+        genuine mid-day gap, not the expected startup / post-gap partial day)."""
+        return bool(self.candles) and min(c.interval_begin for c in self.candles) == self.day_begin
+
+    def fold_24h(self) -> CommittedCandle:
+        """The exact 24h decision candle: open of the earliest 1H, close of the latest, max high,
+        min low, summed volume (lossless - the twenty-four 1H sub-windows partition the day)."""
+        ordered = sorted(self.candles, key=lambda c: c.interval_begin)
+        return CommittedCandle(
+            symbol=self.symbol,
+            interval_begin=self.day_begin,
+            open=ordered[0].open,
+            high=max(c.high for c in ordered),
+            low=min(c.low for c in ordered),
+            close=ordered[-1].close,
+            volume=sum((c.volume for c in ordered), start=type(ordered[0].volume)(0)),
+        )
+
+    def gap_or_none(self) -> "Htf24hGap | None":
+        """On an UNEMITTED rollover: a day-aligned shortfall -> Htf24hGap (a mid-day gap to
+        self-heal); a mid-day partial -> None (the expected startup/post-gap part)."""
+        return Htf24hGap(self.symbol, self.day_begin) if self._began_day_aligned() else None
+
+
 class OhlcAggregator:
     """Folds the per-symbol ohlc_5m close stream into exact 1H candles (Opt 5).
 
@@ -152,6 +262,7 @@ class OhlcAggregator:
 
     def __init__(self) -> None:
         self._buckets: dict[str, _Bucket] = {}
+        self._day_buckets: dict[str, _DayBucket] = {}
 
     def fold(self, closed_5m: CommittedCandle) -> "Closed1H | Htf1hGap | None":
         hour = hour_begin_of(closed_5m.interval_begin)
@@ -174,4 +285,40 @@ class OhlcAggregator:
         if not bucket.emitted and bucket.is_complete():
             bucket.emitted = True
             return Closed1H(bucket.fold_1h())
+        return rolled
+
+    def fold_hour(self, closed_1h: CommittedCandle) -> "Closed24H | Htf24hGap | None":
+        """Fold each CLOSED 1H candle into the exact 24h DECISION candle (TB00787, the second
+        fold stage, one timeframe up from ``fold``). Drive it with each Closed1H ``fold`` emits
+        (or a TB00769-healed 1H, so the self-heal chains through), in interval_begin order per
+        symbol. The UTC day is EAGER-emitted the instant its twenty-fourth contiguous 1H candle
+        closes (the 23:00->00:00 close, coinciding with the native 1440 daily close - NO rollover
+        lag, so the daily long-only decision fires on the same boundary Kraken's daily candle
+        uses). Returns:
+          - Closed24H : the exact 24h decision candle (on the twenty-fourth contiguous close);
+          - Htf24hGap : a day-aligned bucket that rolled over short of twenty-four (a 1H step the
+                        TB00769 heal could not recover) - the caller self-heals from REST 1440;
+          - None      : still accumulating, an already-emitted day rolling over, or an expected
+                        mid-day partial (startup / post-gap) discarded.
+        Structural mirror of ``fold`` with day-level constants - the 1H path is untouched."""
+        day = day_begin_of(closed_1h.interval_begin)
+        bucket = self._day_buckets.get(closed_1h.symbol)
+        rolled: "Htf24hGap | None" = None
+        if bucket is not None and day > bucket.day_begin:
+            # A newer day began: a complete day already eager-emitted on its twenty-fourth
+            # close (rolled stays None); an unemitted prior bucket -> gap / discard.
+            rolled = None if bucket.emitted else bucket.gap_or_none()
+            bucket = None
+        elif bucket is not None and day < bucket.day_begin:
+            # An out-of-order / stale 1H for an already-closed day: ignore it (fold feeds
+            # ascending closes, so this is a defensive no-op).
+            return None
+        if bucket is None:
+            bucket = _DayBucket(symbol=closed_1h.symbol, day_begin=day)
+            self._day_buckets[closed_1h.symbol] = bucket
+        bucket.add(closed_1h)
+        # Eager-emit the exact 24h decision candle the moment the day completes (native timing).
+        if not bucket.emitted and bucket.is_complete():
+            bucket.emitted = True
+            return Closed24H(bucket.fold_24h())
         return rolled
