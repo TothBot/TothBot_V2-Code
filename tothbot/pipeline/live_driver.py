@@ -50,11 +50,20 @@ from ..exchange.ohlc_aggregate import (
 )
 from ..exchange.position_mirror import PositionSide
 from ..exchange.warmup import HTF_EMA_LONG, HTF_EMA_SHORT, INTERVAL_60_MIN, HtfCache
+from ..config import registry
 from ..regime.indicators import ema
 from ..regime.live_indicators import OhlcCandle
 from ..regime.taxonomy import Regime
 from ..rest.client import KrakenRestError
-from .sweep import LiveProviders, sweep_pair
+from .driver import process_candidate
+from .parameter_snapshot import CycleParameters
+from .sweep import (
+    LiveProviders,
+    ProviderNotReady,
+    assemble_candidate,
+    decision_sss_evaluator,
+    sweep_pair,
+)
 
 
 def _is_trade_close(event: object) -> bool:
@@ -170,6 +179,8 @@ class LiveSweepDriver:
         htf_rest_client=None,
         on_committed_5m: Callable[[object], None] | None = None,
         decision_store: DailyDecisionStore | None = None,
+        decision_entry: bool = False,
+        decision_stop_mult: object | None = None,
     ) -> None:
         self._warmups = warmups
         self._regime_cache = regime_cache
@@ -228,6 +239,18 @@ class LiveSweepDriver:
         # (a SECOND consumer of the regime 1440 series, no third warm-up call). Optional - a unit
         # assembly that wires no store leaves it None and the second fold stage is not driven.
         self._decision = decision_store
+        # TB00790: route the validated LONG-ONLY entry/exit through the 24h decision. When True (the
+        # assembled organism), on each Closed24H the EMA(fast)/EMA(slow) BULLISH CROSS runs the
+        # gate:G1-G8 entry for the LONG side (REPLACING the 5m SSS trigger - the 5m sweep entry is
+        # disabled), and the 24h EMA reversal drives the layer:L1a exit (the legacy 1H reversal drive
+        # is retired, the 1H HtfCache stays for gate:G4). False (the default, unit/legacy assemblies):
+        # the 5m sweep entry + the 1H reversal drive are unchanged. decision_stop_mult is the WIDE
+        # layer:L2 stop multiple (param:decision_atr_stop_mult) gate:G8 sizes the entry on.
+        self._decision_entry = decision_entry
+        self._decision_stop_mult = (
+            Decimal(str(decision_stop_mult)) if decision_stop_mult is not None
+            else Decimal(str(registry.value("decision_atr_stop_mult")))
+        )
 
     # --- the 5m system clock: detect -> step indicators -> sweep -------------------------------
     async def on_ohlc_5m(self, frame: dict):
@@ -276,10 +299,15 @@ class LiveSweepDriver:
             elif isinstance(folded, Htf1hGap):
                 self._logger.record(folded, module="WS_Manager")
                 await self._heal_htf(folded.symbol, folded.hour_begin)
-            results.extend(await sweep_pair(
-                self._wm, self._logger, candle=closed, warmup=warmup,
-                regime_cache=self._regime_cache, providers=self._providers, now_monotonic=self._now,
-            ))
+            # TB00790: the 5m sweep ENTRY is DISABLED when the 24h-decision long-only entry owns
+            # entries (the 5m close still steps the indicators + folds + drives the ticker exits
+            # above; only the entry trigger moves to the 24h EMA cross). Legacy/unit assemblies
+            # (decision_entry False) keep the 5m sweep entry unchanged.
+            if not self._decision_entry:
+                results.extend(await sweep_pair(
+                    self._wm, self._logger, candle=closed, warmup=warmup,
+                    regime_cache=self._regime_cache, providers=self._providers, now_monotonic=self._now,
+                ))
         return results
 
     # --- the Htf1hGap self-heal: refetch the 1H series from REST and re-seed the HtfCache --------
@@ -313,6 +341,11 @@ class LiveSweepDriver:
         )
         self._stepped60[symbol] = last60.time  # do not re-step the just-seeded boundary
         self._logger.record(Htf1hHealed(symbol, hour_begin), module="WS_Manager")
+        # TB00790: the healed 1H EMAs re-seed the HtfCache for gate:G4 (above); the 1H EMA20/50
+        # reversal drive is RETIRED when the 24h-decision exit owns layer:L1a (the 24h gap heal
+        # re-seeds the decision cache + the next Closed24H drives the reversal).
+        if self._decision_entry:
+            return
         bid, ask = self._bbo(symbol)
         # EC-L1A-001 1H reversal on the healed EMAs (a reversal hidden by the gap still fires).
         self._wm.on_htf_ohlc_close(symbol, warmup.htf.ema20_1h, warmup.htf.ema50_1h, bid=bid, ask=ask)
@@ -331,10 +364,80 @@ class LiveSweepDriver:
             return
         folded = self._agg.fold_hour(closed_1h)
         if isinstance(folded, Closed24H):
-            self._decision.advance(folded.candle.symbol, folded.candle)
+            symbol = folded.candle.symbol
+            # The pre-advance cache (the bullish-cross compare) BEFORE the advance overwrites it.
+            pre = self._decision.get(symbol)
+            post = self._decision.advance(symbol, folded.candle)
+            # TB00790: route the LONG-ONLY entry/exit through this Closed24H decision bar.
+            if self._decision_entry and post is not None:
+                # (B) the LONG entry on the EMA(fast)/EMA(slow) BULLISH CROSS (pre NOT bullish ->
+                #     post bullish; an unseeded pre is no cross - G5 also guards a same-side open).
+                if pre is not None and (not pre.bullish) and post.bullish:
+                    await self._drive_decision_entry(symbol, folded.candle, post)
+                # (C) layer:L1a - drive the 24h EMA reversal exit on EVERY Closed24H (the bearish
+                #     cross fires it for an open LONG; replaces the retired 1H EMA20/50 drive).
+                self._drive_decision_reversal(symbol, post)
         elif isinstance(folded, Htf24hGap):
             self._logger.record(folded, module="Regime_Engine")
             await self._heal_decision(folded.symbol, folded.day_begin)
+
+    # --- (B) the long-only 24h-decision ENTRY: the EMA(fast)/EMA(slow) bullish cross ------------
+    async def _drive_decision_entry(self, symbol: str, candle, cache) -> None:
+        """TB00790: run the EXISTING gate:G1-G8 entry for the LONG side on a 24h EMA bullish cross.
+        The trigger candle is the Closed24H (entry_ref_price = its close); inputs.atr_14 +
+        ctx.atr_14_entry are OVERRIDDEN to the DAILY decision-bar ATR (so the position is stamped
+        with the daily ATR and the exit/RR re-anchors); the SSS evaluator PASSES (the cross IS the
+        signal); gate:G8 sizes on mae_mult = param:decision_atr_stop_mult. gate:G1-G7 still prefilter
+        (regime/state/liquidity/HTF/selection/risk); G5 has_active_same_side_position guards a double
+        entry. Short DORMANT - LONG only. A not-READY pair / unseeded wallet is a clean skip."""
+        classification = self._regime_cache.get(symbol)
+        if classification is None:   # not READY (no daily regime yet) - skip (ar:AR-044)
+            return
+        warmup = self._warmups.get(symbol)
+        if warmup is None:
+            return
+        side = PositionSide.LONG  # long-only (mod:Short_Module dormant, long-short-paradigm-standing)
+        # The side's G8-sizer reads must both be ready (mode-aware) - like sweep_pair, skip if not.
+        if self._wm.wallet_balance(side) is None or self._wm.portfolio_baseline(side) is None:
+            return
+        try:
+            inputs, ctx = assemble_candidate(
+                symbol, side, candle=candle, warmup=warmup, regime_cache=self._regime_cache,
+                providers=self._providers, wm=self._wm, now_monotonic=self._now,
+                atr_override=cache.atr_14_24h,   # the DAILY decision-bar ATR(14) (TB00790)
+            )
+        except ProviderNotReady:
+            return  # the pair's live caches are not populated yet - skip this Closed24H
+        evaluator = decision_sss_evaluator(cache.ema_fast_24h, cache.ema_slow_24h, side)
+        params = self._decision_cycle_parameters(side)
+        await process_candidate(
+            self._wm, self._logger, side, symbol, inputs, ctx, sss_evaluator=evaluator, params=params
+        )
+
+    def _decision_cycle_parameters(self, side: PositionSide) -> CycleParameters:
+        """The frozen per-cycle Parameter_Store_Snapshot for the 24h-decision entry, with mae_mult
+        OVERLAID to param:decision_atr_stop_mult so gate:G8 sizes net_loss on the WIDE 2.5x daily-ATR
+        stop (the ONE 1R basis). The base snapshot (the per-module CIATS-owned overlay + the protective
+        disallowed_regimes) is taken from the providers' cycle_parameters; None -> a seed-only view."""
+        base = (
+            self._providers.cycle_parameters(side)
+            if self._providers.cycle_parameters is not None else None
+        )
+        owned = dict(base.owned) if base is not None else {}
+        owned["mae_mult"] = self._decision_stop_mult
+        disallowed = base.disallowed_regimes if base is not None else ()
+        return CycleParameters(owned=owned, disallowed_regimes=disallowed)
+
+    # --- (C) layer:L1a - drive the 24h EMA reversal exit on each Closed24H ----------------------
+    def _drive_decision_reversal(self, symbol: str, cache) -> None:
+        """TB00790: drive wm.on_htf_ohlc_close with the 24h EMA(fast)/EMA(slow) so the EC-L1A-001
+        reversal fires on the 24h EMA bearish cross for an open LONG (a no-op when no position is
+        open). REPLACES the retired 1H EMA20/50 reversal drive (the 1H HtfCache stays maintained for
+        gate:G4 only). detect_htf_regime_reversal fires for a LONG when ema_fast < ema_slow."""
+        bid, ask = self._bbo(symbol)
+        self._wm.on_htf_ohlc_close(
+            symbol, cache.ema_fast_24h, cache.ema_slow_24h, bid=bid, ask=ask
+        )
 
     # --- the Htf24hGap self-heal: refetch the 1440 series from REST and re-seed the decision cache --
     async def _heal_decision(self, symbol: str, day_begin: int) -> None:
@@ -379,6 +482,11 @@ class LiveSweepDriver:
             )
             warmup.htf = htf
             self._stepped60[symbol] = closed.interval_begin
+        # TB00790: the legacy 1H EMA20/50 reversal drive is RETIRED when the 24h-decision exit owns
+        # layer:L1a (the 24h EMA12/26 bearish cross drives it from _advance_decision instead). The
+        # 1H HtfCache advance ABOVE still runs - gate:G4 HTF confirmation reads close_1h + ema20_1h.
+        if self._decision_entry:
+            return
         bid, ask = self._bbo(symbol)
         # EC-L1A-001 1H reversal: drive the Layer-1a check with the current 1H EMA(20)/EMA(50).
         self._wm.on_htf_ohlc_close(symbol, htf.ema20_1h, htf.ema50_1h, bid=bid, ask=ask)

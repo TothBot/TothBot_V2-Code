@@ -93,12 +93,21 @@ class PaperExitSignal:
 
 
 def detect_paper_exit(
-    position: Position, bid: object | None, ask: object | None
+    position: Position, bid: object | None, ask: object | None,
+    *, mae_mult: object | None = None,
 ) -> PaperExitSignal | None:
     """Evaluate one open position against one ticker bbo tick (ar:AR-048). Returns the
     fired exit signal, or None if neither the L2 MAE threshold nor the L3 emergSL touch
     is met. PURE - no mutation, no events; the caller (WSManager) acts on the signal and
-    routes the close through mod:Exit_Controller."""
+    routes the close through mod:Exit_Controller.
+
+    `mae_mult` overrides the L2 stop multiple (default: the registry mae_mult seed). The
+    TB00790 validated long-only 24h-decision path passes param:decision_atr_stop_mult (the
+    WIDE 2.5x stop) - so the live organism's L2 stop = atr_14_entry(daily) x 2.5, while the
+    legacy 5m path + unit tests keep the 1.5x mae_mult default. The atr_14_entry snapshot is
+    itself the DAILY decision-bar ATR for a 24h-decision entry (stamped at entry), so the ONE
+    shared 1R basis holds (gate:G8 net_loss + this L2 + the close actual_rr)."""
+    mae_m = _MAE_MULT if mae_mult is None else _dec(mae_mult)
     entry = position.avg_entry_price
     is_long = position.side is PositionSide.LONG
 
@@ -112,7 +121,7 @@ def detect_paper_exit(
     atr = position.atr_14_entry
     if atr is not None and entry != 0:
         mae = (entry - px) if is_long else (px - entry)
-        if mae >= _dec(atr) * _MAE_MULT:
+        if mae >= _dec(atr) * mae_m:
             return PaperExitSignal(
                 symbol=position.symbol,
                 exit_reason="MAE_THRESHOLD_BREACH",

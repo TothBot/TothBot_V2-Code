@@ -52,6 +52,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from decimal import Decimal
 
+from ..exchange.daily_decision import DECISION_EMA_FAST, DECISION_EMA_SLOW
 from ..exchange.position_mirror import Position, PositionSide
 from ..exchange.regime_exit import (
     detect_daily_regime_downgrade,
@@ -59,6 +60,7 @@ from ..exchange.regime_exit import (
 )
 from ..pipeline.sweep import permitted_sides
 from ..regime.engine import RegimeClassification, RegimeComputeError, compute_regime
+from ..regime.indicators import ema
 from ..regime.taxonomy import Regime
 from .seed_estimators import quantile
 
@@ -87,6 +89,29 @@ def rolling_classifications(
     return out
 
 
+def rolling_ema(closes: Sequence[Decimal], period: int) -> list[Decimal | None]:
+    """ema_at[j] = the EMA(period) over closes[:j+1] (None before the SMA seed at index period-1),
+    computed in ONE O(n) pass (seed = SMA of the first `period`, then the standard EMA step matching
+    live_driver._step_htf / DailyDecisionCache.advance). TB00790: the replay reads ema_fast/ema_slow
+    at each bar so the run-to-reversal exit is the 24h EMA(decision_ema_fast)/EMA(decision_ema_slow)
+    bearish cross - the SAME L1a reversal the live exit now fires on (was the daily EMA20/50)."""
+    out: list[Decimal | None] = []
+    if period <= 0:
+        return [None] * len(closes)
+    alpha = Decimal(2) / (period + 1)
+    prev: Decimal | None = None
+    for j, close in enumerate(closes):
+        if j + 1 < period:
+            out.append(None)
+        elif j + 1 == period:
+            prev = ema(list(closes[: j + 1]), period)  # SMA-seeded EMA over the first `period`
+            out.append(prev)
+        else:
+            prev = (close - prev) * alpha + prev
+            out.append(prev)
+    return out
+
+
 def _excursion(side: PositionSide, entry: Decimal, exit_price: Decimal) -> Decimal:
     """The direction-symmetric realized excursion as a fraction of entry (DEC-124): LONG (exit -
     entry)/entry, SHORT (entry - exit)/entry. Sign-preserving (a losing reversal is negative)."""
@@ -106,13 +131,20 @@ def replay_excursions(
     `bars` expose .close (DailyBar / RestOhlcBar). PURE - reads only the precomputed classifications.
     """
     classes = rolling_classifications(symbol, bars)
+    # TB00790: the run-to-reversal exit is now the 24h EMA(decision_ema_fast)/EMA(decision_ema_slow)
+    # bearish cross (the live L1a), so the replay walks each entry to the FIRST bar where that cross
+    # fires (OR the daily downgrade, still a live L1a). Rolling EMAs over the daily decision closes,
+    # one O(n) pass each (the same series the live DailyDecisionCache seeds + advances on).
+    closes = [_dec(b.close) for b in bars]
+    ema_fast = rolling_ema(closes, DECISION_EMA_FAST)
+    ema_slow = rolling_ema(closes, DECISION_EMA_SLOW)
     by_regime: dict[Regime, list[Decimal]] = {}
     n = len(bars)
     for i in range(n - 1):
         cls_i = classes[i]
         if cls_i is None:
             continue
-        entry = _dec(bars[i].close)
+        entry = closes[i]
         if entry == 0:
             continue
         for side in permitted_sides(cls_i.regime):
@@ -121,9 +153,13 @@ def replay_excursions(
                 cls_j = classes[j]
                 if cls_j is None:
                     continue
-                fired = detect_daily_regime_downgrade(
-                    position, cls_j
-                ) or detect_htf_regime_reversal(position, cls_j.ema20, cls_j.ema50)
+                ef, es = ema_fast[j], ema_slow[j]
+                htf_reversed = (
+                    ef is not None
+                    and es is not None
+                    and detect_htf_regime_reversal(position, ef, es) is not None
+                )
+                fired = detect_daily_regime_downgrade(position, cls_j) is not None or htf_reversed
                 if fired:
                     excursion = _excursion(side, entry, _dec(bars[j].close))
                     by_regime.setdefault(cls_i.regime, []).append(excursion)

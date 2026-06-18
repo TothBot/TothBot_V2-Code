@@ -108,8 +108,21 @@ REGISTRY: tuple[Param, ...] = (
     ),
 
     # -- CIATS: exit controller ----------------------------------------
-    Param("mae_mult", 1.5, _C, _M, "x ATR(14)", "Layer 2 MAE threshold breach multiplier."),
+    Param("mae_mult", 1.5, _C, _M, "x ATR(14)", "Layer 2 MAE threshold breach multiplier (legacy 5m path + unit tests; the live 24h-decision long-only path uses decision_atr_stop_mult)."),
     Param("emergency_sl_mult", 3.0, _C, _M, "x ATR(14)", "Layer 3 Kraken resting emergency stop (off-book, failure only)."),
+
+    # -- CIATS: 24h DECISION (the validated long-only strategy, TB00786/787/788/790) --
+    # The derive seeds (TB00787/788, diagram-sited ar:AR-045): mod:OhlcAggregator folds 24
+    # contiguous 1H closes into one 24h DECISION bar; the per-pair DailyDecisionCache holds
+    # EMA(fast)/EMA(slow)/ATR on that daily series. The long-only ENTRY = EMA(fast) bullish
+    # cross above EMA(slow) on a Closed24H; the EXIT = the bearish-cross reversal (layer:L1a)
+    # OR the wide decision_atr_stop_mult x daily-ATR stop (layer:L2). Only the net 1:1.5 R:R
+    # floor stays hardcoded (rule:Sacred_R_R_1_to_1_5).
+    Param("decision_bar_interval_min", 1440, _C, _U, "min", "The 24h DECISION-bar cadence (the validated long-only strategy decides on the daily candle)."),
+    Param("decision_ema_fast", 12, _C, _U, "bars", "Fast EMA on the 24h decision closes; the bullish cross above decision_ema_slow is the long-only entry trigger, the bearish cross the layer:L1a reversal exit."),
+    Param("decision_ema_slow", 26, _C, _U, "bars", "Slow EMA on the 24h decision closes (the entry/exit cross partner of decision_ema_fast)."),
+    Param("decision_atr_period", 14, _C, _U, "bars", "ATR period on the 24h decision bars - the wide-stop volatility basis."),
+    Param("decision_atr_stop_mult", 2.5, _C, _M, "x ATR(14)-daily", "The WIDE Layer-2 volatility stop multiple on the DAILY decision-bar ATR(14), TB00790 - REPLACES the tight 1.5x mae_mult for the 24h-decision long-only path (stop-width sweet spot ~2-2.5x ATR, TB00784/786). The ONE shared 1R basis: gate:G8 net_loss + layer:L2 stop + the close actual_rr; L3 emergSL at emergency_sl_mult x the same daily ATR stays outermost. NEVER the sacred R:R floor."),
     Param(
         "cancel_timeout_window", 5.0, _C, _M, "s",
         "I-6 cancel-timeout fallback: how long mod:Exit_Controller waits for a "

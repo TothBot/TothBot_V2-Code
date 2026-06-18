@@ -563,6 +563,12 @@ class WSManager:
             side: ExitController(on_event=on_event, clock=self._now_utc)
             for side in (PositionSide.LONG, PositionSide.SHORT)
         }
+        # TB00790: the layer:L2 stop multiple the ticker-bbo exit detector uses. Defaults to the
+        # legacy param:mae_mult seed (1.5x - the 5m path + unit tests are byte-unchanged); the
+        # operational assembly rebinds it to param:decision_atr_stop_mult (the WIDE 2.5x daily-ATR
+        # stop) via set_decision_stop_mult once the 24h-decision long-only routing is wired, so the
+        # live L2 stop, the gate:G8 net_loss, and the close actual_rr share the ONE 1R basis.
+        self._decision_stop_mult: Decimal = _dec(registry.value("mae_mult"))
 
         # Outbound order-dispatch mode gate (contract:WSManager_Dispatch_Seam).
         self.seam = DispatchSeam(
@@ -601,6 +607,18 @@ class WSManager:
         in BOTH modes - paper routes the ticker-detected close through on_paper_close, live routes
         the executions-confirmed close through on_live_close (sec 12.5 LIVE FLOW)."""
         return self.exit_controllers[side]
+
+    def set_decision_stop_mult(self, mult: object) -> None:
+        """TB00790: rebind the WIDE layer:L2 stop multiple for the validated long-only 24h-decision
+        path (param:decision_atr_stop_mult, ~2.5x). Sets BOTH (a) the ticker-bbo L2 detector multiple
+        (detect_paper_exit / the live L2 enqueue) and (b) each per-module Exit_Controller's actual_rr
+        multiple (set_mae_mult), so the live L2 stop = atr_14_entry(daily) x mult, the gate:G8 net_loss
+        is sized on the same mult, and the close actual_rr divides by the same 1R - ONE shared basis.
+        The operational assembly calls this (mirroring set_ciats_exit_sinks); a unit/test wm keeps the
+        1.5x mae_mult default. NEVER touches the sacred 1:1.5 R:R floor - only the net_loss basis."""
+        self._decision_stop_mult = _dec(mult)
+        for controller in self.exit_controllers.values():
+            controller.set_mae_mult(mult)
 
     def set_ciats_exit_sinks(self, sinks: Mapping[PositionSide, EventSink]) -> None:
         """Wire each side's CIATS learning sink as that side's Exit_Controller event sink, so a
@@ -809,7 +827,7 @@ class WSManager:
         TothBot-dispatched live exit: the layer:L3 off-book emergSL is Kraken-side (it fires
         autonomously on the matching engine; TothBot never dispatches it). A fired L2 enqueues an
         intent (best_quote = the realizable bbo: bid for a long, ask for a short, for the C-1 retry)."""
-        signal = detect_paper_exit(position, bid, ask)
+        signal = detect_paper_exit(position, bid, ask, mae_mult=self._decision_stop_mult)
         if signal is None or signal.layer != "L2_MAE":
             return
         quote = bid if position.side is PositionSide.LONG else ask
@@ -1440,7 +1458,9 @@ class WSManager:
             # FIRST (incl. the breaching tick) so the running max captures the tick that fires the exit.
             self._mae_tracker.mark(position, entry.get("bid"), entry.get("ask"))
             if self.is_paper:
-                signal = detect_paper_exit(position, entry.get("bid"), entry.get("ask"))
+                signal = detect_paper_exit(
+                    position, entry.get("bid"), entry.get("ask"), mae_mult=self._decision_stop_mult
+                )
                 if signal is not None:
                     self._drive_paper_exit(position, signal)
             else:

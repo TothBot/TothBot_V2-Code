@@ -20,12 +20,25 @@ from tothbot.ciats.expected_reward import (
     compute_expected_reward,
     replay_excursions,
     rolling_classifications,
+    rolling_ema,
 )
 from tothbot.exchange.position_mirror import PositionSide
 from tothbot.pipeline.providers import make_expected_reward_provider
 from tothbot.pipeline.sweep import ProviderNotReady
 from tothbot.regime.engine import DailyBar
+from tothbot.regime.indicators import ema
 from tothbot.regime.taxonomy import Regime
+
+
+def test_rolling_ema_is_none_before_the_seed_and_matches_ema_after_tb00790():
+    # TB00790: the replay's 24h EMA(decision_ema_fast)/EMA(decision_ema_slow) reversal reads a rolling
+    # EMA at each bar. rolling_ema[j] = EMA(period) over closes[:j+1]: None before the SMA seed at
+    # index period-1, then identical to the one-shot ema() (the same SMA-seeded recurrence).
+    closes = [Decimal(x) for x in (10, 11, 12, 13, 14, 15)]
+    r = rolling_ema(closes, 3)
+    assert r[0] is None and r[1] is None              # too few closes to seed EMA(3)
+    assert r[2] == ema(closes[:3], 3)                 # the SMA seed at index period-1
+    assert r[-1] == ema(closes, 3)                    # the full-series EMA at the last bar
 
 
 def _bar(prev_close, close):

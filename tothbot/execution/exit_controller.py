@@ -172,6 +172,15 @@ class ExitController:
         self._clock = clock
         self._mae_mult = _dec(mae_mult) if mae_mult is not None else _MAE_MULT
 
+    def set_mae_mult(self, mae_mult: object) -> None:
+        """Rebind the L2 risk-leg / actual_rr multiplier (TB00790). The operational assembly calls
+        this via wm.set_decision_stop_mult to make the LIVE organism's close-time actual_rr use the
+        WIDE param:decision_atr_stop_mult x position.atr_14_entry(daily) basis - the SAME 1R the
+        gate:G8 net_loss + the layer:L2 stop use, so the realized actual_rr is directly comparable to
+        the entry-gate expected_rr on the ONE shared basis. Default-constructed controllers (unit
+        tests) keep the 1.5x mae_mult seed; only the assembled organism is rebound to 2.5x."""
+        self._mae_mult = _dec(mae_mult)
+
     def set_event_sink(self, on_event: EventSink | None) -> None:
         """Rebind the close-path event sink. The operational assembly calls this (via
         wm.set_ciats_exit_sinks) to make THIS module's TRADE_CLOSE emit THROUGH the side's

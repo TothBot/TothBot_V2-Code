@@ -161,6 +161,45 @@ def live_sss_evaluator(indicators):
     return _evaluate
 
 
+@dataclass(frozen=True)
+class DecisionSignal:
+    """A PASSING signal verdict for the TB00790 validated long-only 24h-decision entry: the 24h
+    EMA(decision_ema_fast)/EMA(decision_ema_slow) BULLISH CROSS IS the signal, so the SSS evaluator
+    is short-circuited to passed=True. Shaped like an SssVerdict for run_pipeline (it reads .passed +
+    .signal_params): signal_params carries the 24h EMA levels as the contract:TRADE_CLOSE field-19
+    per-trade level series (the entry the trade was taken under)."""
+
+    ema_fast_24h: Decimal
+    ema_slow_24h: Decimal
+    side: PositionSide
+    passed: bool = True
+
+    @property
+    def signal_params(self) -> dict:
+        return {
+            "decision_ema_fast_24h": self.ema_fast_24h,
+            "decision_ema_slow_24h": self.ema_slow_24h,
+            "trigger": "DECISION_24H_BULLISH_CROSS",
+            "sss_pass": True,
+            "side": self.side.value,
+        }
+
+
+def decision_sss_evaluator(ema_fast_24h, ema_slow_24h, side: PositionSide):
+    """An sss_evaluator (the evaluate_sss-shaped injection point) that PASSES unconditionally for the
+    24h-decision entry - the EMA12/26 bullish cross detected upstream (live_driver) IS the signal, so
+    the 5m three-factor SSS is bypassed for this candidate. Returns a DecisionSignal carrying the 24h
+    EMA levels. gate:G1-G7 still prefilter the candidate; only the SSS stage is short-circuited."""
+    verdict = DecisionSignal(
+        ema_fast_24h=_dec(ema_fast_24h), ema_slow_24h=_dec(ema_slow_24h), side=side
+    )
+
+    def _evaluate(symbol, closes, volumes, *, side: SignalSide, **_ignored):
+        return verdict
+
+    return _evaluate
+
+
 def assemble_candidate(
     symbol: str,
     side: PositionSide,
@@ -171,16 +210,24 @@ def assemble_candidate(
     providers: LiveProviders,
     wm,
     now_monotonic: Callable[[], float] = time.monotonic,
+    atr_override: object | None = None,
 ) -> "tuple[PipelineInputs, ExecutionContext]":
     """Build the (PipelineInputs, ExecutionContext) for one (pair, side) candidate from the live
-    caches + the injected providers. `candle` is the just-closed 5m CommittedCandle (its close is
-    the ar:AR-069 entry_ref_price); `warmup` is the pair's PairWarmup (LiveIndicators + HtfCache);
-    `regime_cache` holds the daily classification (present for a READY pair)."""
+    caches + the injected providers. `candle` is the just-closed CommittedCandle (its close is the
+    ar:AR-069 entry_ref_price); `warmup` is the pair's PairWarmup (LiveIndicators + HtfCache);
+    `regime_cache` holds the daily classification (present for a READY pair).
+
+    `atr_override` (TB00790): when given, it REPLACES the live 5m indicators.atr_14 for BOTH the
+    gate:G8 sizing (inputs.atr_14) AND the entry-time snapshot (ctx.atr_14_entry). The validated
+    long-only 24h-decision entry passes the DAILY decision-bar ATR(14) here, so the position is
+    stamped with the daily ATR and the whole exit/RR math re-anchors onto the ONE 1R basis (1R =
+    param:decision_atr_stop_mult x ATR(14)-daily). None -> the legacy 5m ATR (the 5m path)."""
     classification = regime_cache.get(symbol)
     regime = classification.regime
     htf = warmup.htf
     indicators = warmup.indicators
-    entry_ref_price = candle.close  # ar:AR-069 base reference = the triggering 5m close
+    atr_14 = indicators.atr_14 if atr_override is None else atr_override  # TB00790 daily-ATR override
+    entry_ref_price = candle.close  # ar:AR-069 base reference = the triggering candle close
 
     base = providers.base_per_trade_size(symbol, side, entry_ref_price)
     sized_usd = size_regime(symbol, side, regime, base).sized_usd  # gate:G6 (single source)
@@ -222,7 +269,7 @@ def assemble_candidate(
         total_committed_usd=total_committed_usd(wm, side),
         semaphore_locked=providers.semaphore_locked(side),
         entry_fill_price=entry_ref_price,
-        atr_14=indicators.atr_14,                          # ar:AR-016 live 5m ATR(14)
+        atr_14=atr_14,                                     # ar:AR-016 live 5m ATR(14) (TB00790: daily-ATR override for the 24h entry)
         expected_reward=providers.expected_reward(symbol, regime),
     )
     # market_regime = the ar:AR-074 BTC/USD anchor regime at entry (the daily scheduler computes it
@@ -233,7 +280,7 @@ def assemble_candidate(
         best_bid=best_bid,
         best_ask=best_ask,
         mpp_abs_cap_pct=providers.mpp_abs_cap_pct(symbol, side),
-        atr_14_entry=indicators.atr_14,
+        atr_14_entry=atr_14,                               # TB00790: the daily decision-bar ATR stamps the position
         regime_at_entry=regime.value,
         cl_ord_id=providers.new_cl_ord_id(),
         deadline=providers.new_deadline(),

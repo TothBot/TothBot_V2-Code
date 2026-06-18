@@ -108,6 +108,20 @@ def test_long_win_net_pnl_and_trade_close_record():
     assert any(isinstance(e, TradeClose) for e in events)
 
 
+def test_set_mae_mult_widens_the_actual_rr_risk_basis_tb00790():
+    # TB00790: set_mae_mult rebinds the actual_rr risk basis to the WIDE param:decision_atr_stop_mult
+    # (2.5x) so the realized actual_rr divides by the SAME 1R the gate:G8 net_loss + the layer:L2 stop
+    # use (the ONE shared basis). The sacred 1:1.5 floor is untouched - only the net_loss BASIS moves.
+    events = []
+    wm = _FakeWM(_pos(), fees_entry=Decimal("7.8"))
+    ec = _ec(events)
+    ec.set_mae_mult("2.5")
+    rec = ec.on_paper_close("BTC/USD", "66000", ExitReason.HTF_REGIME_REVERSAL, "8.58", wm)
+    # net_loss(frac) now uses 2.5x: stop = 2000*2.5/60000; fees = 2*0.0026.
+    _nlf = Decimal("2000") * Decimal("2.5") / Decimal("60000") + Decimal("0.0026") + Decimal("0.0026")
+    assert rec.actual_rr == Decimal("283.62") / (_nlf * Decimal("60000") * Decimal("0.05"))
+
+
 def test_long_win_drives_close_clear_scwin_and_semaphore():
     wm = _FakeWM(_pos(), fees_entry=Decimal("7.8"))
     _ec([]).on_paper_close("BTC/USD", "66000", ExitReason.MAE_THRESHOLD_BREACH, "8.58", wm)

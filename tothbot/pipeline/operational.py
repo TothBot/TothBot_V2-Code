@@ -62,6 +62,7 @@ from ..ciats.conductor import ApprovalInbox, CiatsConductor
 from ..ciats.parameter_store import ParameterStore
 from ..ciats.pool import CiatsPool
 from ..ciats.regime_library import RegimeLibrary
+from ..config import registry
 from ..config.settings import Mode
 from ..exchange.assembler import DataLayer, DataLayerAssembler
 from ..exchange.bbo_cache import BboCache
@@ -422,6 +423,14 @@ async def assemble_operational(
     set_exit_sinks = getattr(wm, "set_ciats_exit_sinks", None)
     if callable(set_exit_sinks):
         set_exit_sinks(ciats_sinks)
+    # TB00790: rebind the WIDE layer:L2 stop multiple (param:decision_atr_stop_mult, ~2.5x) for the
+    # validated long-only 24h-decision path - both the ticker-bbo L2 detector AND each per-module
+    # Exit_Controller's actual_rr basis - so the live L2 stop, the gate:G8 net_loss, and the close
+    # actual_rr share the ONE 1R basis (1R = decision_atr_stop_mult x ATR(14)-daily). Mirrors the
+    # set_ciats_exit_sinks tie-in; a wm without the surface is left untouched.
+    set_decision_mult = getattr(wm, "set_decision_stop_mult", None)
+    if callable(set_decision_mult):
+        set_decision_mult(registry.value("decision_atr_stop_mult"))
     providers = make_live_providers(
         instrument_cache=instrument_cache,
         bbo_cache=bbo_cache,
@@ -476,6 +485,12 @@ async def assemble_operational(
         # folds each Closed1H one timeframe up and advances the cache on each Closed24H (the heal reuses
         # htf_rest_client for the GetOHLCData(1440) re-seed).
         decision_store=decision_store,
+        # TB00790: route the validated LONG-ONLY entry/exit through the 24h decision - on each
+        # Closed24H the EMA12/26 bullish cross runs the gate:G1-G8 LONG entry (the 5m sweep entry is
+        # disabled) and the 24h EMA reversal drives layer:L1a (the 1H reversal drive is retired). The
+        # WIDE layer:L2 stop multiple gate:G8 sizes on (param:decision_atr_stop_mult).
+        decision_entry=True,
+        decision_stop_mult=registry.value("decision_atr_stop_mult"),
     )
 
     # 6. Build + run the public data layer (handlers bound, the SHARED machines/coordinator injected).

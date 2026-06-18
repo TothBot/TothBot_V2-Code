@@ -44,6 +44,15 @@ def test_long_no_breach_below_threshold():
     assert detect_paper_exit(_pos(), bid="58000", ask="58100") is None
 
 
+def test_mae_mult_override_widens_the_l2_stop_tb00790():
+    # TB00790: the WIDE param:decision_atr_stop_mult (2.5x) override. threshold = 2000*2.5 = 5000.
+    # bid 57000 -> mae 3000 < 5000 -> NO breach (the tight 1.5x default WOULD have fired here).
+    assert detect_paper_exit(_pos(), bid="57000", ask="57100", mae_mult="2.5") is None
+    # bid 55000 -> mae 5000 >= 5000 -> breach on the wide stop.
+    sig = detect_paper_exit(_pos(), bid="55000", ask="55100", mae_mult="2.5")
+    assert sig is not None and sig.layer == "L2_MAE" and sig.exit_price == Decimal("55000")
+
+
 def test_long_uses_bid_not_ask_ar048():
     # ask is deep adverse but the long realizable price is the bid (no breach on bid).
     assert detect_paper_exit(_pos(), bid="58000", ask="40000") is None

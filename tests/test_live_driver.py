@@ -571,3 +571,97 @@ def test_derived_24h_from_the_5m_stream_advances_the_daily_cache_end_to_end():
     # 24h close = close of the [23:00,00:00) hour = close of its 23:55 5m slot = candle k=287.
     assert cache.close_24h == Decimal(200000 + 287)
     assert cache.close_24h != seed_close
+
+
+# --------------------------------------------------------------------------- TB00790 routing
+def _declining_bars(n, symbol="BTC/USD", start=60030):
+    """n daily bars (newest-last) with a gently FALLING close so EMA(12) seeds BELOW EMA(26) - the
+    seeded cache is bearish (NOT bullish), the precondition for a bullish-cross entry on the advance.
+    Tight high/low so the seed ATR is small relative to the ~60k price (gate:G8 clears the floor)."""
+    out = []
+    for i in range(n):
+        close = Decimal(start - i)
+        out.append(CommittedCandle(symbol=symbol, interval_begin=i * DAY, open=close + 1,
+                                   high=close + 1, low=close - 1, close=close, volume=Decimal(1)))
+    return out
+
+
+def _bearish_store(symbol="BTC/USD", n=30):
+    store = DailyDecisionStore()
+    store.seed_from_bars(symbol, _declining_bars(n, symbol))
+    return store
+
+
+def _providers_er(er="0.3"):
+    """LiveProviders with a high expected_reward so the 24h-decision entry robustly clears the sacred
+    1:1.5 floor (the daily-ATR override + decision_atr_stop_mult net_loss is small vs this reward)."""
+    p = _providers()
+    return LiveProviders(
+        instrument=p.instrument, bbo=p.bbo, expected_reward=lambda s, r: Decimal(er),
+        mpp_abs_cap_pct=p.mpp_abs_cap_pct, base_per_trade_size=p.base_per_trade_size,
+        ws_state=p.ws_state, new_cl_ord_id=p.new_cl_ord_id, new_deadline=p.new_deadline,
+    )
+
+
+def _decision_driver(pw, wm, store, **over):
+    return LiveSweepDriver(
+        warmups={"BTC/USD": pw}, regime_cache=_cache(), providers=_providers_er(), wm=wm,
+        logger=_FakeLogger(), decision_store=store, decision_entry=True, **over,
+    )
+
+
+def test_decision_entry_dispatches_a_long_on_the_24h_bullish_cross():
+    # (B) TB00790: a 24h EMA12/26 BULLISH CROSS (bearish seed -> a jump-up Closed24H flips it bullish)
+    # runs the gate:G1-G8 entry for the LONG side and dispatches into the wallet. The daily-ATR override
+    # + the high expected_reward clear the sacred 1:1.5 floor.
+    pw, wm, store = _warm(), _FakeWM(), _bearish_store()
+    assert store.get("BTC/USD").bullish is False        # the seeded cache is bearish (cross precondition)
+    driver = _decision_driver(pw, wm, store)
+    day = (max(pw.last_interval_begin, pw.last_interval_begin_60) // DAY + 2) * DAY
+    # 24 contiguous 1H closes RISING 69000 -> ~70000: the folded 24h candle has a strong bullish body
+    # (open=first 1H open, close=last 1H close) so gate:G5 passes, and the jump up flips the cross.
+    for h in range(24):
+        asyncio.run(driver._advance_decision(_h1("BTC/USD", day + h * 3600, 69000 + h * 43)))
+    assert store.get("BTC/USD").bullish is True          # the cross fired (post-advance bullish)
+    assert wm.dispatched == [(PositionSide.LONG, "BTC/USD")]   # the LONG entry dispatched on the cross
+
+
+def test_decision_entry_no_cross_does_not_dispatch():
+    # No bullish cross (the seed is already bullish + stays bullish) -> NO entry. Long-only: short never.
+    pw, wm = _warm(), _FakeWM()
+    store = _seeded_store()                              # rising seed -> already bullish
+    assert store.get("BTC/USD").bullish is True
+    driver = _decision_driver(pw, wm, store)
+    day = (max(pw.last_interval_begin, pw.last_interval_begin_60) // DAY + 2) * DAY
+    for h in range(24):
+        asyncio.run(driver._advance_decision(_h1("BTC/USD", day + h * 3600, 5000 + h)))
+    assert wm.dispatched == []                           # already bullish -> no cross -> no entry
+
+
+def test_decision_reversal_drives_on_htf_ohlc_close_with_the_24h_emas():
+    # (C) TB00790: every Closed24H drives wm.on_htf_ohlc_close with the 24h EMA(fast)/EMA(slow) so the
+    # EC-L1A-001 reversal fires on the 24h bearish cross for an open LONG (replaces the 1H EMA20/50 drive).
+    pw, wm, store = _warm(), _FakeWM(), _seeded_store()
+    driver = _decision_driver(pw, wm, store)
+    day = (max(pw.last_interval_begin, pw.last_interval_begin_60) // DAY + 2) * DAY
+    for h in range(24):
+        asyncio.run(driver._advance_decision(_h1("BTC/USD", day + h * 3600, 5000 + h)))
+    cache = store.get("BTC/USD")
+    assert wm.htf_calls                                  # the 24h reversal was driven
+    sym, ema_s, ema_l, bid, ask = wm.htf_calls[-1]
+    assert sym == "BTC/USD" and ema_s == cache.ema_fast_24h and ema_l == cache.ema_slow_24h
+
+
+def test_1h_step_retires_the_1h_reversal_drive_under_decision_entry():
+    # (C) TB00790: under decision_entry the 1H close STILL advances the HtfCache EMAs (gate:G4) but no
+    # longer drives wm.on_htf_ohlc_close (the 24h decision owns layer:L1a now).
+    pw, wm, store = _warm(), _FakeWM(), _seeded_store()
+    driver = _decision_driver(pw, wm, store)
+    ema20_before = pw.htf.ema20_1h
+    seed60 = pw.last_interval_begin_60
+    for k in (1, 2):
+        driver.on_ohlc_60m({"data": [{"symbol": "BTC/USD", "interval_begin": seed60 + 3600 * k,
+                                      "open": "150", "high": "151", "low": "149",
+                                      "close": "150", "volume": "5"}]})
+    assert pw.htf.ema20_1h != ema20_before               # the HtfCache was maintained (gate:G4)
+    assert wm.htf_calls == []                            # but the 1H reversal drive is retired

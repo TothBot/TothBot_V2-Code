@@ -209,34 +209,39 @@ def test_frame_stream_populates_the_snapshot_caches():
     )
 
 
-def test_5m_close_runs_a_full_decide_size_dispatch_tick():
+def test_5m_close_does_not_dispatch_an_entry_decision_entry_owns_entries():
+    # TB00790: the assembled organism routes entries through the 24h DECISION (decision_entry=True),
+    # so a 5m close NO LONGER dispatches an entry (the 5m sweep entry is DISABLED - the validated
+    # long-only ENTRY is the 24h EMA12/26 bullish cross). The 5m close still STEPS the LiveIndicators
+    # (the clock + state maintenance) and drives the ticker-bbo exits; only the entry trigger moved.
     system, wm, logger = _assemble()
     pw = system.warmups["BTC/USD"]
-    # A 5m close (the contract:OHLC_5m_System_Clock tick) drives the whole pipeline on the warmed pair.
-    frame = {"data": [{"symbol": "BTC/USD", "interval_begin": pw.last_interval_begin + 300,
-                       "open": "264", "high": "266", "low": "262", "close": "264", "volume": "5000"}]}
-    results = asyncio.run(system.driver.on_ohlc_5m(frame))
-    assert len(results) == 1                                   # TRENDING_POS -> long only
-    assert results[0].outcome.accepted is True
-    assert results[0].outcome.reason == "G8_SIZED"
-    assert results[0].dispatched is True and results[0].filled is True
-    # The entry dispatched into the LONG module wallet; the tick logged to mod:Logger Stream-1.
-    assert wm.dispatched == [(PositionSide.LONG, "BTC/USD")]
-    assert logger.operational  # the pipeline outcome reached Stream-1
+    # Two 5m rolls: the first re-emits the warm-up seed candle (AR-016 guard - no entry under the old
+    # path's re-emit either), the second is a genuinely-new close that the OLD architecture would have
+    # swept into a dispatch. Under the 24h-decision routing NEITHER dispatches an entry.
+    for k in (1, 2):
+        frame = {"data": [{"symbol": "BTC/USD", "interval_begin": pw.last_interval_begin + 300 * k,
+                           "open": "264", "high": "266", "low": "262", "close": "264", "volume": "5000"}]}
+        results = asyncio.run(system.driver.on_ohlc_5m(frame))
+        assert results == []                                   # the 5m sweep entry is disabled
+    assert wm.dispatched == []                                 # no entry dispatched on any 5m close
 
 
-def test_1h_close_drives_htf_maintenance():
+def test_1h_close_maintains_htf_cache_without_the_retired_1h_reversal_drive():
+    # TB00790: the 1H close still ADVANCES the HtfCache EMA(20)/EMA(50) (gate:G4 HTF confirmation reads
+    # them), but the legacy 1H EMA20/50 reversal drive is RETIRED - the 24h EMA12/26 bearish cross owns
+    # layer:L1a now, so wm.on_htf_ohlc_close is NOT driven from the 1H path.
     system, wm, _logger = _assemble()
     pw = system.warmups["BTC/USD"]
     seed60 = pw.last_interval_begin_60
+    ema20_before = pw.htf.ema20_1h
     # Two 1H rolls: the first fires committed[-1] (no EMA step), the second steps the 1H EMAs (AR-044).
     for k in (1, 2):
         system.driver.on_ohlc_60m({"data": [{"symbol": "BTC/USD", "interval_begin": seed60 + 3600 * k,
                                               "open": "150", "high": "151", "low": "149",
                                               "close": "150", "volume": "5"}]})
-    # EC-L1A-001: wm.on_htf_ohlc_close was driven with the live bbo from the ticker frame.
-    assert wm.htf_calls
-    assert wm.htf_calls[-1] == ("BTC/USD", Decimal("176"), Decimal("177"))
+    assert pw.htf.ema20_1h != ema20_before                     # the HtfCache EMA was maintained (gate:G4)
+    assert wm.htf_calls == []                                  # the 1H reversal drive is retired (24h owns L1a)
 
 
 def test_trade_close_closes_the_ciats_learning_loop():
@@ -293,9 +298,11 @@ def _open_real_long(wm, *, atr="2000", emergsl="54000"):
 
 
 def _adverse_ticker():
-    # bid 57000 -> long MAE 3000 >= atr 2000 * mae_mult 1.5 = 3000 -> L2 threshold breach at the bid.
+    # TB00790: the assembled organism's L2 stop is the WIDE param:decision_atr_stop_mult (2.5x). bid
+    # 55000 -> long MAE 5000 >= atr 2000 * 2.5 = 5000 -> L2 threshold breach at the bid (and 55000 >
+    # emergsl 54000, so L2 fires first, not the L3 backstop).
     return {"channel": "ticker", "type": "update",
-            "data": [{"symbol": "BTC/USD", "bid": "57000", "ask": "57100"}]}
+            "data": [{"symbol": "BTC/USD", "bid": "55000", "ask": "55100"}]}
 
 
 def test_running_exit_drives_the_trade_close_through_the_wired_sink():
