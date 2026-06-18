@@ -34,11 +34,15 @@ from tothbot.ciats.seed_estimators import MppCapStore
 from tothbot.config.settings import Mode
 from tothbot.exchange.channels import PublicChannel
 from tothbot.exchange.pacing import SubscribeTokenBucket
+from tothbot.exchange.candle_close import CommittedCandle
+from tothbot.exchange.daily_decision import DailyDecisionStore
 from tothbot.exchange.position_mirror import PositionSide
+from tothbot.exchange.warmup import WarmupOrchestrator
 from tothbot.exchange.ws_manager import WSManager
 from tothbot.execution.exit_controller import ExitReason, TradeClose
-from tothbot.pipeline.live_driver import make_ciats_sink
+from tothbot.pipeline.live_driver import LiveSweepDriver, make_ciats_sink
 from tothbot.pipeline.operational import assemble_operational
+from tothbot.pipeline.sweep import LiveProviders
 from tothbot.recorder.logger import Logger
 from tothbot.regime.taxonomy import Regime
 from tothbot.rest.client import OhlcResponse, RestOhlcBar
@@ -798,3 +802,156 @@ def test_running_position_reports_max_over_life_mae_not_the_benign_at_exit():
     assert rec.mae_pct_reached == Decimal("2900") / Decimal("60000")
     assert rec.mae_pct_reached > Decimal("0")                  # the at-exit reading would have been 0
     assert wm.mae_pct_high_for("BTC/USD") is None              # the tracker was cleared at close
+
+
+# ------------------------------------------------ TB00791 (F1): the validated long-only 24h-DECISION
+# strategy driven FULL LIFECYCLE over the ASSEMBLED REAL WSManager (decision_entry=True) - a crafted
+# 24h EMA12/26 BULLISH CROSS fires a REAL paper LONG (daily-ATR stamped), which then EXITS two ways
+# (the 24h bearish-cross reversal OR the wide 2.5x-daily-ATR L2 stop); the emitted TRADE_CLOSE carries
+# the ONE-basis actual_rr + the field-19 24h signal_params + the right exit_reason, learned by the LONG
+# conductor. The wm comes from _assemble_real_wm (modules + seam + exit controllers + per-side
+# conductors wired, set_decision_stop_mult(2.5) applied by the assembly); the cross is driven through a
+# clean-providers LiveSweepDriver (bbo ~60k matching the entry scale - the assembled organism's caches
+# are crafted for the regime classification, this driver owns the decision entry/exit seam under test).
+DAY_F1 = 86400
+
+
+class _NoSleepF1:
+    async def __call__(self, _seconds):
+        return None
+
+
+def _warm_f1(symbol="BTC/USD"):
+    return asyncio.run(WarmupOrchestrator(_FakeRest(), sleep=_NoSleepF1()).warm_pair(symbol))
+
+
+def _regime_cache_f1(regime=Regime.TRENDING_POS_NORMAL):
+    classification = SimpleNamespace(regime=regime, ema20=Decimal("105"), ema50=Decimal("100"))
+    return SimpleNamespace(get=lambda s: classification)
+
+
+def _providers_f1():
+    """Clean providers for the 24h-decision driver: a stable ~60k bbo (the long entry buys at the ask,
+    the reversal sells at the bid) + a high expected_reward so the daily-ATR-override candidate robustly
+    clears the sacred 1:1.5 floor (the WIDE 2.5x net_loss is small vs this reward)."""
+    return LiveProviders(
+        instrument=lambda s: ("online", True, "600000"),
+        bbo=lambda s: (Decimal("59990"), Decimal("60000")),
+        expected_reward=lambda s, r: Decimal("0.3"),
+        mpp_abs_cap_pct=lambda s, side: Decimal("0.01"),
+        base_per_trade_size=lambda s, side, ref: Decimal("50"),
+        ws_state=lambda s: "Subscribed",
+        new_cl_ord_id=lambda: "cl-f1",
+        new_deadline=lambda: "2026-06-15T07:30:00Z",
+    )
+
+
+def _declining_bars_f1(n=30, symbol="BTC/USD", start=60030):
+    """n daily bars (newest-last) gently FALLING so EMA(12) seeds BELOW EMA(26) - a BEARISH cache, the
+    precondition for a bullish-cross entry on the advance; tight high/low -> a small seed ATR."""
+    out = []
+    for i in range(n):
+        close = Decimal(start - i)
+        out.append(CommittedCandle(symbol=symbol, interval_begin=i * DAY_F1, open=close + 1,
+                                   high=close + 1, low=close - 1, close=close, volume=Decimal(1)))
+    return out
+
+
+def _h1_f1(symbol, begin, close):
+    """A folded 1H CommittedCandle - the input the second fold stage (fold_hour) folds into the 24h bar."""
+    c = Decimal(close)
+    return CommittedCandle(symbol=symbol, interval_begin=begin, open=c - 1, high=c + 2, low=c - 2,
+                           close=c, volume=Decimal(5))
+
+
+def _f1_driver(wm, logger):
+    """A decision_entry=True LiveSweepDriver over a fresh BEARISH-seeded DailyDecisionStore, pointed at
+    the assembled REAL wm. Returns (driver, store)."""
+    store = DailyDecisionStore()
+    store.seed_from_bars("BTC/USD", _declining_bars_f1())
+    driver = LiveSweepDriver(
+        warmups={"BTC/USD": _warm_f1()}, regime_cache=_regime_cache_f1(), providers=_providers_f1(),
+        wm=wm, logger=logger, decision_store=store, decision_entry=True,
+    )
+    return driver, store
+
+
+def _drive_bullish_cross(driver, *, day_index=200):
+    """Drive twenty-four contiguous RISING 1H closes (69000 -> ~70000): the second fold stage emits one
+    Closed24H whose strong bullish body flips the bearish seed -> the EMA12/26 bullish cross fires the
+    LONG entry. Returns the day epoch used."""
+    day = day_index * DAY_F1
+    for h in range(24):
+        asyncio.run(driver._advance_decision(_h1_f1("BTC/USD", day + h * 3600, 69000 + h * 43)))
+    return day
+
+
+def test_f1_24h_bullish_cross_opens_a_real_long_stamped_with_the_daily_atr():
+    # (B) the entry leg: the 24h EMA12/26 BULLISH CROSS opens a REAL paper LONG on the assembled wm,
+    # stamped with the DAILY decision-bar ATR (the ONE 1R basis), the L3 emergSL at 3x that daily ATR,
+    # and the field-19 24h signal_params (the DECISION_24H_BULLISH_CROSS trigger the close emits).
+    system, wm, logger = _assemble_real_wm()
+    driver, store = _f1_driver(wm, logger)
+    assert store.get("BTC/USD").bullish is False           # bearish seed (the cross precondition)
+    assert not wm.has_position("BTC/USD")
+    _drive_bullish_cross(driver)
+    assert store.get("BTC/USD").bullish is True            # the cross fired (post-advance bullish)
+    assert wm.has_position("BTC/USD")                      # a REAL paper LONG opened on the cross
+    pos = wm.position("BTC/USD")
+    assert pos.side is PositionSide.LONG                   # long-only (the short module is dormant)
+    daily_atr = store.get("BTC/USD").atr_14_24h
+    assert pos.atr_14_entry == daily_atr                  # stamped with the DAILY ATR (not the 5m ATR)
+    # the L3 emergSL sits at 3x the SAME daily ATR below entry (outermost, DEC-124 no-TP).
+    assert pos.emergsl_price == pos.avg_entry_price - Decimal("3") * daily_atr
+    assert pos.signal_params["trigger"] == "DECISION_24H_BULLISH_CROSS"
+    assert pos.signal_params["side"] == "long"
+
+
+def test_f1_lifecycle_entry_then_wide_2_5x_atr_l2_stop_close():
+    # (C) exit leg (b): the WIDE 2.5x-daily-ATR L2 stop. After the cross entry, an adverse ticker at
+    # 2.6x the daily ATR (past the 2.5x L2 threshold but INSIDE the 3x L3 emergSL) fires the L2 MAE
+    # breach; the emitted TRADE_CLOSE carries exit_reason MAE_THRESHOLD_BREACH, the ONE-basis actual_rr
+    # (net_PL / [decision_atr_stop_mult x daily-ATR risk]), and the field-19 24h signal_params - learned
+    # by the LONG conductor (the short loop is isolated).
+    system, wm, logger = _assemble_real_wm()
+    driver, store = _f1_driver(wm, logger)
+    assert system.conductors[PositionSide.LONG].trade_count == 0
+    _drive_bullish_cross(driver)
+    pos = wm.position("BTC/USD")
+    entry, atr = pos.avg_entry_price, Decimal(pos.atr_14_entry)
+    adverse_bid = entry - Decimal("2.6") * atr               # past 2.5x L2, inside 3x L3 -> L2 fires
+    assert adverse_bid > pos.emergsl_price                   # the L2 stop fires FIRST, not the L3 backstop
+    wm.handle_ticker({"channel": "ticker", "type": "update",
+                      "data": [{"symbol": "BTC/USD", "bid": str(adverse_bid), "ask": str(adverse_bid + 10)}]})
+    assert not wm.has_position("BTC/USD")                    # the wide L2 stop closed it
+    rec = logger.corpus_for("long")[-1]
+    assert rec.exit_reason is ExitReason.MAE_THRESHOLD_BREACH
+    assert rec.actual_rr is not None and rec.actual_rr < 0   # a stopped loss on the ONE 2.5x basis
+    assert rec.signal_params["trigger"] == "DECISION_24H_BULLISH_CROSS"   # field-19 24h entry levels
+    assert system.conductors[PositionSide.LONG].trade_count == 1          # the LONG conductor learned it
+    assert system.conductors[PositionSide.SHORT].trade_count == 0         # the short loop is isolated
+
+
+def test_f1_lifecycle_entry_then_24h_bearish_cross_reversal_close():
+    # (C) exit leg (a): the 24h bearish-cross REVERSAL (layer:L1a). After the cross entry, a falling day
+    # (twenty-four 1H closes crashing the 24h bar) flips the cache bearish -> the Closed24H branch drives
+    # wm.on_htf_ohlc_close with the 24h EMAs -> the EC-L1A-001 reversal closes the open LONG; the emitted
+    # TRADE_CLOSE carries exit_reason HTF_REGIME_REVERSAL, the ONE-basis actual_rr, and the field-19 24h
+    # signal_params, learned by the LONG conductor.
+    system, wm, logger = _assemble_real_wm()
+    driver, store = _f1_driver(wm, logger)
+    _drive_bullish_cross(driver)
+    assert wm.has_position("BTC/USD")
+    # a falling day: twenty-four contiguous 1H closes far below the cross -> the 24h EMA fast dives under
+    # the slow (the bearish cross), so _drive_decision_reversal fires the L1a reversal on the Closed24H.
+    day2 = 201 * DAY_F1
+    for h in range(24):
+        asyncio.run(driver._advance_decision(_h1_f1("BTC/USD", day2 + h * 3600, 1000)))
+    assert store.get("BTC/USD").bullish is False            # the bearish cross fired
+    assert not wm.has_position("BTC/USD")                    # the 24h reversal closed the LONG
+    rec = logger.corpus_for("long")[-1]
+    assert rec.exit_reason is ExitReason.HTF_REGIME_REVERSAL
+    assert rec.actual_rr is not None                         # the close re-anchored onto the ONE basis
+    assert rec.signal_params["trigger"] == "DECISION_24H_BULLISH_CROSS"
+    assert system.conductors[PositionSide.LONG].trade_count == 1
+    assert system.conductors[PositionSide.SHORT].trade_count == 0

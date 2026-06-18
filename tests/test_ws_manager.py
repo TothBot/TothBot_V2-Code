@@ -1636,6 +1636,58 @@ def test_drive_pending_emergsls_short_buy_to_cover_reduce_only_above_entry():
     assert leg["triggers"]["price"] == "66000"
 
 
+def test_f1_live_mode_24h_decision_entry_and_wide_2_5x_stop_exit_enqueue():
+    # TB00791 (F1) the LIVE-mode branch (is_live=True) of the validated long-only 24h-decision routing.
+    # set_decision_stop_mult(2.5) rebinds the WIDE L2 basis (param:decision_atr_stop_mult); the entry
+    # transmits via _dispatch_entry_live (async marketable-IOC, the fill arrives later); the wide
+    # 2.5x-daily-ATR L2 is enqueued via _detect_and_enqueue_live_exit ONLY past 2.5x - an adverse that
+    # WOULD have stopped at the legacy 1.5 default no longer does (the wide stop is the ONE basis) - then
+    # the async driver dispatches the cancel-then-sell and the executions close carries MAE_THRESHOLD_BREACH.
+    mgr, sent, events = _live_manager(cancel_ack_wait=_always_ack)
+    mgr.set_decision_stop_mult("2.5")                         # the WIDE L2 basis
+
+    # (B) the LIVE entry dispatch: _dispatch_entry_live transmits the marketable-IOC, returns dispatched=
+    # True, and opens NO position synchronously (the fill is async on the executions channel).
+    dispatched = asyncio.run(mgr.dispatch_entry(
+        PositionSide.LONG, "BTC/USD",
+        order_qty="0.05", entry_limit_price="60000", emergsl_price="54000",
+        atr_14_entry="2000", regime_at_entry="TRENDING_POS_NORMAL",
+        cl_ord_id="cl-1", deadline="2026-06-16T07:30:00Z",
+        signal_params={"trigger": "DECISION_24H_BULLISH_CROSS", "side": "long"},
+    ))
+    assert dispatched is True and mgr.position("BTC/USD") is None
+    assert [op for op, _ in sent] == [OutboundOp.ADD_ORDER]
+
+    # the async opening fill (executions channel) opens the live LONG, stamped with the daily ATR (2000)
+    # and the L3 emergSL 54000 = entry - 3x daily ATR.
+    _open_live_long(mgr)                                      # entry 60000, atr 2000, emergSL 54000
+
+    # the wide 2.5x basis: L2 threshold = 2000 * 2.5 = 5000. An adverse of 4500 (bid 55500) - which WOULD
+    # have breached the legacy 1.5x stop (3000) - is INSIDE the wide stop now, so NO exit is enqueued.
+    mgr.handle_ticker(_ticker("BTC/USD", "55500", "55600"))  # adverse 4500 < 5000 -> no breach
+    assert mgr.live_exit_intents_pending == 0
+    assert not any(isinstance(e, LiveExitDetected) for e in events)
+
+    # an adverse of 5000 (bid 55000) breaches the wide 2.5x L2 (55000 > emergSL 54000, so L2 not L3):
+    # _detect_and_enqueue_live_exit enqueues the market-sell intent.
+    mgr.handle_ticker(_ticker("BTC/USD", "55000", "55100"))  # adverse 5000 >= 5000 -> L2 breach
+    assert mgr.live_exit_intents_pending == 1
+    det = [e for e in events if isinstance(e, LiveExitDetected)]
+    assert det and det[-1].exit_reason == "MAE_THRESHOLD_BREACH"
+
+    # the async driver dispatches the cancel-then-sell; the executions close carries the stamped reason
+    # onto the 25-field TRADE_CLOSE.
+    outcomes = asyncio.run(mgr.drive_live_exits())
+    assert outcomes == [ExitDispatchOutcome.DISPATCHED]
+    mgr.record_execution(
+        {"exec_type": "filled", "symbol": "BTC/USD", "side": "sell",
+         "cum_qty": "0.05", "avg_price": "55000", "fee": "7.4"}
+    )
+    tc = [e for e in events if isinstance(e, TradeClose)]
+    assert len(tc) == 1 and tc[0].exit_reason is ExitReason.MAE_THRESHOLD_BREACH
+    assert mgr.live_exit_intents_pending == 0
+
+
 def test_on_fill_emergsl_skipped_without_d6_snapshot():
     # a restore/degraded open (no emergsl_price) does NOT enqueue a placement - its resting emergSL
     # was already on Kraken from the original open; the gap-close path owns that case.
