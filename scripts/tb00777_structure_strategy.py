@@ -38,8 +38,9 @@ MINN=30
 TAKER=A.TAKER; OPEN_FEE=A.OPEN_FEE; ROLL_DAY=A.ROLL_DAY
 
 
-def sim_trade(c,h,l,e12,e26,t,side):
-    """Simulate one trade opened at close[t]. Returns (netR, days, hit3, fullstop, exit_off) or None."""
+def sim_trade(c,h,l,rf,rs,t,side):
+    """Simulate one trade opened at close[t]. rf/rs = the reversal-exit MA pair (fast/slow). Returns
+    (netR, days, hit3, fullstop, exit_off) or None."""
     n=len(c); entry=c[t]
     if side=="SHORT":
         ref=max(h[max(0,t-L_INIT+1):t+1]); stop=ref*(1+BUF); Rp=stop-entry
@@ -74,8 +75,8 @@ def sim_trade(c,h,l,e12,e26,t,side):
         else:
             nref=min(l[max(t,j-win+1):j+1])*(1-BUF)
             if nref>stop: stop=nref
-        # 4) reversal exit (EMA12 vs EMA26 flips against us)
-        rev = USE_REVERSAL and e12[j] is not None and ((e12[j]>e26[j]) if side=="SHORT" else (e12[j]<e26[j]))
+        # 4) reversal exit (the chosen MA pair flips against us)
+        rev = USE_REVERSAL and rf[j] is not None and rs[j] is not None and ((rf[j]>rs[j]) if side=="SHORT" else (rf[j]<rs[j]))
         if rev:
             exitR = ((entry-c[j])/Rp) if side=="SHORT" else ((c[j]-entry)/Rp)
             realizedR += pos*exitR; break
@@ -89,15 +90,97 @@ def sim_trade(c,h,l,e12,e26,t,side):
     return netR, days, hit3, fullstop, j
 
 
-def run(pairs, signame, sig, lo, hi):
+# ---------------- STRONGER TREND PREDICTORS (the TB00777 entry hunt) ----------------
+def _adx(h,l,c,n=14):
+    N=len(c); pdm=[0.0]*N; mdm=[0.0]*N; tr=[0.0]*N
+    for i in range(1,N):
+        up=h[i]-h[i-1]; dn=l[i-1]-l[i]
+        pdm[i]=up if (up>dn and up>0) else 0.0
+        mdm[i]=dn if (dn>up and dn>0) else 0.0
+        tr[i]=max(h[i]-l[i],abs(h[i]-c[i-1]),abs(l[i]-c[i-1]))
+    def wil(x):
+        o=[None]*N; s=None
+        for i in range(1,N):
+            if i<n: continue
+            s=sum(x[1:n+1]) if i==n else (s-s/n+x[i]); o[i]=s
+        return o
+    st,sp,sm=wil(tr),wil(pdm),wil(mdm)
+    pdi=[None]*N; mdi=[None]*N; dx=[None]*N
+    for i in range(N):
+        if st[i] and st[i]>0:
+            pdi[i]=100*sp[i]/st[i]; mdi[i]=100*sm[i]/st[i]; s=pdi[i]+mdi[i]
+            dx[i]=100*abs(pdi[i]-mdi[i])/s if s>0 else 0.0
+    adxv=[None]*N; a=None; cnt=0; acc=0.0
+    for i in range(N):
+        if dx[i] is None: continue
+        cnt+=1
+        if cnt<=n: acc+=dx[i]
+        if cnt==n: a=acc/n; adxv[i]=a
+        elif cnt>n: a=(a*(n-1)+dx[i])/n; adxv[i]=a
+    return adxv,pdi,mdi
+
+def _supertrend(h,l,c,n=10,mult=3.0):
+    N=len(c); at=A.atr(h,l,c,n); d=[None]*N; fu=fl=None; pd=1
+    for i in range(N):
+        if at[i] is None: continue
+        mid=(h[i]+l[i])/2; bu=mid+mult*at[i]; bl=mid-mult*at[i]
+        if fu is None: fu,fl,pd=bu,bl,1; d[i]=1; continue
+        fu=bu if (bu<fu or c[i-1]>fu) else fu
+        fl=bl if (bl>fl or c[i-1]<fl) else fl
+        nd=(-1 if c[i]<fl else 1) if pd==1 else (1 if c[i]>fu else -1)
+        d[i]=nd; pd=nd
+    return d
+
+def prep(p):
+    p.sma50=A.sma(p.c,50); p.sma200=A.sma(p.c,200)
+    p.adx,p.pdi,p.mdi=_adx(p.h,p.l,p.c,14)
+    p.stdir=_supertrend(p.h,p.l,p.c,10,3.0)
+    p.dc55hi=A.rmax(p.h,55); p.dc55lo=A.rmin(p.l,55)
+    p.mom100=[None if i<100 else p.c[i]/p.c[i-100]-1 for i in range(p.n)]
+
+def t_ma_cross(p,i):
+    a,b,pa,pb=p.sma50[i],p.sma200[i],p.sma50[i-1],p.sma200[i-1]
+    if None in (a,b,pa,pb): return None
+    if pa<=pb and a>b: return "LONG"
+    if pa>=pb and a<b: return "SHORT"
+    return None
+def t_ma_align(p,i):
+    a,b=p.sma50[i],p.sma200[i]
+    if a is None or b is None: return None
+    if p.c[i]>a>b: return "LONG"
+    if p.c[i]<a<b: return "SHORT"
+    return None
+def t_adx(p,i):
+    ad,pd,md=p.adx[i],p.pdi[i],p.mdi[i]
+    if None in (ad,pd,md) or ad<25: return None
+    return "LONG" if pd>md else "SHORT"
+def t_supertrend(p,i):
+    d,pdd=p.stdir[i],p.stdir[i-1]
+    if d is None or pdd is None or d==pdd: return None
+    return "LONG" if d==1 else "SHORT"
+def t_donch55(p,i):
+    if p.dc55hi[i] is None: return None
+    if p.c[i]>=p.dc55hi[i]: return "LONG"
+    if p.c[i]<=p.dc55lo[i]: return "SHORT"
+    return None
+def t_mom100(p,i):
+    m=p.mom100[i]
+    if m is None: return None
+    return "LONG" if m>0.10 else "SHORT" if m<-0.10 else None
+
+TREND_SIGS={"ma_cross_50_200":t_ma_cross,"ma_align_50_200":t_ma_align,"adx_dmi":t_adx,
+    "supertrend":t_supertrend,"donchian_55":t_donch55,"momentum_100":t_mom100}
+
+
+def run(pairs, signame, sig, lo, hi, rfa="sma50", rsa="sma200"):
     recs=[]  # (entry_frac, netR, side, hit3, fullstop)
     for p in pairs:
-        c,h,l,e12,e26,n=p.c,p.h,p.l,p.e12,p.e26,p.n
+        c,h,l,n=p.c,p.h,p.l,p.n; rf=getattr(p,rfa); rs=getattr(p,rsa)
         i=int(n*lo); end=int(n*hi)
         while i<end-1:
             s=sig(p,i)
             if s is None: i+=1; continue
-            r=sim_trade(c,h,l,e12,e26,i,s)
+            r=sim_trade(c,h,l,rf,rs,i,s)
             if r is None: i+=1; continue
             netR,days,hit3,fs,jend=r
             recs.append((i/n,netR,s,hit3,fs)); i=max(i+1,jend)
@@ -121,7 +204,7 @@ def stats(recs):
 
 
 def one(pairs,sn):
-    sig=A.SIGNALS[sn]
+    sig=TREND_SIGS[sn]
     a=stats(run(pairs,sn,sig,0.0,1.0)); o=stats(run(pairs,sn,sig,0.5,1.0)); ii=stats(run(pairs,sn,sig,0.0,0.5))
     if not a: return f"{sn:17s} | too few trades"
     if o and ii:
@@ -131,17 +214,19 @@ def one(pairs,sn):
         goal=(ii["ER"]>0 and ii["rr"]>=1.5 and o["ER"]>0 and o["rr"]>=1.5)
         verdict=("ROBUST-GOAL" if (goal and dok and tok) else "OOS-goal(fragile)" if goal else "+OOS" if o["ER"]>0 else "fails")
         return (f"{sn:17s} | {a['n']:<4d} {a['ER']:+.3f} {a['win']:4.0f} {a['rr']:4.2f} {a['hit3']:5.0f} {a['fstop']:5.0f} | "
-                f"{o['n']:<4d}{o['ER']:+.3f} {o['win']:4.0f} {o['rr']:4.2f} +{o['tpos']}/{o['tc']} {verdict}")
+                f"{o['n']:<4d}{o['ER']:+.3f} {o['win']:4.0f} {o['rr']:4.2f} L{o['ln']}@{o['le']:+.2f} S{o['sn']}@{o['se']:+.2f} +{o['tpos']}/{o['tc']} {verdict}")
     return f"{sn:17s} | {a['n']:<4d} {a['ER']:+.3f} {a['win']:4.0f} {a['rr']:4.2f} {a['hit3']:5.0f} {a['fstop']:5.0f} | OOS too few"
 
 async def main():
     global SCALE_AT, USE_REVERSAL
     d=await A.fetch_kraken(1440)   # daily, ~720 bars = ~2 years (fetched ONCE; swept below)
     pairs=A.to_pairs(d)
-    sigs=["momentum","donchian","bb_break","rsi_trend"]
-    for sa,rev in [(3.0,True),(2.0,True),(1.5,True),(2.0,False),(1.5,False)]:
-        SCALE_AT=sa; USE_REVERSAL=rev
-        print(f"\n=== scale@{sa}R  reversal_exit={rev}  (L_init={L_INIT} L_run={L_RUN}) | pairs={len(pairs)} ===")
+    for p in pairs: prep(p)
+    sigs=list(TREND_SIGS)
+    print("STRONGER TREND PREDICTORS as entries + Bill's structure exits (reversal = 50/200 flip). daily, 32 pairs.")
+    for sa in (3.0,2.0):
+        SCALE_AT=sa; USE_REVERSAL=True
+        print(f"\n=== scale@{sa}R  reversal=50/200-flip  (L_init={L_INIT} L_run={L_RUN}) ===")
         print("signal            | n    ER(R)  win%  RR   hit3%  fstop% | OOS: n   ER    win  RR  thirds VERDICT")
         for sn in sigs: print(one(pairs,sn))
     print("\nER(R)=net expectancy/trade in R after fees+rollover. RR=avg win/avg loss. hit3=% reaching +3R. "
