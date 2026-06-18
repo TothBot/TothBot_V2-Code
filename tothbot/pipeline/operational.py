@@ -85,6 +85,7 @@ from ..recorder.report_transport import PullCadenceScheduler
 from ..recorder.reporting import ReportCategory
 from ..recorder.trade_record_file import PermanentTradeRecordSink
 from ..recorder.ohlc_record_file import PermanentOhlc5mSink
+from ..recorder.state_snapshot import StateSnapshotEmitter
 from ..regime.scheduler import DailyRegimeCompute, RegimeCache
 from .equity_reconcile import DEFAULT_RECONCILE_INTERVAL_SEC, PeriodicTradeBalanceReconcile
 from .live_driver import (
@@ -258,6 +259,28 @@ def assemble_ciats_modules(
     return conductors, sinks, inboxes
 
 
+def _fan_out_clock_ticks(*ticks):
+    """Compose several OHLC_5m clock-tick consumers into ONE callback, exception-isolated (a raising
+    consumer never starves the others). Returns the lone callable unwrapped when only one is present
+    (so the existing pull_scheduler.tick binding is preserved when no snapshot emitter is wired), None
+    when none are."""
+    callables = [t for t in ticks if t is not None]
+    if not callables:
+        return None
+    if len(callables) == 1:
+        return callables[0]
+
+    def _tick(now) -> None:
+        for fn in callables:
+            try:
+                fn(now)
+            except Exception:
+                # one consumer's failure (e.g. a snapshot write) never starves the others.
+                pass
+
+    return _tick
+
+
 @dataclass
 class OperationalSystem:
     """The assembled, runnable organism: call run() to drive the public data layer (and, in LIVE
@@ -288,6 +311,7 @@ class OperationalSystem:
     trade_record_sink: PermanentTradeRecordSink | None = None
     equity_reconcile: PeriodicTradeBalanceReconcile | None = None
     decision_store: DailyDecisionStore | None = None
+    snapshot_emitter: "StateSnapshotEmitter | None" = None
 
     async def run(self) -> None:
         """Drive the public data layer (and, in live, the private connection + the periodic SHORT-equity
@@ -338,6 +362,7 @@ async def assemble_operational(
     report_emit: "ReportSink | None" = None,
     report_categories: "Sequence[ReportCategory] | None" = None,
     records_dir: "str | None" = None,
+    snapshot_path: "str | None" = None,
 ) -> OperationalSystem:
     """Run the ar:AR-049 cold-start sequence and return the runnable public organism (see module
     docstring). `on_event` (defaulting to logger.record) sinks the warm-up / regime / liquidity /
@@ -465,6 +490,21 @@ async def assemble_operational(
         pull_scheduler = PullCadenceScheduler(pull_service, categories)
         on_clock_tick = pull_scheduler.tick
 
+    # 4c. THE READ-ONLY STATE SNAPSHOT EMITTER (0500000 mod:Logger q5_logs STATE SNAPSHOT FILE,
+    #     TB00793). When `snapshot_path` is wired, build the emitter (a VIEW over wm/conductors/
+    #     decision_store/regime_cache/bbo_cache) and add it as a SECOND consumer of the OHLC_5m system
+    #     clock tick (a fan-out, exception-isolated from the pull scheduler). READ-ONLY: it materializes
+    #     the C2 dashboard view to a local JSON file atomically on the clock cadence; it NEVER writes
+    #     into the trading loop. No snapshot_path -> not wired (paper/unit assemblies stay clock-light).
+    snapshot_emitter: StateSnapshotEmitter | None = None
+    if snapshot_path is not None:
+        snapshot_emitter = StateSnapshotEmitter(
+            snapshot_path, wm=wm, conductors=conductors, decision_store=decision_store,
+            regime_cache=regime_cache, bbo_cache=bbo_cache, warmups=warmups,
+            mode=("live" if mode is Mode.LIVE else "paper"),
+        )
+        on_clock_tick = _fan_out_clock_ticks(on_clock_tick, snapshot_emitter.on_tick)
+
     # 5. The LiveSweepDriver over the warmed pairs (the HR-WM-012 guard reads the shared coordinator).
     driver = LiveSweepDriver(
         warmups=warmups,
@@ -585,4 +625,5 @@ async def assemble_operational(
         trade_record_sink=trade_record_sink,
         equity_reconcile=equity_reconcile,
         decision_store=decision_store,
+        snapshot_emitter=snapshot_emitter,
     )

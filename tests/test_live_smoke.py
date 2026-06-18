@@ -268,7 +268,7 @@ def test_trade_close_closes_the_ciats_learning_loop():
 # --------------------------------------------------------------------------- TB00748 (c): the
 # RUNNING wm emits each exit THROUGH the side's CIATS sink (no manual sink call)
 
-def _assemble_real_wm(*, report_emit=None, report_categories=None, records_dir=None):
+def _assemble_real_wm(*, report_emit=None, report_categories=None, records_dir=None, snapshot_path=None):
     """Assemble the paper organism over a REAL WSManager (not the decide-size stand-in), so the
     exit path is wired end-to-end: assemble_operational hands the per-side ciats_sinks to the wm's
     per-module Exit Controllers (TB00748 (b)). `report_emit` / `report_categories` wire the
@@ -286,6 +286,7 @@ def _assemble_real_wm(*, report_emit=None, report_categories=None, records_dir=N
         mode=Mode.PAPER, now_utc=lambda: datetime(2026, 6, 15, 7, 30, tzinfo=timezone.utc),
         rest_sleep=no_sleep, pace_sleep=no_sleep,
         report_emit=report_emit, report_categories=report_categories, records_dir=records_dir,
+        snapshot_path=snapshot_path,
     ))
     return system, wm, logger
 
@@ -955,3 +956,32 @@ def test_f1_lifecycle_entry_then_24h_bearish_cross_reversal_close():
     assert rec.signal_params["trigger"] == "DECISION_24H_BULLISH_CROSS"
     assert system.conductors[PositionSide.LONG].trade_count == 1
     assert system.conductors[PositionSide.SHORT].trade_count == 0
+
+
+# ------------------------------------------------ TB00793: the read-only STATE SNAPSHOT EMITTER wired
+# off the OHLC_5m system clock - assemble_operational builds the emitter when snapshot_path is set and
+# composes it onto the clock tick; a tick materializes the C2 dashboard VIEW to a local JSON file.
+def test_snapshot_emitter_is_wired_off_the_clock_when_a_path_is_set():
+    import json as _json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "state_snapshot.json")
+        system, wm, _logger = _assemble_real_wm(snapshot_path=path)
+        assert system.snapshot_emitter is not None
+        # with no report_emit wired, the OHLC_5m clock tick IS the snapshot emitter's throttled consumer.
+        assert system.driver._on_clock_tick == system.snapshot_emitter.on_tick
+        _open_real_long(wm)
+        # drive the clock tick (what a 5m close fires) -> a snapshot materializes atomically.
+        system.driver._on_clock_tick(datetime(2026, 6, 18, 22, 0, tzinfo=timezone.utc))
+        snap = _json.loads(open(path, encoding="utf-8").read())
+        assert snap["mode"] == "paper"
+        assert {"ts", "health", "balances", "positions", "decision_board", "ciats"} <= set(snap)
+        assert snap["positions"] and snap["positions"][0]["symbol"] == "BTC/USD"   # the open LONG is in the view
+        assert not os.path.exists(path + ".tmp")                                   # atomic swap, no temp left
+
+
+def test_no_snapshot_emitter_when_no_path():
+    # the default assembly wires no snapshot feed (the clock stays light); zero regression.
+    system, _wm, _logger = _assemble_real_wm()
+    assert system.snapshot_emitter is None

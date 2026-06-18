@@ -56,6 +56,7 @@ class OpsSettings:
     smtp_password: str | None = None
     smtp_starttls: bool = False
     records_dir: str | None = None
+    snapshot_path: str | None = None                # read-only dashboard feed (TB00793 STATE SNAPSHOT FILE)
 
     @property
     def smtp_configured(self) -> bool:
@@ -72,6 +73,13 @@ class OpsSettings:
         env = environ if environ is not None else os.environ
         mode = Mode.LIVE if (env.get("TOTHBOT_MODE", "paper").lower() == "live") else Mode.PAPER
         port_raw = env.get("TOTHBOT_SMTP_PORT")
+        records_dir = env.get("TOTHBOT_RECORDS_DIR") or None
+        # The read-only dashboard snapshot (TB00793): explicit TOTHBOT_SNAPSHOT_PATH, else default to
+        # <records_dir>/state_snapshot.json when a records dir is set (so a deployed paper organism
+        # emits the dashboard feed automatically), else None (no emitter wired).
+        snapshot_path = env.get("TOTHBOT_SNAPSHOT_PATH") or (
+            os.path.join(records_dir, "state_snapshot.json") if records_dir else None
+        )
         return cls(
             universe=tuple(universe),
             mode=mode,
@@ -83,7 +91,8 @@ class OpsSettings:
             smtp_username=env.get("TOTHBOT_SMTP_USER") or None,
             smtp_password=env.get("TOTHBOT_SMTP_PASSWORD") or None,
             smtp_starttls=env.get("TOTHBOT_SMTP_STARTTLS", "").lower() in ("1", "true", "yes"),
-            records_dir=env.get("TOTHBOT_RECORDS_DIR") or None,
+            records_dir=records_dir,
+            snapshot_path=snapshot_path,
         )
 
 
@@ -212,6 +221,7 @@ async def build_system(
         pace_sleep=pace_sleep,
         report_emit=report_emit,
         records_dir=settings.records_dir,
+        snapshot_path=settings.snapshot_path,
         open_private_socket=open_private_socket,
         acquire_token=acquire_token,
         fetch_snap_orders=fetch_snap_orders,
