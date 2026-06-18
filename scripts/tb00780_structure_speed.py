@@ -82,7 +82,7 @@ def sim_struct(p, i, side, L, roll_per_bar):
         j = n - 1; exitR = ((c[j] - e) if side == "LONG" else (e - c[j])) / R
     fee_frac = TAKER * legs + (OPEN_FEE if side == "SHORT" else 0.0)
     roll_frac = (roll_per_bar * off) if side == "SHORT" else 0.0
-    return exitR - (fee_frac + roll_frac) / Rfrac, off, side
+    return exitR - (fee_frac + roll_frac) / Rfrac, off, side, Rfrac   # Rfrac = stop dist as frac of price
 
 
 def run_struct(pairs, sig, L, roll_per_bar):
@@ -94,8 +94,8 @@ def run_struct(pairs, sig, L, roll_per_bar):
             if s is None: i += 1; continue
             r = sim_struct(p, i, s, L, roll_per_bar)
             if r is None: i += 1; continue
-            netR, off, side = r
-            recs.append((i / n, netR, side)); bypair.setdefault(p.sym, []).append(netR)
+            netR, off, side, rfrac = r
+            recs.append((i / n, netR, side, netR * rfrac)); bypair.setdefault(p.sym, []).append(netR)
             i = max(i + 1, i + off)
     return recs, bypair
 
@@ -110,8 +110,9 @@ def line(tag, recs, bypair, m_eras):
     nested = iss and iss["ER"] > 0 and oos["ER"] > 0
     durable = bool(b) and b[0] > 0 and dir_ok and cnt >= 3 and pos >= cnt - 1 and oos["rr"] >= 1.5 and nested
     flag = "DURABLE" if durable else ("+OOS" if oos["ER"] > 0 else "neg")
-    return (f"      {tag:12s} OOS E {oos['ER']:+.3f}R rr {oos['rr']:.2f} win {oos['win']:.0f}%  "
-            f"L:{oos['ln']}@{oos['le']:+.2f} S:{oos['sn']}@{oos['se']:+.2f}  eras+{pos}/{cnt}  {bs}  {flag}"), durable
+    return (f"      {tag:11s} OOS {oos['ER']:+.3f}R ({oos['ERpct']:+.2f}%/tr)  rr {oos['rr']:.2f} win {oos['win']:.0f}%  "
+            f"L:{oos['ln']}@{oos['le']:+.2f}R/{oos['lep']:+.2f}% S:{oos['sn']}@{oos['se']:+.2f}R/{oos['sep']:+.2f}%  "
+            f"eras+{pos}/{cnt} {bs} {flag}"), durable
 
 
 def analyse(label, data, iv_min, m_eras, entry_name):

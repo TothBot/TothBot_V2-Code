@@ -88,7 +88,7 @@ def sim(p, i, side, s_mult, policy, roll_per_bar):
     fee_frac = TAKER * legs + (OPEN_FEE if side == "SHORT" else 0.0)
     roll_frac = (roll_per_bar * off) if side == "SHORT" else 0.0
     netR = realizedR - (fee_frac + roll_frac) / R
-    return netR, off, side
+    return netR, off, side, R   # R = stop distance as a fraction of price (for % on capital)
 
 
 def run_combo(pairs, sig, s_mult, policy, roll_per_bar):
@@ -100,23 +100,27 @@ def run_combo(pairs, sig, s_mult, policy, roll_per_bar):
             if s is None: i += 1; continue
             r = sim(p, i, s, s_mult, policy, roll_per_bar)
             if r is None: i += 1; continue
-            netR, off, side = r
-            recs.append((i / n, netR, side)); bypair.setdefault(p.sym, []).append(netR)
+            netR, off, side, rfrac = r
+            recs.append((i / n, netR, side, netR * rfrac)); bypair.setdefault(p.sym, []).append(netR)
             i = max(i + 1, i + off)
     return recs, bypair
 
 
 def statR(recs, lo=0.0, hi=1.0):
-    rr = [r[1] for r in recs if lo <= r[0] < hi]
-    sd = [r[2] for r in recs if lo <= r[0] < hi]
-    if len(rr) < MINN: return None
+    sel = [r for r in recs if lo <= r[0] < hi]
+    if len(sel) < MINN: return None
+    rr = [r[1] for r in sel]; sd = [r[2] for r in sel]
+    pct = [(r[3] if len(r) > 3 else 0.0) for r in sel]   # per-trade return on capital deployed (fraction)
     w = [x for x in rr if x > 0]; ls = [x for x in rr if x <= 0]
     avgw = sum(w) / len(w) if w else 0.0; avgl = -sum(ls) / len(ls) if ls else 1e-9
     ln = sum(1 for s in sd if s == "LONG"); sn = len(sd) - ln
-    le = (sum(rr[k] for k in range(len(rr)) if sd[k] == "LONG") / ln) if ln else 0.0
-    se = (sum(rr[k] for k in range(len(rr)) if sd[k] == "SHORT") / sn) if sn else 0.0
-    return dict(n=len(rr), ER=sum(rr) / len(rr), win=100 * len(w) / len(rr),
-                rr=avgw / avgl if avgl > 0 else 0.0, ln=ln, le=le, sn=sn, se=se)
+    le = (sum(rr[k] for k in range(len(sd)) if sd[k] == "LONG") / ln) if ln else 0.0
+    se = (sum(rr[k] for k in range(len(sd)) if sd[k] == "SHORT") / sn) if sn else 0.0
+    lep = (100 * sum(pct[k] for k in range(len(sd)) if sd[k] == "LONG") / ln) if ln else 0.0
+    sep = (100 * sum(pct[k] for k in range(len(sd)) if sd[k] == "SHORT") / sn) if sn else 0.0
+    return dict(n=len(sel), ER=sum(rr) / len(rr), win=100 * len(w) / len(rr),
+                rr=avgw / avgl if avgl > 0 else 0.0, ln=ln, le=le, sn=sn, se=se,
+                ERpct=100 * sum(pct) / len(pct), lep=lep, sep=sep)   # ERpct = avg % return on capital/trade
 
 
 def bootR(bypair, iters=600, seed=7):
