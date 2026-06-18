@@ -168,8 +168,21 @@ def t_mom100(p,i):
     if m is None: return None
     return "LONG" if m>0.10 else "SHORT" if m<-0.10 else None
 
+ADX_MIN=25.0   # textbook "a real/strong trend exists" threshold
+def t_super_adx_state(p,i):
+    """Supertrend gives DIRECTION; ADX>=ADX_MIN gates to STRONG trends only (state-based)."""
+    d,ad=p.stdir[i],p.adx[i]
+    if d is None or ad is None or ad<ADX_MIN: return None
+    return "LONG" if d==1 else "SHORT"
+def t_super_adx_flip(p,i):
+    """Enter on the Supertrend FLIP, but only if ADX already confirms a strong trend."""
+    d,pd,ad=p.stdir[i],p.stdir[i-1],p.adx[i]
+    if d is None or pd is None or ad is None or d==pd or ad<ADX_MIN: return None
+    return "LONG" if d==1 else "SHORT"
+
 TREND_SIGS={"ma_cross_50_200":t_ma_cross,"ma_align_50_200":t_ma_align,"adx_dmi":t_adx,
-    "supertrend":t_supertrend,"donchian_55":t_donch55,"momentum_100":t_mom100}
+    "supertrend":t_supertrend,"donchian_55":t_donch55,"momentum_100":t_mom100,
+    "super_adx_state":t_super_adx_state,"super_adx_flip":t_super_adx_flip}
 
 
 def run(pairs, signame, sig, lo, hi, rfa="sma50", rsa="sma200"):
@@ -222,8 +235,8 @@ async def main():
     d=await A.fetch_kraken(1440)   # daily, ~720 bars = ~2 years (fetched ONCE; swept below)
     pairs=A.to_pairs(d)
     for p in pairs: prep(p)
-    sigs=list(TREND_SIGS)
-    print("STRONGER TREND PREDICTORS as entries + Bill's structure exits (reversal = 50/200 flip). daily, 32 pairs.")
+    sigs=["supertrend","super_adx_state","super_adx_flip","adx_dmi"]   # #1: Supertrend + ADX strength gate
+    print(f"SUPERTREND + ADX>={ADX_MIN:.0f} strength gate (#1) vs baselines + Bill's structure exits. daily, 32 pairs.")
     for sa in (3.0,2.0):
         SCALE_AT=sa; USE_REVERSAL=True
         print(f"\n=== scale@{sa}R  reversal=50/200-flip  (L_init={L_INIT} L_run={L_RUN}) ===")
