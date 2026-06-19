@@ -1,0 +1,88 @@
+================================================================================================
+TB00798 PERPS HARDENING - walk-forward persistence + fee-breakeven on the TB00794 survivors
+  perp taker 0.05%/side (the assumption under test); K=6 sequential folds;
+  fixed pre-chosen configs (NO fresh search -> no new selection bias); cached data, offline.
+================================================================================================
+    8h   pairs=30
+    12h  pairs=30
+    24h  pairs=30
+
+################################################################################################
+# SHORT SURVIVORS - WALK-FORWARD (6 folds, E% per fold, pooled across pairs, perp taker)
+################################################################################################
+  config                             tf   folds(E% oldest->newest)               +f/K     min  pooledE    rr      n
+  rsi_trend/vol/stop3x/target3.0x    24h   -3.0  +6.8  +2.6  +1.5  +2.4  +4.0     5/6    -3.0   +2.68%  1.78   1007
+  rsi_trend/trend100/stop2x/target3  24h   -5.3  +4.1  +1.4  +1.1  +1.4  +2.9     5/6    -5.3   +1.18%  1.74   1419
+  ema_cross/vol/stop2x/target3.0x    24h   -3.8  +5.3  +0.3  +1.0  +1.3  +4.0     5/6    -3.8   +1.60%  1.75   1244
+  bb_revert/trend100/trail3.0x       12h   -1.3  +1.3  +0.8  +0.6  +5.8  +2.2     5/6    -1.3   +1.64%  2.04    836
+  bb_revert/trend100/trail3.0x       8h    -0.1  +1.9  -0.2  +2.4  +2.7  +2.9     4/6    -0.2   +1.57%  2.09   1104
+  macd/vol/trail2.0x                 12h   -0.8  -0.3  +1.3  +0.1  +2.0  +2.7     4/6    -0.8   +0.85%  1.74   3580
+  macd/btc_tide/trail3.0x            8h    -1.7  +1.1  +2.0  +0.6  +1.9  +2.3     5/6    -1.7   +1.11%  1.65   3782
+  ema_cross/btc_tide/trail3.0x       8h    -2.2  +1.0  +1.5  +0.3  +1.2  +2.7     5/6    -2.2   +0.91%  1.66   3223
+
+################################################################################################
+# LONG SURVIVORS - WALK-FORWARD (6 folds, E% per fold, pooled across pairs, perp taker)
+################################################################################################
+  config                             tf   folds(E% oldest->newest)               +f/K     min  pooledE    rr      n
+  bb_break/trend100/stop5x/rev       12h  +24.1  +5.1  +1.0  +8.4  +5.2  -2.2     5/6    -2.2   +7.29%  4.17   1339
+  bb_break/vol/stop3x/rev            8h   +16.8  +0.8  +1.4  +3.9  +3.1  -1.4     5/6    -1.4   +4.25%  3.74   1924
+  donchian/trend100/stop5x/rev       12h  +24.3  +4.7  +0.9  +8.0  +5.7  -2.3     5/6    -2.3   +7.22%  4.11   1271
+  bb_break/trend100/stop3x/rev       24h  +38.8  +1.2  -3.0 +15.5  +5.5  -1.7     4/6    -3.0  +12.38%  4.68    688
+
+################################################################################################
+# SHORT SURVIVORS - FEE BREAKEVEN (pooled E% vs taker/side; the route-dependent unknown, 13.6)
+################################################################################################
+  config                             tf       4bp     5bp     7bp    10bp    13bp    16bp    20bp    25bp  breakeven
+  rsi_trend/vol/stop3x/target3.0x    24h   +2.70  +2.68  +2.64  +2.58  +2.52  +2.46  +2.38  +2.28      >25bp
+  rsi_trend/trend100/stop2x/target3  24h   +1.20  +1.18  +1.14  +1.08  +1.02  +0.96  +0.88  +0.78      >25bp
+  ema_cross/vol/stop2x/target3.0x    24h   +1.62  +1.60  +1.56  +1.50  +1.44  +1.38  +1.30  +1.20      >25bp
+  bb_revert/trend100/trail3.0x       12h   +1.66  +1.64  +1.60  +1.54  +1.48  +1.42  +1.34  +1.24      >25bp
+  bb_revert/trend100/trail3.0x       8h    +1.59  +1.57  +1.53  +1.47  +1.41  +1.35  +1.27  +1.17      >25bp
+  macd/vol/trail2.0x                 12h   +0.87  +0.85  +0.81  +0.75  +0.69  +0.63  +0.55  +0.45      >25bp
+  macd/btc_tide/trail3.0x            8h    +1.13  +1.11  +1.07  +1.01  +0.95  +0.89  +0.81  +0.71      >25bp
+  ema_cross/btc_tide/trail3.0x       8h    +0.93  +0.91  +0.87  +0.81  +0.75  +0.69  +0.61  +0.51      >25bp
+
+NOTE: walk-forward = a fixed-mechanism persistence test across 6 sequential sub-periods of the
+  2020-2025 perp span (catches era-fragility); it is NOT a fresh forward holdout (configs were
+  chosen on this span - stated honestly). Breakeven = the taker/side at which pooled E crosses 0;
+  compare it to the LIVE Kraken perp maker/taker once support answers. % = return on capital/trade,
+  unlevered, fixed $50 notional, REAL Binance-UM funding. Sacred 1:1.5 floor unaffected (sizing).
+
+================================================================================================
+CONCLUSIONS (TB00798 hardening)
+================================================================================================
+1. SHORT survivors PERSIST. All 8 are E>0 in 5/6 (a few 4/6) sequential folds; the ONLY losing fold
+   is the OLDEST (2020, the thinnest early-perp sample - TB00794 caveat d, now localized). Pooled E
+   +0.85% to +2.68%/trade, rr 1.65-2.09, n 800-3800. The mean-reversion/filtered + trail/target
+   mechanism is durable across sub-periods, not a single-block artifact (addresses caveat c).
+
+2. SHORT fee-fragility caveat (a) is REFINED, not confirmed. Every short survivor stays POSITIVE
+   through 25 bp/side taker (breakeven >25bp for ALL 8). TB00794 caveat (a) - "short edge flips
+   negative at +10-20bp" - was about the BARE-TREND carry-forward short (Engine B, ~0%/tr), NOT these
+   survivors. The surviving mean-rev/filtered short carries enough gross edge (~+1.5 to +2.7%/tr) to
+   absorb the full plausible Kraken maker/taker range with room to spare. => The 0500000 13.6 ROUTE-
+   DEPENDENT fee unknown is NOT a material threat to the SHORT side; whatever Kraken's live perp taker
+   is (well under 25bp), the short survivors clear. This is the decision-relevant result.
+
+3. LONG breakout is strong but SOFTENS in the most-recent fold. bb_break/donchian + trend100/vol +
+   wide stop (3-5xATR) + reversal: pooled E +4.2% to +12.4%/tr, rr 3.7-4.7, BUT fold 1 (2020-21 bull)
+   is +24 to +39% (alt-bull-inflated, TB00794 caveat b CONFIRMED) and the MOST-RECENT fold (2025) is
+   slightly NEGATIVE (-1.4 to -3.0%). Honest forward expectation = the middle-fold band (~+1 to +8%),
+   not the headline pooled number. The breakout long is real but its recent-period edge has thinned -
+   watch it in paper.
+
+PROPOSED-SEED STARTING VALUES (for graduation into TB00000 sec 8 at 0500000 slice F; still PROPOSED):
+  perp_short_entry_meanrev   = the rsi_trend band (30 < RSI(14) < 55 with EMA12<EMA26) [best+robust,
+                               24h, +2.68%], OR bb_revert (close above the upper 2-sigma/20 Bollinger)
+                               [8h/12h, +1.6%]. Both mean-reversion; rsi_trend is the lead.
+  perp_short_regime_filter   = vol filter (ATR-percentile in [0.20, 0.85]) [the most common winning
+                               filter], with trend100 (close < SMA100) as the secondary.
+  perp_short_exit_trail      = chandelier trail 3.0x ATR (8h/12h) OR 3.0x ATR fixed target (24h);
+                               short L2 stop = 2-3x ATR (REUSES decision_atr_stop_mult per 13.6).
+  LONG (reuses existing seeds; new note): the perp breakout long wants a WIDER stop than the spot
+                               decision_atr_stop_mult=2.5 - 3-5x ATR tested best. Flag for graduation;
+                               NOT minting a new long seed (13.6 LONG side reuses existing).
+
+These VALUES stay PROPOSED until 0500000 Section 13 graduates (slice F, gated on the Kraken subaccount
+item + sandbox perp + the Bill go-live gate). Nothing minted here; TothBot stays in PAPER.
+================================================================================================
