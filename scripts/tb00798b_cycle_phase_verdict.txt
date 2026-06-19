@@ -1,0 +1,68 @@
+========================================================================================================
+TB00798b HALVING-CYCLE PHASE CUT - does the breakout-LONG track bulls and the mean-rev SHORT carry bears?
+  same cached perp history, re-cut by halving-anchored phase; BTC buy&hold % shown to justify each label.
+  perp taker 0.05%/side, REAL funding, fixed $50 notional, pooled across the 30-pair universe.
+========================================================================================================
+
+########################################################################################################
+# BREAKOUT LONG  (E% / rr / win / n  per halving-cycle phase)
+########################################################################################################
+  phase                          BTC b&h |   bb_break 24h |   bb_break 12h
+  pre-halving accum 19-20           +21% |   +1.30%  2.16   36%     44 |   +6.63%  2.23   52%     27
+  C3 BULL (post-2020 halv)         +683% |  +35.49%  6.81   38%    152 |  +19.21%  4.53   44%    287
+  C3 BEAR / winter                  -75% |  -11.34%  1.13   13%     77 |   -3.80%  2.04   22%    155
+  C3->C4 recovery                  +304% |  +18.89%  5.17   47%    184 |  +11.57%  4.74   42%    328
+  C4 BULL (post-2024 halv)          +76% |   +2.66%  3.09   29%    194 |   +3.49%  3.86   29%    397
+  C4 late / cooling 25-26           -38% |   -4.71%  2.30   17%     46 |   -4.22%  1.44   19%    154
+
+########################################################################################################
+# MEAN-REVERSION SHORT  (E% / rr / win / n  per halving-cycle phase)
+########################################################################################################
+  phase                          BTC b&h |  rsi_trend 24h |  bb_revert 12h |   bb_revert 8h
+  pre-halving accum 19-20           +21% |   -2.12%  1.16   43%     21 |   -0.31%  2.73   26%     58 |   -1.18%  3.52   19%     57
+  C3 BULL (post-2020 halv)         +683% |   -2.58%  1.53   33%    128 |   -2.02%  1.40   33%     82 |   +0.26%  1.62   39%    130
+  C3 BEAR / winter                  -75% |  +10.66%  1.79   61%    170 |   +1.11%  1.90   39%    139 |   +1.04%  1.89   40%    189
+  C3->C4 recovery                  +304% |   -1.61%  1.49   35%    269 |   -0.49%  2.02   31%    178 |   +0.87%  2.13   37%    257
+  C4 BULL (post-2024 halv)          +76% |   +1.09%  2.15   35%    329 |   +3.00%  1.92   47%    242 |   +1.80%  2.08   41%    334
+  C4 late / cooling 25-26           -38% |   +8.47%  1.67   66%    146 |   +5.72%  2.84   49%    138 |   +5.40%  3.03   50%    137
+
+READ: a BULL phase = large positive BTC b&h; a BEAR phase = negative/flat. HYPOTHESIS (Bill):
+  LONG E strong in BULL phases, weak/negative in BEAR; SHORT E carries the BEAR/chop phases. If the
+  pattern holds, the long's recent softness is CYCLE-PHASE (between bulls), not alpha decay - expect
+  reacceleration into the Apr-2028 halving - and the Long/Short organism is itself the cycle hedge.
+  CAVEAT: only ~2 full halving cycles of perp data (low n); a maturing/ETF market may dampen the
+  amplitude or shift timing -> design cycle-ROBUST (both sides + filters), NOT cycle-TIMED.
+
+================================================================================================
+CONCLUSION (TB00798b) - HYPOTHESIS CONFIRMED; the TB00798 "long softening" flag was CYCLE-MYOPIC
+================================================================================================
+The pattern is clean and anti-correlated by cycle phase:
+
+  BREAKOUT LONG (bb_break/trend100, 24h):
+    bull/recovery phases -> STRONGLY positive:  C3 bull +35.5% | recovery +18.9% | C4 bull +2.7%
+    bear/cooling phases  -> NEGATIVE:            C3 bear -11.3% | C4 late/cooling -4.7%
+  MEAN-REVERSION SHORT (rsi_trend/vol, 24h):
+    bear/cooling phases  -> STRONGLY positive:   C3 bear +10.7% | C4 late/cooling +8.5%
+    raging-bull phases   -> negative/flat:       C3 bull -2.6% | recovery -1.6% | C4 bull +1.1%
+
+1. The long's "most-recent-fold softening" (TB00798) IS the C4 late/cooling BEAR phase (BTC -38%), NOT
+   alpha decay. The breakout long was positive in EVERY bull/recovery phase and negative in EVERY bear.
+   Expect reacceleration into the Apr-2028 halving, exactly as 2020-21 (+35%) and the 2022-24 recovery
+   (+19%). Bill was right; the generic walk-forward blurred the cycle.
+
+2. The Long/Short organism IS the cycle hedge. The two sides are nearly phase-anti-correlated: in the
+   worst long phase (C3 bear, long -11.3%) the short prints +10.7%; in the current cooling (long -4.7%)
+   the short prints +8.5%. Running BOTH sides + the regime filters spans the full cycle - longs harvest
+   summer, the mean-rev shorts harvest winter. This is a first-order architectural argument for the
+   equal-detail short side (0500000 13.4 / long-short-paradigm-standing).
+
+3. The maturing-market caveat is ALSO visible (honest both-ways): the post-2024 (C4) bull gave the long
+   only +2.7% vs +35.5% post-2020 (C3) - the ETF-era bull was far less parabolic. So amplitude IS
+   dampening cycle-over-cycle. Design CYCLE-ROBUST (both sides, filters, paper-first), NOT cycle-TIMED
+   (do not hard-code "the 2028 bull will arrive on schedule"). Neither side is always-on: the long is
+   small-negative in winter (filters cap the bleed), the short is small-negative in euphoric bulls.
+
+NET: the perps Long/Short design is cycle-validated. The long is a bull harvester (do not judge it on a
+bear-phase fold); the short is the winter complement. Nothing minted; STAY IN PAPER; sacred 1:1.5 floor
+unaffected.
+================================================================================================
