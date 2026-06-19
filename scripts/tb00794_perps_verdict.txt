@@ -1,0 +1,144 @@
+================================================================================
+TB00794 - CRYPTO-PERPS RESEARCH PROBE - VERDICT
+  Re-run of the spot-arc battery (TB00779-786) on PERPETUAL FUTURES, both
+  directions, real funding swapped in for spot borrow.
+  Data: Binance USDT-margined (UM) perp klines + REAL fundingRate history,
+  30 pairs, ~6.4yr (2019/20 -> 2025; spans 2021 bull / 2022 bear / 2023-25),
+  data.binance.vision bulk mirror. Perp taker 0.05%/side (Kraken Futures),
+  vs the spot organism's 0.26%/side. Unlevered, fixed $50 notional, 8 eras,
+  OOS block-bootstrap, regime-robustness. Script: tb00794_perps_probe.py.
+================================================================================
+
+CENTRAL QUESTION: does removing borrow + adding real funding REVIVE the
+regime-gated SHORT (spot couldn't) and change the best LONG?
+
+ANSWER: YES, shorts revive decisively - BUT the dominant lever is the perp FEE
+(0.05% vs 0.26%/side), not funding. Funding is a small SHORT tailwind and a
+real LONG headwind. The best LONG shifts toward breakout entries; the
+carry-forward emacross long still works.
+
+--------------------------------------------------------------------------------
+1. SHORTS REVIVE (the headline)
+--------------------------------------------------------------------------------
+Regime-robust, OOS-bootstrap-SIG survivors from the full 9x4x15 nested search:
+
+                LONG-robust   SHORT-robust   (spot arc TB00779-786: SHORT = 0)
+   8h               105            63
+   12h               96            62
+   24h              105            40
+
+Spot found ZERO durable shorts across the entire arc. Perps yield 40-63
+regime-robust, bootstrap-SIG short survivors per slow timeframe. Decisive flip.
+
+Best SHORT configs (perp, regime-robust, bootstrap-SIG, OOS):
+   8h   bb_revert/trend100 + trail3.0x   +2.69%/tr  rr2.36  win44%  n=545
+        macd/btc_tide + trail3.0x        +1.56%/tr  rr1.81  win44%  n=1969
+        ema_cross/btc_tide + trail3.0x   +1.46%/tr  rr1.86  win42%  n=1705
+   12h  bb_revert/trend100 + trail3.0x   +3.08%/tr  rr2.18  win45%  n=421
+        macd/vol + trail2.0x             +1.54%/tr  rr1.95  win43%  n=1890
+   24h  rsi_trend/vol + 3xATR target     +2.58%/tr  rr1.88  win43%  n=552
+        ema_cross/vol + 3xATR target     +2.05%/tr  rr1.88  win42%  n=688
+
+COMMON THREAD of the winning shorts: mean-reversion / filtered entry
+(bb_revert overbought, rsi_trend, macd) + a TRAILING or fixed-TARGET exit +
+a regime filter (trend100 / vol / btc_tide). High win rate (42-46%), modest
+rr (1.6-2.4). This is EXACTLY the TB00785 mean-reversion-short profile that
+had a high win rate in spot but bled out on the small-win/big-loss asymmetry
+PLUS the 0.52% round-trip fee PLUS borrow. Strip ~47 bps/trade of cost and
+those shorts clear zero.
+
+--------------------------------------------------------------------------------
+2. WHAT ACTUALLY REVIVED THEM: FEE >> FUNDING (the honest decomposition)
+--------------------------------------------------------------------------------
+The focused carry-forward sweep prints funding per trade in bps (fund_bp) and
+E with funding zeroed (E_noFund), isolating funding's contribution:
+
+  - SHORT funding credit:  -2 to -15 bps/trade (shorts COLLECT positive funding).
+  - LONG funding drag:    +14 to +145 bps/trade (longs PAY funding; grows with
+                          hold time - ~115-145 bps/trade on slow 24h longs).
+  - FEE saving vs spot:   0.52% -> 0.10% round-trip = ~42 bps/trade, BOTH sides.
+
+So the revival math for shorts is ~42 bps (fee) + ~5-15 bps (funding credit)
+= ~50 bps/trade of cost removed vs the spot model. The funding credit alone is
+too small to revive shorts; the FEE is the load-bearing lever. Proof: the BARE
+trend-following carry-forward short (emacross/momentum + wide stop + reversal,
+no filter, no trail) stays FLAT on perps too -
+
+  Engine B  emacross SHORT  4h/8h:  ~0.00%/tr,  ci~0  (NOT revived)
+            momentum SHORT  4h/8h:  negative,   ci~0  (NOT revived)
+
+Funding did NOT fix trend-following shorts. The perp instrument's low fee
+revived the MEAN-REVERSION / filtered + trailing shorts that fees had erased.
+
+--------------------------------------------------------------------------------
+3. THE LONG (carry-forward transfers; best entry shifts to breakout)
+--------------------------------------------------------------------------------
+The TB00786 carry-forward LONG (slow + wide 2-2.5xATR + reversal) TRANSFERS and
+is strongly positive on perps:
+
+  Engine B  emacross LONG  4h  +1.0..1.35%/tr  6/8 eras
+                           8h  +2.3..3.0%/tr   6/8 eras
+                          24h  +12..15%/tr     (bull-INFLATED, n small - caveat)
+
+But the BEST long is no longer emacross - breakout entries dominate:
+   8h   bb_break/trend100 + wide stop + rev  +3.04%/tr  rr3.36  SIG (n=999)
+   12h  donchian/trend100 + wide stop + rev  +3.75%/tr  rr3.90  SIG (n=643)
+   24h  bb_break/vol + wide stop + rev       +8.90%/tr  rr4.04  SIG (n=265; bull-inflated)
+
+emacross/donchian/bb_break all clear; bb_break + a trend/vol filter is the
+strongest. The validated long EXIT (wide stop + run-to-reversal) is unchanged.
+
+NEW honest caveat for longs: funding is a real HEADWIND that scales with hold
+time. Slow-tf perp longs pay ~1-1.5% of notional per trade in funding. The edge
+survives because the gross move is large, but funding is not negligible and a
+fee-only model would overstate the slow-long edge.
+
+--------------------------------------------------------------------------------
+4. SKEPTICAL CAVEATS (TB00786-honest)
+--------------------------------------------------------------------------------
+a. FEE IS LOAD-BEARING. The entire short revival rides on 0.05% perp taker. The
+   short edge is THIN (+1.5%/tr, rr<2) and cost-sensitive: Engine B short cells
+   flip negative by ~10-20 bp of added slippage. If the live Kraken-perp taker /
+   effective spread is worse than 0.05%/side, the short edge erodes first. Longs
+   are far more robust to cost.
+b. ALT-SEASON INFLATION. The 24h LONG +8-15%/tr is inflated by the 2021/2024 alt
+   bull (same caveat as TB00786 spot). Honest forward is the 8h/12h band
+   (+1.5-3%/tr). 24h trade counts are small (n~265).
+c. SELECTION RISK. Engine A short survivors come from a 525-combo search;
+   multiple-comparison risk applies. Mitigated (not eliminated) by nested
+   IS/OOS + regime-robust + bootstrap, AND by the fact that 40-63 survive and
+   cluster on ONE coherent mechanism (mean-rev + trail + filter), not 1-2 random
+   cells.
+d. PERP HISTORY ~5-6yr (younger than spot's 7.5yr); some alts only ~2.5yr. The
+   8-era test spans 2021 bull / 2022 bear / 2023-25 and is meaningful, but the
+   deep-bear sample is thinner than spot's.
+e. FUNDING REGIME RISK. Shorts collect funding only while funding is positive
+   (the crypto-bull norm). In a sustained negative-funding (bear-led) regime the
+   short tailwind becomes a headwind; the fee advantage persists regardless.
+
+--------------------------------------------------------------------------------
+5. VERDICT
+--------------------------------------------------------------------------------
+PERPS VIABILITY:  YES, both directions clear the bar with TB00786 rigor, and by
+   a wider margin than spot (the 0.05% fee restores most of the edge the 0.26%
+   spot taker ate).
+
+SHORTS REVIVED:   YES - 40-63 regime-robust, bootstrap-SIG OOS survivors per slow
+   tf vs ZERO in spot. Mechanism = MEAN-REVERSION / filtered entry + trailing or
+   fixed-target exit + regime filter (NOT trend-following; bare trend shorts stay
+   flat). Driver = the perp FEE, with funding a small tailwind. Edge is real but
+   THIN and cost-sensitive.
+
+BEST LONG:        breakout (bb_break / donchian) + trend100/vol filter + wide
+   2-5xATR stop + run-to-reversal, slow tf (8-24h). The emacross carry-forward
+   long still works. Funding is a new, non-trivial long headwind.
+
+IMPLICATION (Bill's WHAT): this VALIDATES a perps expansion. Next-next step =
+design diagram-first - perps connectivity (Kraken Futures) + Short_Module
+RE-ACTIVATION (the machine is already Long/Short-symmetric; shorts were ratified
+OFF at TB00786 on SPOT economics, which this probe overturns FOR PERPS). The
+live read maps to Kraken's perp-listed subset present here: BTC ETH SOL XRP ADA
+AVAX BCH DOGE DOT LINK LTC. Recommend a SHORT module that trades the
+mean-reversion/filtered + trailing profile (NOT the long's trend-following
+logic) - the two sides want DIFFERENT mechanisms.
+================================================================================
