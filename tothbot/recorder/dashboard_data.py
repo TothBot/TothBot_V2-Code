@@ -56,17 +56,36 @@ def load_trades(path: str) -> list:
     return records
 
 
-def compute_performance(records: Sequence[Mapping], *, floor: int = 200, recent: int = 25) -> dict:
+def _side_of(r: Mapping) -> str:
+    return str(r.get("side") or "").upper()
+
+
+def compute_performance(
+    records: Sequence[Mapping], *, floor: int = 200, recent: int = 25, sides: "Sequence[str] | None" = ("LONG",)
+) -> dict:
     """Realized-performance VIEW over the trade records: count, win rate, cumulative + per-trade P/L,
     avg actual_rr, the equity curve (cumulative net P/L), progress to the 200-trade CIATS floor, and the
-    most-recent trades. All display floats; the durable JSONL stays the authoritative Decimal source."""
-    count = len(records)
+    most-recent trades. All display floats; the durable JSONL stays the authoritative Decimal source.
+
+    `sides` scopes the headline to the ACTIVE strategy (default LONG-only -- shorts were ratified OFF at
+    TB00786, the Short_Module stays in the machine but dormant, see long-short-paradigm-standing). Trades
+    on any OTHER side (e.g. the 5 retired legacy shorts) are EXCLUDED from the headline so they do not
+    contaminate the active strategy's stats, but are NOT erased -- they are summarized under `legacy`.
+    sides=None counts every record (no scoping)."""
+    if sides is None:
+        active, legacy = list(records), []
+    else:
+        allow = {s.upper() for s in sides}
+        active, legacy = [], []
+        for r in records:
+            (active if _side_of(r) in allow else legacy).append(r)
+    count = len(active)
     wins = losses = 0
     net_pl = 0.0
     rr_values: list = []
     equity: list = []
     running = 0.0
-    for r in records:
+    for r in active:
         pl = _f(r.get("net_pl_usd")) or 0.0
         net_pl += pl
         running += pl
@@ -94,6 +113,8 @@ def compute_performance(records: Sequence[Mapping], *, floor: int = 200, recent:
             "exit": _f(r.get("exit_price")),
         }
 
+    # Legacy (excluded sides, e.g. the retired short strategy): summarized, never erased.
+    legacy_net = round(sum((_f(r.get("net_pl_usd")) or 0.0) for r in legacy), 4)
     return {
         "trade_count": count,
         "wins": wins,
@@ -104,8 +125,10 @@ def compute_performance(records: Sequence[Mapping], *, floor: int = 200, recent:
         "avg_rr": (round(avg_rr, 4) if avg_rr is not None else None),
         "progress_to_floor": f"{count}/{floor}",
         "floor": floor,
+        "scope": ("+".join(s.upper() for s in sides) if sides is not None else "ALL"),
         "equity_curve": equity,
-        "recent": [_row(r) for r in list(records)[-recent:][::-1]],   # newest first
+        "recent": [_row(r) for r in active[-recent:][::-1]],   # newest first, active strategy only
+        "legacy": {"count": len(legacy), "net_pl_usd": legacy_net},
     }
 
 

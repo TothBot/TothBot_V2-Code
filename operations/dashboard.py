@@ -69,7 +69,7 @@ PAGE = r"""<!doctype html>
   <span class="pill">refreshed <b id="refreshed">--</b></span>
 </header>
 <main>
-  <section class="panel wide"><h2>Performance (realized, paper)</h2>
+  <section class="panel wide"><h2>Performance (realized, paper) &middot; <span class="mut" id="scope">LONG-only</span></h2>
     <div class="kpis">
       <div class="kpi"><div class="v" id="k_trades">--</div><div class="l">trades / floor</div></div>
       <div class="kpi"><div class="v" id="k_win">--</div><div class="l">win rate (target ~28%)</div></div>
@@ -78,6 +78,7 @@ PAGE = r"""<!doctype html>
       <div class="kpi"><div class="v" id="k_rr">--</div><div class="l">avg actual_rr</div></div>
     </div>
     <svg id="equity" viewBox="0 0 600 60" preserveAspectRatio="none"></svg>
+    <div id="legacy" class="mut" style="font-size:11px;margin-top:8px"></div>
   </section>
 
   <section class="panel"><h2>Open positions</h2><div id="positions"></div></section>
@@ -116,6 +117,9 @@ function render(s){
   $('k_net').innerHTML='<span class="'+sign(p.net_pl_usd)+'">'+num(p.net_pl_usd)+'</span>';
   $('k_avg').innerHTML='<span class="'+sign(p.avg_pl_per_trade)+'">'+num(p.avg_pl_per_trade)+'</span>';
   $('k_rr').innerHTML='<span class="'+sign(p.avg_rr)+'">'+num(p.avg_rr)+'</span>';
+  if(p.scope)$('scope').textContent=p.scope+'-only';
+  const lg=p.legacy||{count:0};
+  $('legacy').textContent=lg.count?('Legacy (retired '+'short'+' strategy, not counted): '+lg.count+' trades, net '+num(lg.net_pl_usd)+' $ — kept in history'):'';
   spark(p.equity_curve);
   $('positions').innerHTML=tbl(
     [['sym',r=>r.symbol],['side',r=>r.side],['qty',r=>num(r.qty,6)],['entry',r=>num(r.entry,4)],
@@ -129,10 +133,11 @@ function render(s){
      ['gap %',r=>num(r.gap_pct,3),r=>sign(r.gap_pct)],['close24h',r=>num(r.close_24h,2)]],
     board.map(r=>({...r,_cls:(r.gap_pct!==null&&r.gap_pct!==undefined&&Math.abs(r.gap_pct)<0.5)?'near':''})));
   const c=snap.ciats||{};
+  // LONG-only: shorts were ratified OFF (TB00786); the dormant SHORT module is hidden from the UI.
   $('ciats').innerHTML=tbl(
     [['module',r=>r.k.toUpperCase()],['trades',r=>r.trade_count??'--'],['win',r=>pct(r.win_rate)],
      ['net rr',r=>num(r.net_rr)],['pending',r=>r.pending??'--'],['floor',r=>r.progress_to_floor||'--']],
-    ['long','short'].map(k=>({k,...(c[k]||{})})));
+    ['long'].map(k=>({k,...(c[k]||{})})));
   $('trades').innerHTML=tbl(
     [['sym',r=>r.symbol],['side',r=>r.side],['reason',r=>'<span class="mut">'+(r.exit_reason||'')+'</span>'],
      ['net$',r=>num(r.net_pl_usd),r=>sign(r.net_pl_usd)],['rr',r=>num(r.actual_rr),r=>sign(r.actual_rr)],

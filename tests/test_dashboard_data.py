@@ -27,7 +27,7 @@ def _trade(net, rr, *, symbol="BTC/USD", side="LONG", reason="HTF_REGIME_REVERSA
 # --------------------------------------------------------------------------- compute_performance
 def test_performance_aggregates_count_winrate_pl_and_equity():
     recs = [_trade("2", "1.6"), _trade("-1", "-1"), _trade("3", "2.0"), _trade("-1", "-1")]
-    p = compute_performance(recs, floor=200)
+    p = compute_performance(recs, floor=200)               # all LONG -> all counted
     assert p["trade_count"] == 4 and p["wins"] == 2 and p["losses"] == 2
     assert p["win_rate"] == 0.5
     assert p["net_pl_usd"] == 3.0                       # 2-1+3-1
@@ -35,7 +35,30 @@ def test_performance_aggregates_count_winrate_pl_and_equity():
     assert p["avg_rr"] == round((1.6 - 1 + 2.0 - 1) / 4, 4)
     assert p["equity_curve"] == [2.0, 1.0, 4.0, 3.0]    # cumulative
     assert p["progress_to_floor"] == "4/200"
+    assert p["scope"] == "LONG" and p["legacy"]["count"] == 0
     assert p["recent"][0]["symbol"] == "BTC/USD"        # newest first
+
+
+def test_performance_scopes_to_long_only_and_summarizes_legacy_shorts():
+    # the active strategy is LONG-only (TB00786); retired SHORT trades must NOT contaminate the headline
+    # (win-rate / net P/L), but are summarized under `legacy` (kept in history, never erased).
+    recs = [
+        _trade("-1", "-3", side="SHORT"), _trade("-1", "-2", side="SHORT"),   # 2 legacy short losers
+        _trade("2", "1.6", side="LONG"), _trade("-1", "-1", side="LONG"),     # 2 active long trades
+    ]
+    p = compute_performance(recs, floor=200)
+    assert p["scope"] == "LONG"
+    assert p["trade_count"] == 2                          # ONLY the long trades in the headline
+    assert p["wins"] == 1 and p["losses"] == 1 and p["win_rate"] == 0.5
+    assert p["net_pl_usd"] == 1.0                         # 2 - 1 (the shorts excluded)
+    assert all(r["side"] == "LONG" for r in p["recent"])  # recent shows the active strategy only
+    assert p["legacy"] == {"count": 2, "net_pl_usd": -2.0}   # the 2 shorts summarized, not counted
+
+
+def test_performance_sides_none_counts_everything():
+    recs = [_trade("2", "1.6", side="LONG"), _trade("-1", "-1", side="SHORT")]
+    p = compute_performance(recs, sides=None)
+    assert p["trade_count"] == 2 and p["scope"] == "ALL" and p["legacy"]["count"] == 0
 
 
 def test_performance_empty_corpus_is_safe():
