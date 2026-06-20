@@ -1,0 +1,131 @@
+============================================================================================================
+TB00801a - HOW DOES THE HALVING CYCLE ENTER THE STRATEGY?  causal regime + Bill's asymmetric idea, scored
+  perp taker 0.05%/side, REAL funding, fixed $50 notional, 30-pair universe. Detectors are CAUSAL (<=t).
+============================================================================================================
+
+############################################################################################################
+# PART 1 - CAUSAL DETECTOR VALIDATION: % of each phase's BTC days the detector calls BULL (want hi in
+#          bull phases, lo in bear). A good causal detector reproduces the empirical bull/bear sign.
+############################################################################################################
+  phase                        truth  BTCb&h |  sma100 |  sma200 |    dd25 |   ret90 | halvclk
+  pre-halving accum 19-20      bull     +21% |     85% |    100% |     64% |     69% |    100%
+  C3 BULL (post-2020 halv)     bull    +683% |     83% |     82% |     78% |     81% |    100%
+  C3 BEAR / winter             bear     -75% |     13% |     11% |      7% |     19% |      3%
+  C3->C4 recovery              bull    +304% |     75% |     78% |     13% |     77% |    100%
+  C4 BULL (post-2024 halv)     bull     +76% |     67% |     80% |     98% |     70% |    100%
+  C4 late / cooling 25-26      bear     -38% |     22% |     12% |     23% |     16% |      8%
+
+  AGREEMENT (% of all BTC days the causal label matches the phase's hindsight bull/bear truth):
+     sma100    77.9%   (BEAR days called: 933/619)
+     sma200    83.4%   (BEAR days called: 865/619)
+     dd25      69.6%   (BEAR days called: 1165/619)
+     ret90     77.3%   (BEAR days called: 935/619)
+     halvclk   98.8%   (BEAR days called: 590/619)
+
+############################################################################################################
+# PART 2 - EDGE SPLIT BY CAUSAL REGIME (Bill's hypothesis: counter-cycle trades are the losers).
+#          with-cycle = LONG in detected-BULL, SHORT in detected-BEAR. counter = the opposite.
+#          E% / win / n. If counter-cycle E<0 and with-cycle E>0 under a CAUSAL label, the gate is real.
+############################################################################################################
+
+  detector = sma100
+    side           WITH-cycle E/win/n      COUNTER-cycle E/win/n
+    LONG          +14.16%  35%    578         +2.99%  30%    110
+    SHORT          +4.94%  49%    473         +0.68%  38%    534
+
+  detector = sma200
+    side           WITH-cycle E/win/n      COUNTER-cycle E/win/n
+    LONG          +15.38%  35%    520         +3.08%  30%    168
+    SHORT          +3.80%  49%    378         +2.01%  40%    629
+
+  detector = dd25
+    side           WITH-cycle E/win/n      COUNTER-cycle E/win/n
+    LONG          +14.51%  32%    363         +9.99%  37%    325
+    SHORT          +2.31%  46%    494         +3.04%  41%    513
+
+  detector = ret90
+    side           WITH-cycle E/win/n      COUNTER-cycle E/win/n
+    LONG          +15.20%  33%    498         +4.96%  37%    190
+    SHORT          +5.51%  52%    390         +0.89%  38%    617
+
+  detector = halvclk
+    side           WITH-cycle E/win/n      COUNTER-cycle E/win/n
+    LONG          +16.62%  38%    571         -8.36%  15%    117
+    SHORT          +9.45%  63%    276         +0.13%  36%    731
+
+  ROBUSTNESS (pooled across all validated configs, detector=sma200): counter-cycle E by side
+    LONG   WITH  +11.16%  35%   1458   COUNTER   +3.52%  31%    569
+    SHORT  WITH   +0.80%  38%   1181   COUNTER   +2.75%  43%   1766
+
+############################################################################################################
+# PART 3 - CANDIDATE-POLICY SCORECARD (primary 24h long+short organism, gate detector = sma200).
+#          MONEY = total $ P&L at $50/trade over full history; LOSS = max-drawdown proxy $ (chrono,
+#          overlapping -> comparative not tradable). worstPhE = worst hindsight-phase E%.
+############################################################################################################
+
+  -- baselines --
+  P0 no-gate (both always-on) [d] n= 1695  E/tr= +6.62%  total=$ +5608.2  maxDD=$  400.3  worstPhE= +0.20%
+      long-only no-gate          n=  688  E/tr=+12.38%  total=$ +4257.0  maxDD=$  555.2  worstPhE=-10.70%
+      short-only no-gate         n= 1007  E/tr= +2.68%  total=$ +1351.1  maxDD=$  579.9  worstPhE= -2.58%
+
+  -- Bill's idea + variants (counter-cycle = short-in-bull / long-in-bear) --
+  P1 hard-gate counter off [a-max] n=  898  E/tr=+10.50%  total=$ +4715.9  maxDD=$  559.3  worstPhE= -1.53%
+  P2 size-tilt counter x0.5 [b]  n= 1695  E/tr= +6.09%  total=$ +5162.0  maxDD=$  432.2  worstPhE= +0.47%
+  P3 quick-exit on counter [c]   n= 1695  E/tr= +5.63%  total=$ +4771.0  maxDD=$  538.5  worstPhE= -0.79%
+  P4 raise-bar counter (strict) [a] n= 1183  E/tr= +8.65%  total=$ +5117.9  maxDD=$  489.8  worstPhE= -0.19%
+  P5 Bill-combo strict+quick     n= 1183  E/tr= +7.87%  total=$ +4654.3  maxDD=$  514.3  worstPhE= -1.42%
+  P6 asym: gate LONG-in-bear only n= 1527  E/tr= +7.01%  total=$ +5349.2  maxDD=$  514.6  worstPhE= +0.20%
+  P7 asym + quick on short-in-bull n= 1527  E/tr= +6.26%  total=$ +4778.7  maxDD=$  539.3  worstPhE= -1.01%
+
+READ: compare every policy to P0. A winner makes MORE money (higher total$) AND/OR reduces losses
+  (lower maxDD, better worstPhE). Bill's idea = P1/P4 (gate or raise-bar the counter-cycle side);
+  the asymmetric reading (gate only the expensive long-in-bear side) = P6/P7.
+
+============================================================================================================
+CONCLUSION (TB00801a) - FIRST PRINCIPLES / DEMING: the cycle's role is the HEDGE, NOT a gate
+============================================================================================================
+
+1. THE CYCLE IS REAL AND CAUSALLY KNOWABLE (answers NSI sub-problem e). BTC daily close vs its own
+   200-day SMA (sma200) reproduces the hindsight bull/bear sign 83% of the time with NO lookahead and NO
+   cycle-timing assumption. It is the best honest detector. (halvclk scores 99% but that is CIRCULAR -
+   the hindsight phases ARE halving-anchored - and it is cycle-TIMED, which the NSI forbids; discount it.)
+
+2. BILL'S SEED IDEA, TESTED HONESTLY, IS DIRECTIONALLY RIGHT BUT THE REMEDY HURTS THE WHOLE ORGANISM.
+   - Directionally right: with-cycle E cleanly beats counter-cycle E on BOTH sides, under EVERY honest
+     detector (sma200: LONG +15.4% vs +3.1%; SHORT +3.8% vs +2.0%). The cycle orders expected value.
+   - But the counter-cycle trades are NOT money-losers under a causal label - they are merely
+     lower-edge POSITIVE. The reason: the per-pair trend100 + vol filters ALREADY screen the cycle drag.
+     The TB00798b -11%/-4.7% counter-cycle longs were UNCONDITIONAL phase cuts; once the causal detector
+     AND the filters are applied, the survivors print +3%. Only the CIRCULAR halvclk makes counter-cycle
+     longs look catastrophic (-8.4%) - i.e. Bill's gate only "works" if you cheat with the calendar.
+   - So gating costs money and ADDS drawdown: P1 hard-gate -16% total$ and maxDD $400->$559; every
+     gate/raise-bar/quick-exit variant (P1-P7) is DOMINATED by P0 on total$ AND maxDD AND worst-phase E.
+
+3. DEMING - OPTIMIZE THE WHOLE, NOT THE PART. Bill's gate optimizes each phase (don't fight the cycle)
+   but pessimizes the organism, because the two sides are phase-ANTI-CORRELATED and self-hedge:
+   running BOTH sides cuts max-drawdown BELOW either side alone ($400 vs long-only $555 / short-only
+   $580) and lifts the worst-phase E from the long-only -10.7% to +0.2%. The short side literally
+   rescues the long's winter. THAT is the cycle edge, quantified - and it is candidate (d): run both
+   sides at equal detail, no explicit cycle gate, let the existing filters + anti-correlation hedge.
+
+4. THE ONE DURABLE LEVER is the EV ORDERING (with-cycle >> counter-cycle), and it points to SIZE, not a
+   gate: P2 (counter x0.5 size-tilt) was the least-bad modifier (money $5608->$5162, maxDD $400->$432).
+   Even it does not beat P0 here - so nothing should be built now - but a GENTLE, CIATS-self-tuned,
+   paper-validated size tilt keyed on sma200 is the only cycle mechanism worth keeping on the table.
+   NEVER a hard gate, NEVER cycle-timing, NEVER a hand-set Bill knob (ciats-self-tuning + 200-trade floor).
+
+ANSWERS TO BILL'S TWO QUESTIONS:
+  Q1 MORE RESEARCH? Core question = answered (cycle real, detectable, gate rejected). YES on 3 bounded
+     cuts: (i) low-n bear side - only ~2 honest bear phases; re-test as C4 winter deepens / calibrate
+     sma200 on longer spot BTC history. (ii) a CIATS-self-tuned CONTINUOUS size tilt vs the binary gate
+     (the only modifier that nearly held money). (iii) detector robustness - confirm sma200 OOS and that
+     it is not just re-encoding trend100. NO to building any cycle GATE now; NO to halvclk cycle-timing.
+  Q2 HOW TO USE IT? Primary (already ratified, no new code): KEEP the both-sides equal-detail organism -
+     it IS the cycle hedge. Use the cycle knowledge to (a) NOT judge the breakout long on a bear-phase
+     fold (its softness is the C4 winter; expect reacceleration into Apr-2028), and (b) justify funding
+     the short side (winter harvester). Secondary (propose only, Bill's nod): register a CIATS theory =
+     gentle sma200 size tilt, to self-test in paper - do NOT fold into 0500000 until it beats P0 OOS.
+
+NET: do NOT add a cycle gate. The cycle is the ARCHITECTURAL ARGUMENT for the Long/Short organism Bill
+already ratified, plus at most a future CIATS size-tilt theory. Nothing minted; STAY IN PAPER; 1:1.5 floor
+untouched; 0500000 unchanged (propose only).
