@@ -1,0 +1,77 @@
+TB00812 - ALL FIVE TRADING MODES, REPORTED INDIVIDUALLY (Bill's WHAT; supersedes the partial TB00811)
+=====================================================================================================
+Bill WHAT: "Do the test on ALL of the modes we will be trading so we can do a meaningful analysis. I
+want Spot Longs, Long Perps only, Long Perps with Short Hedges, Short Perps only, Short Perps with
+Long Hedges. Report the results individually." The earlier TB00811 was perps-only on both sides + no
+spot + no breaker, so it could NOT support a credible cross-mode analysis - this run fixes that.
+
+METHOD: TB00806 data substrate (real spot universe + 30-pair perp universe + funding, daily 2019-2026)
++ the CAUSAL BTC 200d-SMA regime (no lookahead, the TB00801a detector ~83% phase-accurate). Profit =
+sum(pct x $50 clip) netted by exit timestamp; maxDD from that curve; Calmar = profit/maxDD; E/trade =
+mean per-trade edge. "+ hedge" modes = PRIMARY side full + OPPOSITE side a LIGHT 30% insurance overlay
+(a CIATS-tunable knob), with the live no-same-instrument-collision rule on the hedge side. Propose-only,
+STAY IN PAPER, no lookahead. CAVEAT: Spot (62 pairs, 0.26% taker) and Perps (30 pairs, ~0.05% taker +
+funding) are DIFFERENT universes/fee regimes - read each mode on its own terms, not $-for-$.
+
+THE FIVE MODES (full sample 2019-2026, then BULL/BEAR/CURRENT-winter)
+-----------------------------------------------------------------------------------------------------
+MODE 1  SPOT LONGS (the deployed EMA12/26 spot organism; spot, no leverage)
+  FULL 2019-2026   n=2380  profit=$+19688  maxDD=$1226  Calmar=16.1  win=29.1%  E/trade=+16.54%
+  BULL (summer)    n=1440  profit=$+17047  maxDD=$ 980  Calmar=17.4  win=28.7%  E/trade=+23.68%
+  BEAR (winter)    n= 940  profit=$ +2641  maxDD=$1265  Calmar= 2.1  win=29.7%  E/trade= +5.62%
+  CURRENT winter   n= 230  profit=$  -718  maxDD=$ 834  Calmar=-0.9  win=15.2%  E/trade= -6.24%
+
+MODE 2  LONG PERPS ONLY (perp breakout long; ~0.05% fee + funding)
+  FULL 2019-2026   n= 688  profit=$ +4259  maxDD=$ 514  Calmar= 8.3  win=34.0%  E/trade=+12.38%
+  BULL (summer)    n= 487  profit=$ +3891  maxDD=$ 302  Calmar=12.9  win=34.7%  E/trade=+15.98%
+  BEAR (winter)    n= 201  profit=$  +368  maxDD=$ 384  Calmar= 1.0  win=32.3%  E/trade= +3.66%
+  CURRENT winter   n=  44  profit=$   -98  maxDD=$ 183  Calmar=-0.5  win=18.2%  E/trade= -4.46%
+
+MODE 3  LONG PERPS + SHORT HEDGE (long full + short 30% insurance overlay)
+  FULL 2019-2026   n=1616  profit=$ +4760  maxDD=$ 403  Calmar=11.8  win=40.7%  E/trade= +7.34%
+  BULL (summer)    n=1059  profit=$ +4134  maxDD=$ 305  Calmar=13.6  win=38.5%  E/trade= +8.88%
+  BEAR (winter)    n= 557  profit=$  +626  maxDD=$ 259  Calmar= 2.4  win=44.7%  E/trade= +4.40%
+  CURRENT winter   n= 143  profit=$   -25  maxDD=$ 154  Calmar=-0.2  win=49.0%  E/trade= +2.02%
+
+MODE 4  SHORT PERPS ONLY (perp mean-reversion short)
+  FULL 2019-2026   n=1007  profit=$ +1353  maxDD=$ 605  Calmar= 2.2  win=43.3%  E/trade= +2.69%
+  BULL (summer)    n= 614  profit=$  +773  maxDD=$ 401  Calmar= 1.9  win=40.6%  E/trade= +2.52%
+  BEAR (winter)    n= 393  profit=$  +580  maxDD=$ 407  Calmar= 1.4  win=47.6%  E/trade= +2.95%
+  CURRENT winter   n= 100  profit=$  +241  maxDD=$  97  Calmar= 2.5  win=62.0%  E/trade= +4.81%
+
+MODE 5  SHORT PERPS + LONG HEDGE (short full + long 30% insurance overlay)
+  FULL 2019-2026   n=1580  profit=$ +2541  maxDD=$ 481  Calmar= 5.3  win=39.8%  E/trade= +6.73%
+  BULL (summer)    n=1043  profit=$ +1890  maxDD=$ 327  Calmar= 5.8  win=38.3%  E/trade= +8.62%
+  BEAR (winter)    n= 537  profit=$  +651  maxDD=$ 344  Calmar= 1.9  win=42.8%  E/trade= +3.04%
+  CURRENT winter   n= 142  profit=$  +212  maxDD=$ 120  Calmar= 1.8  win=48.6%  E/trade= +2.04%
+
+THE READS (honest, no hedging language)
+-----------------------------------------------------------------------------------------------------
+1. SPOT LONG is by far the biggest engine (+$19,688, Calmar 16.1) - universe size (62 pairs) + trade
+   count (2380). But it has NO downside protection and is the WORST hit in the current winter (-$718,
+   -6.24% E, 15% win). It is a SUMMER instrument (E +23.7% bull vs +5.6% bear).
+2. ADDING A HEDGE IMPROVES RISK-ADJUSTED RETURN on both sides (at the light 30% overlay):
+   - Long + short hedge (M3) Calmar 11.8 > long-perp-only (M2) 8.3, and profit is slightly HIGHER
+     (+$4,760 vs +$4,259) - the hedge here is better than free.
+   - Short + long hedge (M5) Calmar 5.3 > short-only (M4) 2.2, profit +$2,541 vs +$1,353 - the long
+     overlay nearly doubles the short book's risk-adjusted return.
+3. THE CURRENT WINTER is the decisive signal for the on/off call:
+   - Pure long books BLEED: spot -$718, long-perp -$98.
+   - The SHORT is the side that EARNS right now: short-only +$241 (62% win, Calmar 2.5).
+   - The HEDGED books are protected: long+short-hedge -$25 (vs -$98 naked), short+long-hedge +$212.
+   => Bill's instinct NOT to run long-only in this winter is CORRECT. But "neither side does well now"
+      is only HALF right: the LONG doesn't, the SHORT does, and the hedged books are roughly flat-to-up.
+4. SUMMER vs WINTER (the switch): longs dominate summer (spot E +23.7%), the short is a thin all-weather
+   edge that is RELATIVELY best in winter/cooling. So the cycle call is real - but TB00811 already showed
+   that MANUALLY flipping the switch underperforms just running BOTH sides always (the per-pair filters
+   already time it), and TB00801a/cycle-strategy-verdict reached the same conclusion. The hedge captures
+   the cycle by running both, not by an on/off switch.
+
+BOTTOM LINE
+-----------------------------------------------------------------------------------------------------
+  Best standalone engine = SPOT LONGS (but summer-only; bleeding now). Best risk-adjusted perp books =
+  the HEDGED modes (M3 long+short-hedge Calmar 11.8; M5 short+long-hedge Calmar 5.3), each beating its
+  naked side. Right NOW (winter): longs lose, the short earns, hedged books are protected. The data
+  supports running BOTH sides with a light hedge overlay over manually switching a single side on/off.
+  All figures are HISTORICAL BACKTEST at $50/trade, propose-only, STAY IN PAPER, no realized money, no
+  lookahead; the hedge weight (30%) is a CIATS-tunable knob (heavier = more drawdown cut, less return).
