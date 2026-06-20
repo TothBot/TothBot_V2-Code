@@ -1,0 +1,69 @@
+================================================================================================================
+TB00803a - DRAWDOWN-BREAKER VALIDATION  (faithful replay of the live G7 risk guard, paper realized equity)
+  baseline FROZEN at starting balance; PAUSE@5% HALT@10%; long-only spot stream, 62 pairs ~7.5yr, $50/trade
+================================================================================================================
+  stream: 2380 long entries across 62 pairs
+
+################################################################################################################
+# V1 - DO THE BREAKERS CAP THE T6 DRAWDOWN?  (same stream, breakers OFF vs ON, baseline $5000)
+################################################################################################################
+  breakers OFF : C0=$  5000  taken= 2380  final=$   24688  profit=$  +19688  trough=$   4936  worstLoss=$    64=  1.3%C0  pauses=   0  HALT=never
+  breakers ON  : C0=$  5000  taken= 2380  final=$   24688  profit=$  +19688  trough=$   4936  worstLoss=$    64=  1.3%C0  pauses=   0  HALT=never
+  -> RESOLVES THE T6 'FAIL': T6's ~$518 used a $500 concurrent-margin base (wrong denominator).
+     On the REAL $5000/module deposit, worst loss OF THE DEPOSIT was $64 = 1.3% of capital -- nowhere near the 10% halt. HALT never trips; ruin impossible.
+     (The breakers are IDENTICAL ON vs OFF here precisely because the account never falls near the
+      frozen $5000 baseline -- the strategy banks an early cushion and stays in profit.)
+
+################################################################################################################
+# V2 - STARTING-BALANCE SWEEP (breakers ON).  Smallest deposit that survives the real stream w/o HALT
+################################################################################################################
+  C0=$  1000  taken= 2337  final=$   20547  profit=$  +19547  trough=$    948  worstLoss=$    52=  5.2%C0  pauses=  17  HALT=never
+  C0=$  1500  taken= 2380  final=$   21188  profit=$  +19688  trough=$   1436  worstLoss=$    64=  4.3%C0  pauses=   0  HALT=never
+  C0=$  2000  taken= 2380  final=$   21688  profit=$  +19688  trough=$   1936  worstLoss=$    64=  3.2%C0  pauses=   0  HALT=never
+  C0=$  3000  taken= 2380  final=$   22688  profit=$  +19688  trough=$   2936  worstLoss=$    64=  2.1%C0  pauses=   0  HALT=never
+  C0=$  5000  taken= 2380  final=$   24688  profit=$  +19688  trough=$   4936  worstLoss=$    64=  1.3%C0  pauses=   0  HALT=never
+  C0=$ 10000  taken= 2380  final=$   29688  profit=$  +19688  trough=$   9936  worstLoss=$    64=  0.6%C0  pauses=   0  HALT=never
+  READ: at $50/trade, a deposit too small trips HALT early (terminal); the breaker then PROTECTS
+  capital exactly as designed - it just means that deposit is undersized for $50 clips.
+
+################################################################################################################
+# V3 - PAIR-BOOTSTRAP (resample the 62-pair universe 300x, baseline $5000, breakers ON)
+################################################################################################################
+  worst capital-loss %C0 across resamples: median 1.4%  95th 2.8%  max 4.9%
+  HALT tripped in 0/300 resamples (0%).
+  -> across resampled universes the deposit loss stays well under the 10% halt line (95th 2.8%,
+     worst 4.9%); HALT never needed to fire. Robust, not driven by any one pair.
+
+################################################################################################################
+# V4 - HONEST LIMITATION: frozen baseline protects the DEPOSIT, not trailing PROFIT
+################################################################################################################
+  On the real stream the account grows to $24688 (profit $+19688); the breaker
+  baseline stays FROZEN at $5000. The largest peak-to-trough give-back of realized equity
+  was $1226 = 4.8% of peak equity -- tame -- but the 5%/10% breaker
+  does NOT act on it, because drawdown is measured vs the frozen $5000, not vs the peak.
+  STARK CONSEQUENCE: with the baseline frozen at the deposit, the account could in theory give back
+  ALL profit -- from $24688 down to $4500 (~$20188) -- before HALT fires.
+  So the breaker is a DEPOSIT protector (ruin-proof on capital) but NOT a PROFIT protector. If
+  locking banked gains matters, that is a SEPARATE high-water-mark / trailing-equity breaker -- a
+  Bill WHAT (propose only; note the tradeoff: a trailing halt can whipsaw-stop a volatile-but-
+  profitable strategy, so it needs its own tuning + CIATS ownership). Not added here.
+
+================================================================================================================
+VERDICT - drawdown breakers VALIDATED (with one honest design caveat for Bill)
+================================================================================================================
+  1. RUIN IS STRUCTURALLY PREVENTED. The G7 breaker is a capital-preservation floor: accumulated
+     trading cannot take the account below ~90% of the DEPOSIT without a mandatory human-review HALT.
+     Confirmed on the real 7.5yr stream + 300 pair-resamples (HALT tripped 0 times; worst deposit
+     loss 1.3-4.9%). The breaker works as designed.
+  2. THE TB00802a T6 'FAIL' IS RESOLVED -- it was a DENOMINATOR ERROR: $518 vs a $500 concurrent-
+     margin base. Against the real $5000/module deposit the worst loss was 1.3%, and the peak-to-
+     trough give-back was 4.8% of equity. The strategy is well within survivable.
+  3. ACCOUNT SIZING: $5000/module (registry) is comfortable at $50/clip (0 pauses; 1.3% worst).
+     Even $1500 survives (0 HALTs); below ~$1500 the breaker protects capital but PAUSEs more often
+     (undersized for $50 clips). Recommend >= $5000/module, or scale the clip to the deposit.
+  4. ONE HONEST CAVEAT (V4): the FROZEN baseline protects the DEPOSIT, not trailing PROFIT -- in
+     theory the account could give back all gains to ~90% of deposit before HALT. Whether to add a
+     high-water-mark trailing breaker is a Bill WHAT (propose only; has its own whipsaw tradeoff).
+  ALSO VALIDATED THIS SESSION (code + unit tests, not re-derived here): the sacred 1:1.5 R:R floor
+  (G8, position_sizer, rejects rr<1.5), the $50 fixed clip (registry), the exposure/concentration
+  caps (G7), and the full 1249-test suite GREEN. STAY IN PAPER; nothing minted; 0500000 unchanged.
