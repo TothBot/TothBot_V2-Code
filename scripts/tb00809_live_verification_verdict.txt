@@ -1,0 +1,106 @@
+TB00809 - PERPS + HEDGING CODED INTO tothbot/ + TEST/STRESS-TEST VERDICT (the HARD GATE before paper)
+=====================================================================================================
+Bill WHAT (TB00809 NSI): CODE the perps + hedging into the live tothbot/ organism per the GRADUATED
+0500000 section 13 + Image10 + TB00000 v2_103 seeds (NO new module / NO new gate), THEN TEST +
+STRESS-TEST the ACTUAL code. The test + stress-test PASS is a HARD GATE in front of paper trading:
+DO NOT deploy the perps code to paper this session. PROPOSE-ONLY / DORMANT; STAY IN PAPER; sacred
+1:1.5 R:R floor NEVER lowered.
+
+WHAT WAS CODED (tothbot/perp/, propose-only / dormant - NOT wired into run_pipeline)
+-----------------------------------------------------------------------------------------------------
+  registry.py        +7 CIATS-owned perp seeds (perp_short_entry_meanrev / regime_filter / exit_trail
+                     / fee_per_contract / hedge_weight / funding_divergence_monitor / breaker_config);
+                     leverage_cap_short=3 REUSED (not re-added). SACRED stays 1, OPERATOR stays 2.
+  perp/margin.py     rule:Perp_Isolated_Margin_Loss_Cap - PerpContractSpec (lev / maint-margin ratio /
+                     contract multiplier; the ratio + multiplier are NON-PUBLIC swept placeholders,
+                     flagged MarginSourceStatus.SWEPT_PLACEHOLDER -> STAY IN PAPER until pinned) +
+                     evaluate_loss_cap (realized pool loss <= posted margin BY CONSTRUCTION) +
+                     whole-contract sizing. Mirrors the tb00806 oracle margin model.
+  perp/pools.py      mod:Long_Spot_Pool / Long_Perp_Pool / Short_Perp_Pool - re-groundings of the
+                     existing TB00000 sec 7 modules (the dormant Short_Module re-pointed to the perps
+                     route), each its OWN isolated wallet -> the structural RING-FENCE (battery C6).
+  perp/funding.py    mod:Perp_Funding_Divergence_Monitor - ONE new instance of the live
+                     ciats.EwmaMonitor (lambda=0.2, baseline=0, threshold=perp_funding_divergence_
+                     monitor seed, sustained_n=50), SIGNALS-ONLY (D5, cannot deadlock) + the 8h
+                     funding sign mirror + the exchange clamp.
+  perp/breaker.py    param:perp_short_breaker_config - the recalibrated per-module hedge breaker
+                     (PAUSE rolling 10% / HALT frozen 20%, V2) implemented ENTIRELY through
+                     pipeline.risk_guard.evaluate_risk_guard's EXISTING override params (no new gate)
+                     + a RollingPeakTracker for the exogenous (deadlock-safe) re-arm.
+  perp/collision.py  rule:No_Same_Instrument_Collision - no simultaneous long+short on one instrument.
+
+UNIT + INTEGRATION TESTS (the full existing suite stays green + the new tests)
+-----------------------------------------------------------------------------------------------------
+  Baseline suite at Code HEAD 7fee138: 1249 passed.
+  After the perps build: 1325 passed (1249 + 76 NEW perp tests; tests/test_perp_{margin,collision,
+  funding,breaker,pools}.py). Red suite would be NOT done; the suite is GREEN.
+
+RE-RUN OF THE TB00806 BATTERIES + WHOLE-ORGANISM + STRESS AGAINST THE LIVE CODE (the HARD GATE)
+-----------------------------------------------------------------------------------------------------
+  scripts/tb00809_live_verification.py drives the NEW LIVE code (tothbot.perp.*) through the tb00806
+  data substrate (the real 30-pair perp universe + spot universe + causal BTC regime) - so a PASS
+  proves the live-coded path reproduces what the research promised, not just the offline scripts.
+  Pre-registered pass bars; honest characterizations kept VISIBLE (non-gating). VERDICT: 23/23 GATING
+  PASS.
+
+  BATTERY C (live margin.evaluate_loss_cap) -- isolated-margin loss cap is STRUCTURAL:
+    [PASS] C1/C2/C4 loss-cap bound: 11865 live evaluations across real + gap-swept trades (gaps
+           5/10/20/50/84/99%, native-stop-fail), 0 cap breaches (realized pool loss <= posted margin).
+    [PASS] C1/C2 liq agreement live==oracle: 5394/5394 oracle-liquidations the live cap also bounds.
+    [PASS] C5 fat-tail MC: 40k draws, 99.9pct = max = $16.6667 == posted margin $16.6667.
+    [PASS] C6 ring-fence: crash Long-Perp 99% -> Long-Spot + Short-Perp pools bit-for-bit unchanged.
+    [PASS] C6 all-pairs cascade: 30 pairs' worst real wicks, 0 cap breaches.
+    [PASS] C7: liq_frac@3x = 0.323 > median native stop 0.225 -> liquidation is a TAIL backstop.
+
+  BATTERY A (live collision.filter, oracle equal-capital combined_curve) -- DRAWDOWN INSURANCE:
+    [PASS] A1a equal-capital combined maxDD $602 < long-only(spot) maxDD $1226 (51% lower).
+    [PASS] A5 live collision rule: 79/1007 shorts blocked; kept_ret +33.371 vs raw +27.058 (FREE).
+    [PASS] A2 long vs short monthly PnL corr = -0.124 over 70 shared months (anti-correlated).
+    [PASS] A7 combined worst month -$173 vs long-only -$452 (milder, at equal capital).
+    [honest] A1b combined Calmar 14.2 vs spot-long 16.1 -- the hedge is INSURANCE, not a return
+             improver (the win is the worst phase, not the average). Pre-registered, non-gating.
+
+  BATTERY B (live make_funding_divergence_monitor) -- funding is 2nd-order + monitored:
+    [PASS] B0 short funding sign mirror: 1007 trades, LIVE funding_cost/adverse match the oracle.
+    [PASS] B1 short COLLECTS funding on average: 742/1007 trades in a positive-funding regime.
+    [PASS] W2 monitor SILENT on real funding: 1007 real adverse obs -> 0 fires.
+    [PASS] W2 monitor FIRES on a sustained pinned-adverse pin (0.13%/day) -> fired; signals-only.
+    [honest] B2 break-even ~0.13%/day adverse funding -- above typical (~4x headroom), below the
+             0.225%/day clamp; the genuine sensitivity the funding monitor is built to flag. Non-gating.
+
+  WHOLE-ORGANISM + BREAKER (live evaluate_hedge_breaker):
+    [PASS] E V0 frozen-5% STRANGLES the hedge: taken 90/1007, pauses 917, profit -$304.
+    [PASS] E V2 rolling-10/halt-20 DEPLOYS the hedge: taken 1005/1007, pauses 2, profit +$1343.
+    [PASS] E V2 RUIN-SAFE: 0 HALTs, worst 7.5% deposit (under the 20% ruin floor).
+    [PASS] E V2 bootstrap ruin-safe: 150 resamples, 0 HALTs, worst-of-worst 15.3% < 20%.
+    [PASS] Spot LONG UNAFFECTED: taken 2380/2380, 0 pauses, 0 halts (breaker never fires).
+    [honest] W3 adding short capital does not improve whole-account return -> size it modestly (the
+             A6 frontier); it is bear/cooling insurance. Pre-registered, non-gating.
+
+  ADVERSARIAL STRESS (beyond the batteries):
+    [PASS] Deadlock-safety (TB00804 law): a paused hedge PASSES once the time-window peak re-arms
+           (exogenous, no self-equity trap).
+    [PASS] No-lookahead: the breaker/monitor consume time in order (RollingPeakTracker rejects a
+           decreasing timestamp); the replay realizes only PAST exits before each decision.
+    [PASS] Sacred 1:1.5 R:R floor intact: SACRED_RR_FLOOR == 1.5; no perp seed/code touches it.
+    [PASS] Margin specs flagged NON-PUBLIC swept placeholders -> STAY IN PAPER until pinned.
+
+BOTTOM LINE
+-----------------------------------------------------------------------------------------------------
+  The live-coded perps + hedging (tothbot/perp/, propose-only / dormant) REPRODUCES the TB00806
+  batteries C/A/B + the whole-organism + breaker analysis on the LIVE path, and survives the
+  adversarial stress: the isolated-margin loss cap is structural (realized loss <= posted margin on
+  every one of 11865 real+gap evaluations + a 40k fat-tail MC), the ring-fence is byte-isolated, the
+  recalibrated V2 breaker UNBLOCKS the hedge (90 -> 1005 of 1007) while staying ruin-safe (0 HALTs),
+  the funding monitor is signals-only and fires only on a sustained pinned-adverse regime, and the
+  sacred 1:1.5 R:R floor is never lowered. The two pre-registered honest results (A1b combined Calmar
+  does not beat the spot long; B2 sustained-adverse funding erases the thin short edge) are KEPT
+  VISIBLE - they characterize the hedge as bear/cooling INSURANCE sized via the A6 frontier, exactly
+  as the design intends.
+
+  HARD GATE: PASSED. The code is PROVEN against the batteries + stress. It is PROPOSE-ONLY / DORMANT
+  and was NOT deployed to paper this session (Bill's gate). NEXT Bill gates, in order: (1) pin the
+  NON-PUBLIC Kraken/Bitnomial maintenance-margin ratio + per-contract multiplier from the rulebook
+  (+ retail derivatives subaccount availability); (2) paper go-live of the coded perps organism;
+  (3) real-money go-live. The deployed long-only SPOT organism stays in its F3 paper observation,
+  UNAFFECTED. STAY IN PAPER; nothing erased; sacred 1:1.5 R:R floor never lowered.

@@ -218,6 +218,71 @@ REGISTRY: tuple[Param, ...] = (
         "(D9 net_loss / D3 R:R). CIATS-owned seed, refined from paper.",
     ),
 
+    # -- CIATS: perps (Long/Short perp pools; GRADUATED TB00807; 0500000 sec 13 + Image10) --
+    # Re-grounds the dormant Short_Module (TB00000 sec 7) from the spot-margin path onto the
+    # Kraken-Pro / Bitnomial perps route - a re-grounding, NOT a new module (0500000 sec 13.9).
+    # All CIATS-owned (DEC-124/DEC-128 seed-then-correct), per-module, starting values from the
+    # TB00794-806 research + refined from paper. Canonical in 0500000 sec 13 + Image10 (Perps
+    # Hedge Organism, R1). The perps organism STAYS IN PAPER; real-money go-live is a separate
+    # Bill gate. leverage_cap_short=3 (above) is REUSED unchanged to bound the perp short
+    # committed margin (TB00806 battery C validates the 2-3x band) - no new leverage seed.
+    Param(
+        "perp_short_entry_meanrev", None, _C, _M, "mean-reversion band",
+        "Recipe: the mean-reversion entry band for the perps short (the TB00794 short "
+        "survivors are mean-reversion + filtered, NOT breakout). Analogue of rsi_short_low/high "
+        "(70/50) but a DIFFERENT mechanism (mean-reversion, not SSS). Starting value derived "
+        "from TB00794, refined from paper from the 200-trade floor. 0500000 sec 13.4 SHORT entry.",
+    ),
+    Param(
+        "perp_short_regime_filter", None, _C, _M, "regime set",
+        "Recipe: the regime set in which the perps short is ENABLED (short only in the regimes "
+        "where TB00794/TB00805 showed it survives - a regime-concentrated bear/cooling hedge, "
+        "not all-weather alpha). Starting set derived from the TB00794 regime split, refined "
+        "from paper. 0500000 sec 13.4 SHORT.",
+    ),
+    Param(
+        "perp_short_exit_trail", None, _C, _M, "trail/target magnitude",
+        "Recipe: the trailing-or-target exit magnitude for the perps short (0500000 sec 13.4 "
+        "SHORT exit = trail/target, NOT a pure reversal). The wide layer:L2 stop REUSES "
+        "decision_atr_stop_mult (no new stop seed). Starting value from TB00794, refined from paper.",
+    ),
+    Param(
+        "perp_fee_per_contract", 0.0005, _C, _PS, "fraction",
+        "ROUTE-DEPENDENT perp fee (analogue of FEE_TAKER_PCT). PRIMARY Kraken-Pro route = the "
+        "Kraken maker/taker schedule (RE-VERIFY at code time - NOT the flat Bitnomial-direct "
+        "rate); DIRECT-Bitnomial FALLBACK route = flat ~$0.07-0.10/contract (maker==taker). The "
+        "0.0005 (5 bps) seed is the TB00806-validated research rate; folds into perp net_loss + "
+        "the sacred 1:1.5 R:R floor; CIATS-monitored for tier divergence. 0500000 sec 13.6.",
+    ),
+    Param(
+        "perp_short_hedge_weight", (0.90, 0.05, 0.05), _C, _M, "Long-Spot/Long-Perp/Short-Perp",
+        "The A6 allocation-frontier short-sizing knob (HOW MUCH Short-Perp to run as a hedge), "
+        "as a (Long-Spot, Long-Perp, Short-Perp) capital split. Seed = LIGHT ~90/5/5 (keeps "
+        "~100% of long-only Calmar while buying tail insurance; TB00806 A6). Sized as INSURANCE, "
+        "NOT a co-equal profit center (0500000 sec 13.8). CIATS-owned (the A6 frontier), NOT a "
+        "hand-set Bill knob.",
+    ),
+    Param(
+        "perp_funding_divergence_monitor", 0.0005, _C, _M, "fraction/day",
+        "The sustained-adverse-funding monitor THRESHOLD - ONE new instance of the live "
+        "EwmaMonitor (the fee_tier_divergence machinery, ciats/ewma_monitor.py; lambda=0.2, "
+        "baseline=0, sustained_n = fee_tier_divergence_sustained_trades = 50). SIGNALS-ONLY "
+        "(TB00000 D5: monitors/alerts, never self-adjusts - routes to the CIATS PDCA cycle + "
+        "Bill HR-CI-011), so it CANNOT deadlock. Covers the TB00806 battery-B sensitivity "
+        "(break-even ~0.121%/day adverse funding). 0500000 sec 13.9.",
+    ),
+    Param(
+        "perp_short_breaker_config", (0.10, 0.20, "rolling", 180), _C, _M,
+        "pause_pct / halt_pct / pause_baseline / window_days",
+        "Per-module hedge breaker for the Short-Perp pool (TB00806e V2 winner), as "
+        "(pause_pct, halt_pct, pause_baseline, window_days): PAUSE = rolling-window 10% "
+        "(exogenous re-arm over a 180-day high-water window) / HALT = frozen-deposit 20% (ruin "
+        "floor). NOT a new gate - it is evaluate_risk_guard's EXISTING override params "
+        "(baseline-source + the two thresholds) set per-module. The frozen-deposit ruin HALT + "
+        "the sacred 1:1.5 R:R floor are untouched; the spot LONG keeps its 5%/10% frozen-baseline "
+        "breaker (unaffected). 0500000 sec 13.9.",
+    ),
+
     # -- CIATS: VPS deployment (single process, universal) -------------
     Param("StartLimitBurst", 3, _C, _U, "count", "systemd restart cap."),
     Param("StartLimitIntervalSec", 600, _C, _U, "s", "systemd restart window."),
