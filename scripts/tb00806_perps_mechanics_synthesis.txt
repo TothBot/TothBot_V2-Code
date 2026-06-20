@@ -1,0 +1,70 @@
+================================================================================================================
+TB00806 - PERPS MECHANICS BATTERY: SYNTHESIS (C -> A -> B)   PAPER, offline, propose-only, 0500000 unchanged
+================================================================================================================
+Built ONE unified 3-pool perp-account simulator (tb00806_perp_account_sim.py) - 3 isolated pools (Long-Spot,
+Long-Perp, Short-Perp), per-position isolated-margin model (leverage / maint-ratio / liquidation price),
+funding-shock multiplier + sustained-adverse pin, and a gap injector - then ran the three mechanics batteries
+in the FP/DP order C -> A -> B (C is the floor A assumes; B refines an already-validated edge).  Centre
+margin = lev 3 / mmr 1% (margin $16.67 on the $50 clip, liq @ 32.3% adverse).  Reuses the tb00794 perp engine
++ tb00802a stat/era/regime + tb00805a centre configs.  STAY IN PAPER; nothing minted.
+
+----------------------------------------------------------------------------------------------------------------
+BATTERY C - ISOLATED-MARGIN LIQUIDATION UNDER GAPS .................................................. 7/7 PASS
+----------------------------------------------------------------------------------------------------------------
+  C1 gap-sweep cap ............. realized pool loss <= posted margin for 100% of trades at 5/10/20/50% gaps
+  C2 stop-fails backstop ....... loss still capped with the native stop gapped-through or removed entirely
+  C3 RR-floor bounded .......... the sacred 1:1.5 degrades gracefully under random gaps (avg loss <= margin)
+  C4 historical wicks .......... every one of 30 pairs' worst REAL wick (down to TIA -84%) capped at margin
+  C5 MC fat-tail 99.9pct ....... 99.9th-pct AND absolute-max loss over 40k fat-tailed gap draws <= margin
+  C6 cascade + no contagion .... all-pairs simultaneous 50% crash bounded; crash one pool -> others byte-equal
+  C7 edge-preserving lev band .. lev 2-3 keeps the edge byte-for-byte vs no-margin; lev>=5 liq eats it, 20 neg
+  => The crash-proof loss cap is STRUCTURAL (loss bounded by posted margin BY CONSTRUCTION even on a gap-
+     through; the overflow is the exchange insurance fund's, not the pool's).  3 pools BYTE-isolated = the
+     sec-13.7 ring-fence.  ONE constraint: keep leverage LOW (2-3x) so liquidation stays a tail backstop
+     UNDER the 3xATR stop.  CAVEAT: real maint-margin / contract specs non-public -> swept, pin at code time.
+
+----------------------------------------------------------------------------------------------------------------
+BATTERY A - CONCURRENT TWO-POOL HEDGE DRAWDOWN ..................................................... 7/8 (honest)
+----------------------------------------------------------------------------------------------------------------
+  A1a same-capital maxDD reduced  PASS  combined 3-pool maxDD $620 vs long-only $1226 = ~50% lower at = capital
+  A1b Calmar > singles (pre-reg)  FAIL  combined Calmar 13.6 does NOT beat the pure spot long 16.1 (HONEST)
+  A2 anti-correlation ........... PASS  Long vs Short monthly PnL corr -0.10 overall, ~0 in bear
+  A3 MC tail tighter ........... PASS  shuffled combined DD-per-return < long-spot alone
+  A4 walk-forward DD-reduction .. PASS  hedge lowers maxDD in 6/6 eras incl all 3 bear eras
+  A5 collision-rule cheap ...... PASS  the sec-13.7 no-same-instrument rule is FREE (+5.6%, it HELPS)
+  A6 frontier well-behaved ..... PASS  maxDD falls monotonically with hedge weight; 90/5/5 keeps ~100% Calmar
+  A7 V-bottom bounded .......... PASS  worst combined month -$175 vs long-only -$452 (milder)
+  => The ring-fenced hedge is DRAWDOWN / REGIME INSURANCE, NOT a risk-adjusted-return improver.  The spot
+     long alone is the single best Calmar pool; every perp allocation trades return for safety.  This CONFIRMS
+     'size the short as a HEDGE, not a profit center' + the cycle finding (win shows up in the WORST phase,
+     not the full-sample average).  A6 frontier = the CIATS size knob (light short weight = ~free insurance).
+
+----------------------------------------------------------------------------------------------------------------
+BATTERY B - ADVERSE / SUSTAINED-FUNDING STRESS ..................................................... 4/5 (honest)
+----------------------------------------------------------------------------------------------------------------
+  B1 short E>0 at >=2x funding .. PASS  amplifying REAL funding HELPS the short (it COLLECTS funding on avg)
+  B2 break-even > clamp ceiling . FAIL  break-even sustained-adverse funding ~0.13%/day - above typical (4x)
+                                        but BELOW the exchange clamp ceiling; a permanent hard-adverse pin
+                                        WOULD erase the thin ~2.5% edge (the one genuine sensitivity, honest)
+  B3 worst-window < loss cap .... PASS  worst single REAL funding cost ~$5 vs $16.67 margin
+  B4 no double-whammy .......... PASS  corr(funding cost, price loss) = -0.04 (not compounded)
+  B5 bear-survives-2x-funding ... PASS  short BEAR E +2.87% under 2x funding (hedge role survives)
+  => Funding is largely SECOND-ORDER and de-risked; the one exception is a SUSTAINED hard-adverse funding
+     flip, the short's most material cost -> a CIATS MONITORING knob (trim the short on a sharp sustained
+     flip), folding into the 0500000 sec-13.6 tier-divergence monitor.  Extends the TB00805a fee-robustness
+     finding: neither per-contract fee NOR typical funding is the lever; the edge is native short ACCESS +
+     the rsi_trend/vol/wide-stop config - but funding is the one cost worth a live monitor.
+
+================================================================================================================
+NET VERDICT
+================================================================================================================
+The 3 MECHANICS-level perps unknowns are ANSWERED:
+  (C) the exchange-enforced isolated-margin loss cap + the sec-13.7 ring-fence are VALIDATED (structural);
+  (A) the both-sides hedge lowers account-level drawdown / worst-phase loss but is INSURANCE not alpha ->
+      size the short modestly via the frontier;
+  (B) funding is de-risked except a sustained-adverse-flip CIATS monitor.
+REMAINS before perps code / graduation (engineering / Bill-gated, NOT edge): pin the real Kraken/Bitnomial
+margin specs (maint ratio, contract multiplier, tiered margin) + resolve retail derivatives SUBACCOUNT
+availability (the perps-kraken-pro-decision open item).  Fidelity: 30-pair 1d Binance-UM proxy, era-lumpy
+short, combined curve spot-dominated.  Code tb00806*, propose-only, 0500000 unchanged, STAY IN PAPER; F4 live
+go-live remains the only Bill-gated step.

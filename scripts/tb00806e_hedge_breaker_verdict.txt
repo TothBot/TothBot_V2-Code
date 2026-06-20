@@ -1,0 +1,80 @@
+======================================================================================================================
+TB00806e - RECALIBRATE THE SHORT-MODULE BREAKER FOR A HEDGE, and test it through the LIVE gate
+  HALT stays on the frozen deposit (ruin floor); PAUSE moves to an exogenously-re-arming basis.
+  PAPER, offline, propose-only, 0500000 unchanged, STAY IN PAPER.
+======================================================================================================================
+  long module (unchanged 5/10): taken=2380/2380 final=$  24688 profit=$ +19688 maxDD=24.5%dep worstLoss= 1.3%dep pauses=  0 HALT=never Cal=16.1
+  long-only whole account: final=$24688 maxDD=24.5%dep Calmar=16.1; BEAR-phase maxDD=$1212
+
+######################################################################################################################
+# E1 - SHORT MODULE under each breaker variant.  Goal: the hedge DEPLOYS (taken >> 90) while RUIN
+#   stays prevented (0 HALTs AND worst deposit loss < halt line).
+######################################################################################################################
+  V0 frozen 5/10 (live default)    taken=  90/1007 final=$   4696 profit=$   -304 maxDD= 9.0%dep worstLoss= 6.1%dep pauses=917 HALT=never Cal=-0.7
+  V1 frozen 15/25 (wider band)     taken=1007/1007 final=$   6353 profit=$  +1353 maxDD=12.2%dep worstLoss= 7.5%dep pauses=  0 HALT=never Cal= 2.2
+  V2 rolling-pause 10 / halt 20    taken=1005/1007 final=$   6343 profit=$  +1343 maxDD=12.1%dep worstLoss= 7.5%dep pauses=  2 HALT=never Cal= 2.2
+  V3 frozen 15/25 + BEAR arm       taken=1007/1007 final=$   6353 profit=$  +1353 maxDD=12.2%dep worstLoss= 7.5%dep pauses=  0 HALT=never Cal= 2.2
+  V4 halt-only 20 (no pause)       taken=1007/1007 final=$   6353 profit=$  +1353 maxDD=12.2%dep worstLoss= 7.5%dep pauses=  0 HALT=never Cal= 2.2
+  READ: V0 benches the hedge (90 trades); the recalibrated variants let it deploy. HALT must stay
+  'never' and worst-loss under the halt line for ruin to remain prevented.
+
+######################################################################################################################
+# E2 - WHOLE ACCOUNT (long $5000 unchanged + short $5000 under each variant).  The hedge's JOB is to
+#   cut BEAR-phase drawdown without adding ruin.  Compare vs long-only.
+######################################################################################################################
+  variant                          || whole final$ whole maxDD% BEAR maxDD$ vs long-only BEAR
+  long-only (no short)             ||       24688       24.5%        1212       (reference)
+  V0 frozen 5/10 (live default)    ||       29384       12.3%        1212           no help
+  V1 frozen 15/25 (wider band)     ||       31041       15.8%        1185           CUTS 2%
+  V2 rolling-pause 10 / halt 20    ||       31031       15.8%        1185           CUTS 2%
+  V3 frozen 15/25 + BEAR arm       ||       31041       15.8%        1185           CUTS 2%
+  V4 halt-only 20 (no pause)       ||       31041       15.8%        1185           CUTS 2%
+  READ: a working hedge should CUT the whole-account BEAR-phase drawdown vs long-only (its purpose);
+  whole maxDD% is over total deposit so it also falls as the (idle-proof) short capital is added.
+
+######################################################################################################################
+# E3 - PICK THE WINNER (pre-registered bars) + ROBUSTNESS
+######################################################################################################################
+  V1 frozen 15/25 (wider band)     deploy=PASS     ruin_prevented=PASS     cuts_bear_DD=PASS     -> qualifies
+  V2 rolling-pause 10 / halt 20    deploy=PASS     ruin_prevented=PASS     cuts_bear_DD=PASS     -> qualifies
+  V3 frozen 15/25 + BEAR arm       deploy=PASS     ruin_prevented=PASS     cuts_bear_DD=PASS     -> qualifies
+  V4 halt-only 20 (no pause)       deploy=PASS     ruin_prevented=PASS     cuts_bear_DD=PASS     -> qualifies
+  NOTE: every recalibrated variant is OUTCOME-EQUIVALENT (same +$1353, same bear-DD) - once the pause
+  band clears the hedge's ~7.5% natural operating drawdown, the hedge fully deploys and the rolling/
+  regime sophistication never activates. So the choice is on PRINCIPLE: the TIGHTEST ruin HALT floor
+  that clears the bootstrap-worst loss with margin, plus an EXOGENOUS (deadlock-safe) re-arm.
+
+  PRINCIPLED WINNER: V2 rolling-pause 10 / halt 20  (tightest safe halt floor + exogenous rolling re-arm)
+
+  ROBUSTNESS - pair-bootstrap the winner's short module (150 resamples): does ruin stay prevented?
+  worst deposit-loss %dep across resamples: median 7.9%  95th 10.9%  max 14.7%  (halt line 20%)
+  HALT tripped in 0/150 resamples; median deploy rate 100% of trades.
+  -> ruin stays prevented under resampling (no HALT, worst loss < halt line): PASS
+
+======================================================================================================================
+VERDICT - the recalibrated hedge breaker.  Propose-only; STAY IN PAPER.
+======================================================================================================================
+  PASS      E winner deploys + ruin-safe + cuts bear DD
+  PASS      E winner ruin-safe under bootstrap
+
+  THE RECALIBRATION WORKS - Bill's WHAT is accomplished. The strangler was the 5% session-PAUSE
+  measured vs the FROZEN deposit (a hedge sits at a drawdown-from-deposit by design, so it was
+  benched - 90/1007 trades, and it could not self-equity-recover to un-pause = the TB00804 deadlock).
+  FIX: keep the HALT on the frozen deposit (ruin floor) but move the PAUSE to an EXOGENOUSLY-re-arming
+  basis wide enough to clear the hedge's ~7.5% natural operating drawdown. The hedge now DEPLOYS
+  (1005/1007 trades), is RUIN-SAFE (HALT never trips; worst deposit loss 7.5% on the real
+  stream, bootstrap-worst ~15% both under the 20% halt), and flips from -$304-benched to +$1353.
+  PRINCIPLED CHOICE = V2 rolling-pause 10 / halt 20: every deploying variant is OUTCOME-EQUIVALENT (same return, same bear-DD),
+  so the pick is the TIGHTEST safe ruin HALT (20%, clears the ~15% bootstrap-worst with margin) with an
+  EXOGENOUS rolling-window re-arm (deadlock-safe). The regime-arm (V3) is unnecessary - the widened
+  band already prevents strangling. MECHANISM: implemented ENTIRELY through the LIVE evaluate_risk_guard's
+  existing override params (portfolio_baseline + the two thresholds) - NO new gate code; a per-MODULE
+  breaker config + a baseline-source policy, CIATS-ownable. Sacred 1:1.5 R:R + the frozen ruin HALT
+  untouched.
+  HONEST LIMIT (do not oversell): at $5000/$5000 the deployed hedge cuts whole-account BEAR-phase
+  drawdown only modestly ($1212 -> $1185, ~2%) - the long's bear bleed
+  dominates and the thin short's bear gains are small. The recalibration UNBLOCKS the hedge and makes
+  it ruin-safe + return-positive; how much drawdown protection to BUY is the battery-A allocation-
+  frontier tradeoff (more short weight = more protection, less blended return) - a CIATS/Bill sizing
+  call, not a breaker question. CAVEAT: paper realized-equity basis (MTM fires sooner = FN-safe);
+  perp short is the proposed revival (live short = spot-margin, dormant). Propose-only; STAY IN PAPER.

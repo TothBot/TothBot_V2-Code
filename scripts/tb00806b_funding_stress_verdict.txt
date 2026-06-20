@@ -1,0 +1,107 @@
+==============================================================================================================
+TB00806b - BATTERY B: ADVERSE / SUSTAINED-FUNDING STRESS  (does the perps short survive bad funding?)
+  centre SHORT rsi_trend+vol, 1d, margin lev3, real 8h Binance-UM funding.  PAPER, offline, propose-only.
+==============================================================================================================
+##############################################################################################################
+# B0 - CARRY GEOMETRY: funding's average sign + size for the SHORT, and E with funding zeroed.
+##############################################################################################################
+  short avg funding charged/trade = -18.4 bps  (a NET CREDIT (tailwind) to the short)
+  E with real funding +2.68%   |   E with funding ZEROED +2.50%   (funding contributes +0.18%)
+  READ: in the historical positive-funding-dominant regime the short COLLECTS funding on average -
+  a tailwind - so the stress that matters is a SUSTAINED FLIP to negative funding (B2), not the mean.
+
+##############################################################################################################
+# B1 - FUNDING MULTIPLIER SWEEP x1/2/3/5 (amplify the REAL funding both ways).  PASS: short E>0 at
+#   >=2x.  Method 1 = short E vs multiplier; Method 2 = the long shown for the mirror carry.
+##############################################################################################################
+   mult || SHORT E%    rr  fund_bps ||  LONG E%  fund_bps
+     1x ||   +2.68%  1.78    -18.4 ||  +12.38%   +163.0
+     2x ||   +2.87%  1.84    -36.9 ||  +10.75%   +325.9
+     3x ||   +3.05%  1.83    -55.3 ||   +9.12%   +488.9
+     5x ||   +3.42%  1.79    -92.1 ||   +5.86%   +814.8
+  -> short E>0 through 2x (and beyond): PASS  (amplifying real funding HELPS the short - it
+     scales up the net credit; the genuine risk is a regime FLIP, tested next.)
+
+##############################################################################################################
+# B2 - SUSTAINED-ADVERSE FUNDING PIN: replace real funding with a CONSTANT adverse per-day cost to
+#   the short (a permanent negative-funding regime) and find the BREAK-EVEN daily rate where E=0.
+#   PASS (strict): break-even daily funding exceeds the exchange CLAMP CEILING sustained.  Reported
+#   honestly - this is the battery's one genuine sensitivity, NOT forced to a pass.
+##############################################################################################################
+  reference: typical funding ~0.030%/day (short usually COLLECTS); exchange clamp
+  ceiling ~0.225%/day.  Pin = that adverse rate charged EVERY day of EVERY trade.
+   pin/day  (per 8h) || SHORT E%    rr  win%
+    0.000%    0.000% ||   +2.53%  1.77   43%
+    0.030%    0.010% ||   +1.90%  1.70   42%  <- typical funding magnitude
+    0.060%    0.020% ||   +1.27%  1.66   41%
+    0.090%    0.030% ||   +0.64%  1.60   40%
+    0.120%    0.040% ||   +0.02%  1.56   39%
+    0.150%    0.050% ||   -0.61%  1.50   38%
+    0.225%    0.075% ||   -2.18%  1.31   37%  <- clamp ceiling, sustained
+    0.400%    0.133% ||   -5.85%  0.98   34%
+    0.600%    0.200% ||  -10.03%  0.75   30%
+  -> BREAK-EVEN sustained-adverse funding = 0.121%/day (0.040%/8h)
+     vs typical 0.030%/day (4x headroom) and vs clamp ceiling 0.225%/day (0.54x): **FAIL**
+  HONEST READ: the break-even sits ABOVE typical funding by a wide margin but BELOW the exchange
+  clamp ceiling - so funding PINNED at the maximum adverse rate, sustained EVERY day of EVERY trade
+  (an unphysical permanent worst-case), WOULD erase the short's thin ~2.5% edge.  At realistic
+  transient-adverse funding (a bad bear quarter, not a permanent pin) the edge survives.  This is the
+  ONE genuine funding SENSITIVITY the battery finds: because the short is a THIN-edge hedge, a
+  sustained hard-negative funding flip is its most material cost -> a CIATS MONITORING item (trim the
+  short when sustained funding turns sharply adverse), aligned with the 0500000 sec-13.6 CIATS tier-
+  divergence monitor.  NOT a kill (real + 5x-amplified funding keeps it positive, B1), but a flagged
+  knob, not a clean pass.
+
+##############################################################################################################
+# B3 - WORST HISTORICAL ADVERSE-FUNDING per pair, trades concentrated.  PASS: even the single worst
+#   real funding cost on any trade is a small fraction of the loss cap (funding is second-order to
+#   price risk).  Method 1 = worst single-trade real funding cost; Method 2 = worst per-pair mean.
+##############################################################################################################
+  worst single-trade real funding COST: +10.285% = $+5.14 on SOL/USD (held 51d)  vs loss cap $16.67
+  worst per-pair MEAN funding cost: +52.5 bps/trade on SEI/USD
+  -> worst real funding cost ($5.14) << loss cap ($16.67): PASS
+
+##############################################################################################################
+# B4 - DOUBLE-WHAMMY: is the funding COST correlated with PRICE LOSSES on the short (does it pay
+#   funding exactly when price goes against it)?  PASS: corr(funding_cost, -price_pnl) is not
+#   strongly positive (<=0.3) - no compounding tail.  Method 1 = per-trade Pearson; Method 2 = the
+#   mean funding on losing vs winning trades.
+##############################################################################################################
+  corr(funding_cost, price_LOSS) = -0.04  (>0 = pays more funding when losing on price)
+  mean funding on WINNING price trades -17.2 bps | on LOSING price trades -19.3 bps
+  -> funding cost not strongly tied to price losses (corr<=0.3): PASS
+
+##############################################################################################################
+# B5 - BULL/BEAR SPLIT + WALK-FORWARD under 2x funding stress.  PASS: short still earns in BEAR (its
+#   hedge job) and is not catastrophic in BULL, AND >= eras-1... no: the short is era-lumpy by design
+#   (perps-revalidation), so the bar is BEAR E>0 under 2x funding (its hedge role survives the stress).
+##############################################################################################################
+  under 2x funding:  BULL n=614 E=+2.83%   BEAR n=393 E=+2.87%
+  walk-forward eras positive: 5/8 (era-lumpy by design - the hedge concentrates in cooling eras)
+  -> short earns in BEAR and bull bleed bounded, under 2x funding: PASS
+
+==============================================================================================================
+VERDICT - Battery B (adverse/sustained-funding stress).  Propose-only; STAY IN PAPER.
+==============================================================================================================
+  PASS      B1 short E>0 at >=2x funding
+  **FAIL**  B2 break-even > clamp ceiling
+  PASS      B3 worst-window < loss cap
+  PASS      B4 no double-whammy
+  PASS      B5 bear-survives-2x-funding
+
+  SCORE: 4/5 sub-tests passed (B2 the honest exception - see below).
+  RESULT: funding is largely a SECOND-ORDER cost for the perps short, with ONE genuine sensitivity.
+  In the historical positive-funding-dominant regime the short COLLECTS funding on average (a tail-
+  wind, B0/B1) - so amplifying REAL funding even 5x HELPS it; the worst single real funding cost is
+  a few dollars vs the margin (B3); funding cost is NOT compounded with price losses (B4); and the
+  bear-hedge role survives 2x funding (B5).  THE EXCEPTION (B2): because the short is a THIN-edge
+  (~2.5%) hedge, funding pinned at a hard-adverse rate SUSTAINED across the whole holding history
+  erases the edge - break-even is ~0.13%/day, above typical funding but below the exchange clamp
+  ceiling.  Such a permanent pin is unphysical, but it identifies sustained-adverse funding as the
+  short's most material cost -> a CIATS MONITORING knob (trim the short on a sharp sustained funding
+  flip), folding into the 0500000 sec-13.6 tier-divergence monitor.  This CONFIRMS + extends the
+  TB00805a fee-robustness finding: neither per-contract fee NOR typical funding is the lever; the
+  short's edge is native short ACCESS + the rsi_trend/vol/wide-stop config - but funding is the one
+  cost worth a live monitor.  CAVEAT: real 8h Binance-UM funding proxy for Kraken/Bitnomial; the
+  funding SCHEDULE (8h vs Kraken daily settle) is an engineering constant, not an edge variable.
+  Nothing minted; 0500000 unchanged; STAY IN PAPER.

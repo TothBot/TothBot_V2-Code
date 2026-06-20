@@ -1,0 +1,107 @@
+====================================================================================================================
+TB00806d - WHOLE-ORGANISM ANALYSIS (the 3 TB00806 changes driven through the LIVE G7/G8 gates + registry)
+  imports tothbot.pipeline.risk_guard + .position_sizer + config.registry; two modules, real breakers.
+  live seeds: leverage_cap_short=3  pause=5% halt=10%  deposit L=$5000 S=$5000
+  PAPER, offline, propose-only, 0500000 unchanged, STAY IN PAPER.
+====================================================================================================================
+  streams: Long-Spot 2380 trades | Short(perp) 1007 trades
+
+####################################################################################################################
+# W0 - THE LIVE ORGANISM AS-CONFIGURED (registry seeds: leverage_cap_short=3, $5000/module each).
+#   This is the reference the three changes are measured against - both modules through the real G7.
+####################################################################################################################
+  Long  module : taken= 2380 final=$   24688 profit=$  +19688 maxDD=$  1226=24.5%dep worstLoss= 1.3%dep pauses=  0 HALT=never Calmar= 16.1
+  Short module : taken=   90 final=$    4696 profit=$    -304 maxDD=$   451= 9.0%dep worstLoss= 6.1%dep pauses=917 HALT=never Calmar= -0.7
+  WHOLE account: final=$29384 profit=$+19384 maxDD=$1226=12.3%dep Calmar=15.8  (total deposit $10000)
+
+####################################################################################################################
+# W1 - CHANGE #1 (leverage cap) is ALREADY IN THE ORGANISM: registry leverage_cap_short=3 feeds the
+#   SHORT's committed margin (= clip/leverage) in G7 CHECK 2/3. So this is a VALIDATION, not an add.
+#   Sweep leverage_cap_short through the LIVE gate; PASS: the existing seed (3) sits in the safe band
+#   (short edge intact AND no exposure pathology) - confirming nothing needs adding.
+####################################################################################################################
+  lev_cap committed$/pos || taken   final$ maxDD%dep blocks   HALT
+        1        50.00 ||    79     4745      8.0%      0  never
+        2        25.00 ||    89     4688      9.2%      0  never
+        3        16.67 ||    90     4696      9.0%      0  never  <- EXISTING SEED
+        5        10.00 ||    97     4697      9.0%      0  never
+       10         5.00 ||  1007     5271     11.0%      0  never
+  -> the existing leverage_cap_short=3 sits in the battery-C safe band (2-3x: edge intact, liq a
+     backstop) AND keeps short committed margin low ($16.67/pos = capital-efficient). NOTHING TO ADD.
+
+####################################################################################################################
+# W3 - CHANGE #3 (size the short as a hedge) tested WHOLE-ACCOUNT through the real breakers.  The
+#   key whole-organism question battery A could NOT see: the long module's OWN 5%/10% breaker already
+#   floors its drawdown - so how much of the hedge's 'drawdown insurance' is REDUNDANT with the
+#   breaker that already exists?  Sweep the SHORT deposit; long fixed $5000; measure whole-account.
+####################################################################################################################
+  long-module-ALONE (real breakers): taken= 2380 final=$   24688 profit=$  +19688 maxDD=$  1226=24.5%dep worstLoss= 1.3%dep pauses=  0 HALT=never Calmar= 16.1
+  -> the long module's own breaker already caps its worst deposit loss at 1.3% (HALT line 10%); maxDD 24.5% of deposit.
+
+  short$dep capital$ || whole final$ whole maxDD% whole Calmar vs long-only
+          0     5000 ||        24688        24.5%         16.1         +0.0  (long-only)
+       1000     6000 ||        25623        20.4%         16.0         -0.1
+       2500     7500 ||        27049        16.3%         16.0         -0.1
+       5000    10000 ||        29384        12.3%         15.8         -0.2
+  -> WHOLE-ACCOUNT: adding short capital does NOT raise Calmar (16.1 -> 15.8); the long module's own
+     breaker already makes ruin impossible (1.3% worst-from-deposit), so the hedge's 'insurance' is
+     largely REDUNDANT with the breaker that already exists. The stovepiped battery-A 'size it modestly'
+     is OVERTURNED at the organism level: as configured, the hedge dilutes, it does not help.
+
+####################################################################################################################
+# W3b - THE ROOT CAUSE (a whole-organism interaction C/A/B could NOT see): the live 5% PAUSE breaker,
+#   calibrated for the LONG (which banks an early cushion and floats far above its frozen baseline),
+#   STRANGLES a thin-edge hedge module. Isolate it: short module breakers ON vs OFF.
+####################################################################################################################
+  short breakers ON : taken=   90 final=$    4696 profit=$    -304 maxDD=$   451= 9.0%dep worstLoss= 6.1%dep pauses=917 HALT=never Calmar= -0.7
+  short breakers OFF: taken= 1007 final=$    6353 profit=$   +1353 maxDD=$   610=12.2%dep worstLoss= 7.5%dep pauses=  0 HALT=never Calmar=  2.2
+  -> with the live breaker ON the hedge takes only 90/1007 trades (917 PAUSES) and ends $-304; with it OFF it takes 1007/1007 and ends $+1353. The hedge starts at a FROZEN
+  $5000 baseline, dips below the 5% pause line early, and never banks a cushion to float back above it
+  (it is break-even-to-slightly-negative standalone, earning only in bear BURSTS) -> it is benched
+  right when its winning regime may be arriving. The frozen-baseline drawdown breaker is MIS-
+  CALIBRATED for a hedge module. This is a genuine ORGANISM-level design question, NOT one of my
+  three stovepiped 'additions' - and it must be resolved BEFORE a short hedge is worth its capital.
+
+####################################################################################################################
+# W2 - CHANGE #2 (sustained-adverse-funding monitor) tested by IMPORTING the live CIATS EwmaMonitor
+#   (the exact machinery behind fee_tier_divergence). PASS: the monitor (a) stays quiet under normal
+#   funding, (b) fires .sustained on a sustained-adverse run, and (c) is SIGNALS-ONLY (it raises a
+#   CIATS drift signal -> PDCA + Bill per HR-CI-011; it NEVER pauses/trims the pool itself) so there
+#   is NO deadlock (the TB00804 deadlock law needs an exogenous resume; a signals-only monitor has no
+#   resume to deadlock).
+####################################################################################################################
+  monitor on the REAL funding stream (1007 trades): .sustained fired 0 times (quiet under the historical positive-funding-dominant regime, as expected).
+  monitor on a PINNED hard-adverse regime (~B2 break-even 0.13%/day): .sustained fired after 50 consecutive adverse trades (= the sustained_n=50 window).
+  -> change #2 is a NEW EwmaMonitor INSTANCE + one registry threshold seed, REUSING the exact live
+     fee_tier_divergence machinery; it is SIGNALS-ONLY (D5: monitors+alert, never self-adjusts) so it
+     routes to CIATS PDCA + Bill (HR-CI-011) and CANNOT deadlock the pool: PASS
+
+====================================================================================================================
+SYNTHESIS - what the WHOLE ORGANISM says about the three proposed changes (vs the stovepiped batteries)
+====================================================================================================================
+  PASS      W1 leverage_cap_short=3 validated
+  PASS      W3 hedge does NOT improve whole-account (the honest finding)
+  PASS      W2 funding monitor reuses EwmaMonitor, signals-only
+
+  #1 LEVERAGE CAP: ALREADY IN THE MODEL. registry leverage_cap_short=3 already feeds the SHORT's
+     committed margin in G7. Battery C VALIDATES the seed (2-3x = edge intact, liq a backstop); the
+     whole-organism sweep confirms 3 is capital-efficient ($16.67/pos). => NOTHING TO ADD; my earlier
+     'add a 2-3x band' was redundant. (Honest correction surfaced by running the live gate.)
+  #2 FUNDING MONITOR: a GENUINE, CHEAP, SAFE add IF perps go live. It is one new EwmaMonitor instance
+     + one threshold seed, reusing the live fee_tier_divergence machinery, SIGNALS-ONLY (no deadlock,
+     routes to CIATS+Bill). Recommend it - but only once the short side is actually perps (today the
+     short is spot-margin borrow/rollover, not funding).
+  #3 SIZE THE SHORT AS A HEDGE: OVERTURNED at the organism level. The live 5% frozen-baseline PAUSE
+     breaker STRANGLES a thin-edge hedge module (917 pauses, 90/1007 trades), and adding short capital
+     DILUTES whole-account Calmar (16.1 -> 15.8) because the long's own breaker already makes ruin
+     impossible (the hedge's insurance is redundant). As configured, the hedge does NOT help the whole
+     organism. The REAL question W3b surfaces is a NEW one: whether to RECALIBRATE the short module's
+     breaker (a hedge-appropriate baseline, e.g. high-water-mark or a wider hedge band) so the hedge
+     can actually deploy - a Bill WHAT, not a knob I can set. Until then, do NOT add the short hedge.
+
+  NET: of my three stovepiped recommendations, the whole organism keeps ONE as-is (#2, cheaply), finds
+  ONE already present (#1), and OVERTURNS ONE (#3 needs a breaker redesign first). This is exactly the
+  part-vs-whole gap Bill flagged: the parts looked additive; the whole says the existing breaker both
+  makes the hedge's main benefit redundant AND prevents the hedge from deploying. CAVEAT: paper realized-
+  equity basis (MTM fires sooner = FN-safe); perp short is the proposed revival (live short=spot-margin,
+  dormant). Propose-only; 0500000 unchanged; STAY IN PAPER.
